@@ -320,6 +320,12 @@ Create a new training scenario.
 - `Content-Type: application/json`
 - `x-request-id: <idempotency-key>` (alternative to body field)
 
+**Idempotency semantics**:
+- The service stores completed responses by `request_id` for **24 hours**.
+- A duplicate `request_id` within the retention window returns the **same response body** and `scenario_id` as the original.
+- The first successful request returns `201 Created`; subsequent duplicates return `200 OK` with the original payload.
+- Requests that reuse a `request_id` with different `track` are rejected as a validation error.
+
 **Response** (201 Created):
 ```json
 {
@@ -332,11 +338,27 @@ Create a new training scenario.
 
 **Errors**:
 - `400`: Missing request_id or unsupported track
+- `422`: Validation failure (schema/limits); see error format below
 - `401`: Missing/invalid bearer token
 - `403`: OPA policy denied or insufficient role/tenant scope
 - `429`: Rate limit exceeded (per-tenant quotas; retry with backoff)
 - `502`: OPA unavailable
 - `500`: Internal error
+
+**Validation error format** (400/422):
+```json
+{
+  "error": "validation_failed",
+  "message": "Request validation failed",
+  "details": [
+    {
+      "field": "track",
+      "issue": "unsupported value",
+      "expected": ["netplus", "ccna", "cissp"]
+    }
+  ]
+}
+```
 
 #### GET /health
 
@@ -906,7 +928,121 @@ The `spec.assets.containers[].capabilities` field is optional. When provided, ea
     },
     "spec": {
       "type": "object",
-      "required": ["limits", "network", "assets", "successCriteria"]
+      "required": ["limits", "network", "assets", "successCriteria"],
+      "properties": {
+        "limits": {
+          "type": "object",
+          "required": ["cpu", "memory_mb", "attacker_max_exploits", "timeout_minutes"],
+          "properties": {
+            "cpu": {"type": "number", "minimum": 0.1},
+            "memory_mb": {"type": "integer", "minimum": 128},
+            "attacker_max_exploits": {"type": "integer", "minimum": 0},
+            "timeout_minutes": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "network": {
+          "type": "object",
+          "required": ["egress", "subnets"],
+          "properties": {
+            "egress": {"type": "string", "enum": ["deny", "allowlist"]},
+            "allowlist_profile": {"type": "string"},
+            "subnets": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["name", "cidr"],
+                "properties": {
+                  "name": {"type": "string"},
+                  "cidr": {"type": "string"}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {"properties": {"egress": {"const": "allowlist"}}},
+              "then": {"required": ["allowlist_profile"]}
+            }
+          ]
+        },
+        "assets": {
+          "type": "object",
+          "required": ["containers"],
+          "properties": {
+            "containers": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["name", "image", "read_only", "networks"],
+                "properties": {
+                  "name": {"type": "string"},
+                  "image": {"type": "string"},
+                  "read_only": {"type": "boolean"},
+                  "networks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "string"}
+                  },
+                  "environment": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                  },
+                  "capabilities": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "successCriteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "description", "weight", "evidence"],
+            "properties": {
+              "id": {"type": "string"},
+              "description": {"type": "string"},
+              "weight": {"type": "number", "minimum": 0},
+              "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["type", "container", "command", "expect"],
+                  "properties": {
+                    "type": {"type": "string", "enum": ["command"]},
+                    "container": {"type": "string"},
+                    "command": {"type": "string"},
+                    "expect": {
+                      "type": "object",
+                      "properties": {
+                        "exit_code": {"type": "integer"},
+                        "stdout_contains": {"type": "string"},
+                        "stderr_contains": {"type": "string"}
+                      },
+                      "minProperties": 1,
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }
