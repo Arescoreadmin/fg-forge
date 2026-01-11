@@ -41,13 +41,17 @@ def load_app():
 
 
 async def request(
-    app: object, method: str, path: str, json: dict | None = None
+    app: object,
+    method: str,
+    path: str,
+    json: dict | None = None,
+    headers: dict | None = None,
 ) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver"
     ) as client:
-        return await client.request(method, path, json=json)
+        return await client.request(method, path, json=json, headers=headers)
 
 
 class SpawnServiceTests(unittest.TestCase):
@@ -153,7 +157,92 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(payload["track"], "netplus")
         self.assertEqual(payload["template_id"], "netplus")
         self.assertEqual(payload["subject"], "user-789")
+        self.assertEqual(payload["tenant_id"], "user-789")
         self.assertEqual(payload["tier"], "pro")
+
+    def test_spawn_api_missing_subject_identifier(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-missing-subject",
+                    "subject": "",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_spawn_rate_limit_exceeded(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["SPAWN_RATE_LIMIT_PER_MINUTE"] = "1"
+        app = load_app()
+        first = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-rate-1",
+                    "subject": "user-rate",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(first.status_code, 200)
+        second = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-rate-2",
+                    "subject": "user-rate",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(second.status_code, 429)
+
+    def test_spawn_concurrent_quota_exceeded(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["SPAWN_MAX_CONCURRENT_SCENARIOS"] = "1"
+        app = load_app()
+        first = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-quo-1",
+                    "subject": "user-quo",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(first.status_code, 200)
+        second = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-quo-2",
+                    "subject": "user-quo",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(second.status_code, 409)
 
     def test_sat_secret_alias_warning_emitted_once(self):
         os.environ.pop("SAT_HMAC_SECRET", None)
@@ -164,6 +253,40 @@ class SpawnServiceTests(unittest.TestCase):
             module._get_sat_secret()
         warnings = [record for record in logs.output if "SAT_SECRET is deprecated" in record]
         self.assertEqual(len(warnings), 1)
+
+    def test_spawn_api_rejects_subject_mismatch(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
+        module = load_module()
+        app = module.app
+        issued_at = module._sat_issued_at()
+        sat = module.generate_sat(
+            module.SatClaims(
+                jti=str(uuid.uuid4()),
+                exp=module._sat_expiration(issued_at),
+                iat=issued_at,
+                track="netplus",
+                template_id="netplus",
+                subject="user-1",
+                tenant_id="user-1",
+                tier="free",
+            )
+        )
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-mismatch",
+                    "subject": "user-2",
+                    "tier": "free",
+                },
+                headers={"x-sat": sat},
+            )
+        )
+        self.assertEqual(response.status_code, 403)
 
 
 if __name__ == "__main__":

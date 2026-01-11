@@ -51,11 +51,22 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             artifacts_dir = Path(tmpdir) / scenario_id / "artifacts"
             artifacts_dir.mkdir(parents=True)
             (artifacts_dir / "sample.txt").write_text("artifact-data", encoding="utf-8")
+            module.STORAGE_ROOT = Path(tmpdir)
+            module.append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.create",
+                actor="user-1",
+                correlation_id="req-1",
+                details={"track": "netplus"},
+            )
             bundle = module.build_evidence_bundle(
                 scenario_id,
                 "netplus",
                 "s3://forge-evidence/scn-123/evidence.tar.gz",
                 tmpdir,
+                module.audit_log_path(scenario_id),
+                "user-1",
+                "tenant-1",
             )
 
             if bundle.filename.endswith(".zst"):
@@ -69,10 +80,43 @@ class ScoreboardArtifactsTests(unittest.TestCase):
 
             with tarfile.open(fileobj=BytesIO(raw_tar), mode="r:") as tar:
                 names = tar.getnames()
+                manifest = json.loads(tar.extractfile("manifest.json").read())
             self.assertIn("logs/scoreboard.log", names)
             self.assertIn("telemetry/scoreboard.json", names)
             self.assertIn("source_evidence.txt", names)
             self.assertIn("artifacts/sample.txt", names)
+            self.assertIn("audit/audit.jsonl", names)
+            self.assertEqual(manifest["subject"], "user-1")
+            self.assertEqual(manifest["tenant_id"], "tenant-1")
+            self.assertIn("audit_sha256", manifest)
+
+    def test_audit_chain_detects_tampering(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module.STORAGE_ROOT = Path(tmpdir)
+            scenario_id = "scn-audit"
+            module.append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.create",
+                actor="user-1",
+                correlation_id="req-1",
+                details={"track": "netplus"},
+            )
+            module.append_audit_event(
+                scenario_id=scenario_id,
+                event_type="score.finalized",
+                actor="user-1",
+                correlation_id="req-2",
+                details={"score": 1.0},
+            )
+            audit_path = module.audit_log_path(scenario_id)
+            self.assertTrue(module.verify_audit_chain(audit_path))
+            lines = audit_path.read_text(encoding="utf-8").splitlines()
+            tampered = json.loads(lines[0])
+            tampered["details"]["track"] = "cissp"
+            lines[0] = json.dumps(tampered, separators=(",", ":"))
+            audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            self.assertFalse(module.verify_audit_chain(audit_path))
 
     def test_sign_verdict_uses_hashes(self):
         module = load_module()
