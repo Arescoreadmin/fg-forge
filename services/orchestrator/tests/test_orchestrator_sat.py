@@ -71,12 +71,13 @@ class OrchestratorSatTests(unittest.TestCase):
             "track": "netplus",
             "template_id": "netplus",
             "subject": "user-1",
+            "tenant_id": "tenant-1",
             "tier": "free",
         }
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
-        asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus"))
+        asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus", "free"))
         with self.assertRaises(module.HTTPException):
-            asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus"))
+            asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus", "free"))
 
     def test_spawn_request_denied_without_sat(self):
         module = load_module()
@@ -99,6 +100,7 @@ class OrchestratorSatTests(unittest.TestCase):
             "track": "netplus",
             "template_id": "netplus",
             "subject": "user-2",
+            "tenant_id": "tenant-2",
             "tier": "pro",
             "scenario_id": "scn-opa",
         }
@@ -114,12 +116,30 @@ class OrchestratorSatTests(unittest.TestCase):
                 "scenario_id": "scn-opa",
                 "track": "netplus",
                 "request_id": "req-2",
+                "tier": "pro",
                 "sat": token,
             }
         )
         asyncio.run(module.process_spawn_request(msg))
         self.assertTrue(msg.acked)
         self.assertEqual(module.scenarios, {})
+
+    def test_sat_missing_tenant_or_subject_rejected(self):
+        module = load_module()
+        module.replay_protector = module.ReplayProtector()
+        now = int(datetime.now(timezone.utc).timestamp())
+        claims = {
+            "jti": "jti-missing",
+            "exp": now + 300,
+            "iat": now,
+            "track": "netplus",
+            "template_id": "netplus",
+            "subject": "user-3",
+            "tier": "free",
+        }
+        token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
+        with self.assertRaises(module.HTTPException):
+            asyncio.run(module.enforce_sat(token, "scn-3", "netplus", "netplus", "free"))
 
     def test_sat_secret_alias_warning_emitted_once(self):
         os.environ.pop("SAT_HMAC_SECRET", None)

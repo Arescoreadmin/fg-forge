@@ -14,6 +14,9 @@
 - Implemented retention cleanup script with operator auth, dry-run support, investigation-flag protection, and unit tests.
 - Hardened /readyz checks to include OPA/scoreboard dependencies, storage writability, and signing key availability with tests.
 - Enforced operator-only access on scenario completion and retention cleanup with tests.
+- Added per-subject spawn rate limiting and concurrent scenario quotas with Redis-backed counters and in-memory fallback plus tests.
+- Enforced SAT subject/tenant binding and tier matching, propagated correlation IDs to scoreboard, and recorded subject/tenant in score artifacts.
+- Implemented hash-chained audit logs with evidence bundle coverage and tamper detection tests.
 
 ## How to run locally
 ```

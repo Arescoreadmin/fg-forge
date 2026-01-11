@@ -66,6 +66,7 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
                 track="netplus",
                 template_id="netplus",
                 subject="user-1",
+                tenant_id="tenant-1",
                 tier="free",
                 scenario_id=scenario_id,
             )
@@ -78,6 +79,9 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
                     scenario_id=scenario_id,
                     request_id="req-1",
                     track="netplus",
+                    subject="user-1",
+                    tenant_id="tenant-1",
+                    tier="free",
                     status=orchestrator_module.ScenarioStatus.RUNNING,
                 )
             )

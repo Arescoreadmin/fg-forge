@@ -6,10 +6,12 @@ import hmac
 import json
 import logging
 import os
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import requests
 import yaml
@@ -54,6 +56,7 @@ TRACK_TEMPLATE = {
 }
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 REQUEST_CACHE: Dict[str, dict] = {}
+CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
 _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
@@ -268,9 +271,117 @@ class SatClaims(BaseModel):
     track: str
     template_id: str
     subject: str
+    tenant_id: str
     tier: str
     requested_limits: Optional[dict[str, int]] = None
     scenario_id: Optional[str] = None
+
+
+class RateLimitState:
+    def __init__(self, count: int, reset_at: float) -> None:
+        self.count = count
+        self.reset_at = reset_at
+
+
+class SpawnLimiter:
+    def __init__(self) -> None:
+        self._redis_url = os.getenv("REDIS_URL")
+        self._redis_client = None
+        self._lock = threading.Lock()
+        self._rate_cache: dict[str, RateLimitState] = {}
+        self._active_cache: dict[str, dict[str, float]] = {}
+
+    def _get_redis(self):
+        if not self._redis_url:
+            return None
+        if self._redis_client is None:
+            import redis
+
+            self._redis_client = redis.from_url(self._redis_url, decode_responses=True)
+        return self._redis_client
+
+    def _rate_limit(self) -> int:
+        return int(os.getenv("SPAWN_RATE_LIMIT_PER_MINUTE", "20"))
+
+    def _max_concurrent(self) -> int:
+        return int(os.getenv("SPAWN_MAX_CONCURRENT_SCENARIOS", "3"))
+
+    def check_rate_limit(self, subject: str) -> None:
+        limit = self._rate_limit()
+        if limit <= 0:
+            return
+        now = time.time()
+        client = self._get_redis()
+        if client:
+            key = f"spawn:rate:{subject}"
+            try:
+                count = client.incr(key)
+                if count == 1:
+                    client.expire(key, 60)
+                if count > limit:
+                    raise HTTPException(status_code=429, detail="rate limit exceeded")
+                return
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Redis rate limit failed: %s", exc)
+
+        with self._lock:
+            state = self._rate_cache.get(subject)
+            if state is None or now >= state.reset_at:
+                self._rate_cache[subject] = RateLimitState(1, now + 60)
+                return
+            state.count += 1
+            if state.count > limit:
+                raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+    def _purge_active(self, subject: str, now: float) -> None:
+        entries = self._active_cache.get(subject)
+        if not entries:
+            return
+        expired = [key for key, exp in entries.items() if exp <= now]
+        for key in expired:
+            entries.pop(key, None)
+
+    def check_concurrent(self, subject: str, scenario_id: str, expires_at: datetime) -> None:
+        limit = self._max_concurrent()
+        if limit <= 0:
+            return
+        expires_ts = expires_at.timestamp()
+        now = time.time()
+        client = self._get_redis()
+        if client:
+            key = f"spawn:active:{subject}"
+            try:
+                client.zremrangebyscore(key, 0, now)
+                existing = client.zscore(key, scenario_id)
+                active_count = client.zcard(key)
+                if existing is None and active_count >= limit:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="concurrent scenario quota exceeded",
+                    )
+                client.zadd(key, {scenario_id: expires_ts})
+                ttl = max(int(expires_ts - now), 1)
+                client.expire(key, ttl)
+                return
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Redis quota check failed: %s", exc)
+
+        with self._lock:
+            self._purge_active(subject, now)
+            entries = self._active_cache.setdefault(subject, {})
+            if scenario_id not in entries and len(entries) >= limit:
+                raise HTTPException(
+                    status_code=409,
+                    detail="concurrent scenario quota exceeded",
+                )
+            entries[scenario_id] = expires_ts
+
+
+spawn_limiter = SpawnLimiter()
 
 
 def load_template(track: str) -> dict:
@@ -315,13 +426,36 @@ def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]
     return payload.request_id or request.headers.get(header_name)
 
 
-def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnResponse:
+def resolve_subject_identifier(
+    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+) -> str:
+    subject = payload.subject.strip() if payload.subject else ""
+    if sat_claims:
+        if subject and sat_claims.subject != subject:
+            raise HTTPException(status_code=403, detail="subject mismatch")
+        subject = sat_claims.subject
+    if not subject:
+        subject = request.headers.get(CLIENT_ID_HEADER, "").strip()
+    if not subject:
+        raise HTTPException(
+            status_code=403,
+            detail=f"subject identifier required (provide subject or {CLIENT_ID_HEADER})",
+        )
+    return subject
+
+
+def build_spawn_response(
+    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+) -> SpawnResponse:
     request_id = resolve_request_id(payload, request)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id required")
 
     if payload.track not in TRACKS:
         raise HTTPException(status_code=400, detail="unsupported track")
+
+    subject = resolve_subject_identifier(payload, request, sat_claims)
+    spawn_limiter.check_rate_limit(subject)
 
     if request_id in REQUEST_CACHE:
         cached = REQUEST_CACHE[request_id]
@@ -333,7 +467,8 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
                 iat=issued_at,
                 track=cached["track"],
                 template_id=cached["template_id"],
-                subject=payload.subject,
+                subject=subject,
+                tenant_id=subject,
                 tier=payload.tier,
                 requested_limits=payload.requested_limits,
                 scenario_id=cached["scenario_id"],
@@ -364,7 +499,8 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
             iat=issued_at,
             track=payload.track,
             template_id=payload.template_id or payload.track,
-            subject=payload.subject,
+            subject=subject,
+            tenant_id=subject,
             tier=payload.tier,
             requested_limits=payload.requested_limits,
             scenario_id=scenario_id,
@@ -380,6 +516,11 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
         sat=sat_token,
     )
 
+    expires_at_dt = datetime.fromisoformat(expires_at)
+    if expires_at_dt.tzinfo is None:
+        expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
+    spawn_limiter.check_concurrent(subject, scenario_id, expires_at_dt)
+
     REQUEST_CACHE[request_id] = {
         "request_id": response.request_id,
         "scenario_id": response.scenario_id,
@@ -391,6 +532,33 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
     }
 
     return response
+
+
+def notify_orchestrator(
+    payload: SpawnRequest, response: SpawnResponse, request: Request
+) -> None:
+    orchestrator_url = os.getenv("ORCHESTRATOR_URL")
+    if not orchestrator_url:
+        return
+    headers = {"x-request-id": request_id_ctx.get(), "x-sat": response.sat}
+    body = {
+        "scenario_id": response.scenario_id,
+        "template": payload.track,
+        "request_id": response.request_id,
+        "tier": payload.tier,
+    }
+    try:
+        call = requests.post(
+            f"{orchestrator_url}/v1/scenarios",
+            json=body,
+            headers=headers,
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        logger.warning("orchestrator request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="orchestrator unavailable") from exc
+    if call.status_code >= 400:
+        raise HTTPException(status_code=502, detail="orchestrator error")
 
 
 @app.get("/health")
@@ -410,14 +578,18 @@ def readyz() -> dict:
 
 @app.post("/v1/spawn", response_model=SpawnResponse)
 def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    enforce_spawn_authorization(request)
-    return build_spawn_response(payload, request)
+    sat_claims = enforce_spawn_authorization(request)
+    response = build_spawn_response(payload, request, sat_claims)
+    notify_orchestrator(payload, response, request)
+    return response
 
 
 @app.post("/api/spawn", response_model=SpawnResponse)
 def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    enforce_spawn_authorization(request)
-    return build_spawn_response(payload, request)
+    sat_claims = enforce_spawn_authorization(request)
+    response = build_spawn_response(payload, request, sat_claims)
+    notify_orchestrator(payload, response, request)
+    return response
 
 
 @app.get("/v1/access/{scenario_id}")

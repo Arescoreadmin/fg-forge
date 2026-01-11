@@ -83,6 +83,8 @@ class CriterionScore(BaseModel):
 class ScoreResult(BaseModel):
     scenario_id: str
     track: str
+    subject: str | None = None
+    tenant_id: str | None = None
     score: float  # 0.0 to 1.0
     passed: int
     total: int
@@ -112,6 +114,8 @@ class ScenarioCompletionPayload(BaseModel):
     track: str
     completion_reason: str
     completed_at: datetime
+    subject: str | None = None
+    tenant_id: str | None = None
     score: float | None = None
     passed: int | None = None
     total: int | None = None
@@ -223,6 +227,71 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _audit_payload(entry: dict[str, Any]) -> bytes:
+    payload = dict(entry)
+    payload.pop("entry_hash", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def audit_log_path(scenario_id: str) -> Path:
+    return _results_dir(scenario_id) / "audit.jsonl"
+
+
+def append_audit_event(
+    scenario_id: str,
+    event_type: str,
+    actor: str,
+    correlation_id: str,
+    details: dict[str, Any],
+) -> None:
+    path = audit_log_path(scenario_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev_hash = "0" * 64
+    if path.exists():
+        last_line = ""
+        with path.open("r", encoding="utf-8") as handle:
+            for last_line in handle:
+                pass
+        if last_line:
+            try:
+                prev_hash = json.loads(last_line).get("entry_hash", prev_hash)
+            except json.JSONDecodeError:
+                prev_hash = "0" * 64
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scenario_id": scenario_id,
+        "event_type": event_type,
+        "actor": actor,
+        "correlation_id": correlation_id,
+        "details": details,
+        "prev_hash": prev_hash,
+    }
+    entry["entry_hash"] = _hash_bytes(_audit_payload(entry))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+
+
+def verify_audit_chain(path: Path) -> bool:
+    if not path.exists():
+        return False
+    prev_hash = "0" * 64
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+            if entry.get("prev_hash") != prev_hash:
+                return False
+            expected = _hash_bytes(_audit_payload(entry))
+            if entry.get("entry_hash") != expected:
+                return False
+            prev_hash = entry.get("entry_hash")
+    return True
+
+
 def _tar_add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     info = tarfile.TarInfo(name=name)
     info.size = len(data)
@@ -315,6 +384,9 @@ def build_evidence_bundle(
     track: str,
     source_evidence_url: str,
     artifacts_root: str | None = None,
+    audit_path: Path | None = None,
+    subject: str | None = None,
+    tenant_id: str | None = None,
 ) -> EvidenceBundle:
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
@@ -327,6 +399,24 @@ def build_evidence_bundle(
             {"scenario_id": scenario_id, "track": track}, sort_keys=True
         ).encode("utf-8")
         _tar_add_bytes(tar, "telemetry/scoreboard.json", telemetry_payload)
+
+        manifest = {
+            "scenario_id": scenario_id,
+            "track": track,
+            "subject": subject,
+            "tenant_id": tenant_id,
+        }
+
+        if audit_path and audit_path.exists():
+            audit_bytes = audit_path.read_bytes()
+            _tar_add_bytes(tar, "audit/audit.jsonl", audit_bytes)
+            manifest["audit_sha256"] = _hash_bytes(audit_bytes)
+
+        _tar_add_bytes(
+            tar,
+            "manifest.json",
+            json.dumps(manifest, sort_keys=True).encode("utf-8"),
+        )
 
         if source_evidence_url:
             _tar_add_bytes(
@@ -380,14 +470,20 @@ def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdi
 
 
 def build_score_result(payload: ScenarioCompletionPayload) -> ScoreResult:
+    if not payload.subject or not payload.tenant_id:
+        raise HTTPException(status_code=400, detail="subject and tenant_id required")
     if payload.criteria:
         score = calculate_score(payload.criteria)
         score.scenario_id = payload.scenario_id
         score.track = payload.track
+        score.subject = payload.subject
+        score.tenant_id = payload.tenant_id
         return score
     return ScoreResult(
         scenario_id=payload.scenario_id,
         track=payload.track,
+        subject=payload.subject,
+        tenant_id=payload.tenant_id,
         score=payload.score or 0.0,
         passed=payload.passed or 0,
         total=payload.total or 0,
@@ -400,6 +496,17 @@ def finalize_scoring(
     evidence_url: str,
     artifacts_root: str | None,
 ) -> ScoreboardEntry:
+    append_audit_event(
+        scenario_id=payload.scenario_id,
+        event_type="score.finalized",
+        actor=payload.subject or "unknown",
+        correlation_id=request_id_ctx.get(),
+        details={
+            "track": payload.track,
+            "tenant_id": payload.tenant_id,
+            "completion_reason": payload.completion_reason,
+        },
+    )
     score = build_score_result(payload)
     score_bytes = _score_json_bytes(score)
     score_hash = _hash_bytes(score_bytes)
@@ -408,6 +515,9 @@ def finalize_scoring(
         payload.track,
         evidence_url,
         artifacts_root,
+        audit_log_path(payload.scenario_id),
+        payload.subject,
+        payload.tenant_id,
     )
     evidence_hash = _hash_bytes(evidence_bundle.payload)
     verdict = sign_verdict(score_hash, evidence_hash, payload.scenario_id)
@@ -438,14 +548,21 @@ async def process_scenario_completed(msg: Any) -> None:
         scenario_id = data.get("scenario_id")
         track = data.get("track")
         evidence_url = data.get("evidence_url", "")
+        subject = data.get("subject")
+        tenant_id = data.get("tenant_id")
 
         logger.info("Processing scenario.completed: %s", scenario_id)
+
+        if not subject or not tenant_id:
+            raise RuntimeError("scenario.completed missing subject or tenant_id")
 
         payload = ScenarioCompletionPayload(
             scenario_id=scenario_id,
             track=track,
             completion_reason=data.get("completion_reason", "nats_event"),
             completed_at=datetime.now(timezone.utc),
+            subject=subject,
+            tenant_id=tenant_id,
             score=data.get("score"),
             passed=data.get("passed"),
             total=data.get("total"),

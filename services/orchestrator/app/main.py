@@ -10,6 +10,7 @@ import asyncio
 import base64
 import contextvars
 import hmac
+import hashlib
 import json
 import logging
 import os
@@ -64,6 +65,7 @@ OPA_URL = os.getenv("OPA_URL", "http://forge_opa:8181")
 NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
 NETWORK_PREFIX = "forge_scn_"
 SCOREBOARD_URL = os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080")
+STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "storage"))
 
 
 class ScenarioStatus(str, Enum):
@@ -80,6 +82,9 @@ class ScenarioState(BaseModel):
     scenario_id: str
     request_id: str
     track: str
+    subject: str | None = None
+    tenant_id: str | None = None
+    tier: str | None = None
     status: ScenarioStatus = ScenarioStatus.PENDING
     network_id: str | None = None
     containers: list[str] = Field(default_factory=list)
@@ -94,6 +99,7 @@ class CreateScenarioRequest(BaseModel):
     scenario_id: str
     template: str
     request_id: str
+    tier: str
 
 
 class CreateScenarioResponse(BaseModel):
@@ -114,6 +120,7 @@ class SatClaims(BaseModel):
     track: str
     template_id: str
     subject: str
+    tenant_id: str
     tier: str
     requested_limits: Optional[dict[str, int]] = None
     scenario_id: Optional[str] = None
@@ -262,6 +269,9 @@ async def _trigger_scoreboard(
     track: str,
     completion_reason: str,
     completed_at: datetime,
+    subject: str | None,
+    tenant_id: str | None,
+    correlation_id: str | None,
 ) -> None:
     token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
     if not token:
@@ -271,8 +281,12 @@ async def _trigger_scoreboard(
         "track": track,
         "completion_reason": completion_reason,
         "completed_at": completed_at.isoformat(),
+        "subject": subject,
+        "tenant_id": tenant_id,
     }
     headers = {"x-internal-token": token}
+    if correlation_id:
+        headers["x-request-id"] = correlation_id
     async with _scoreboard_client() as client:
         response = await client.post(
             f"/internal/scenario/{scenario_id}/score", json=payload, headers=headers
@@ -324,17 +338,22 @@ async def enforce_sat(
     scenario_id: str | None,
     track: str | None,
     template_id: str | None,
+    tier: str | None,
 ) -> SatClaims:
     if not token:
         raise HTTPException(status_code=401, detail="sat required")
 
     claims = verify_sat(token)
+    if not claims.subject or not claims.tenant_id:
+        raise HTTPException(status_code=401, detail="sat missing subject or tenant")
     if scenario_id and claims.scenario_id and claims.scenario_id != scenario_id:
         raise HTTPException(status_code=403, detail="sat scenario mismatch")
     if track and claims.track != track:
         raise HTTPException(status_code=403, detail="sat track mismatch")
     if template_id and claims.template_id != template_id:
         raise HTTPException(status_code=403, detail="sat template mismatch")
+    if tier and claims.tier != tier:
+        raise HTTPException(status_code=403, detail="sat tier mismatch")
 
     stored = await replay_protector.check_and_store(claims.jti, claims.exp)
     if not stored:
@@ -376,6 +395,54 @@ async def _check_opa_ready() -> None:
         raise HTTPException(
             status_code=503, detail=f"opa unhealthy: {response.status_code}"
         )
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _audit_payload(entry: dict[str, Any]) -> bytes:
+    payload = dict(entry)
+    payload.pop("entry_hash", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _audit_path(scenario_id: str) -> Path:
+    return STORAGE_ROOT / "scenarios" / scenario_id / "results" / "audit.jsonl"
+
+
+def append_audit_event(
+    scenario_id: str,
+    event_type: str,
+    actor: str,
+    correlation_id: str,
+    details: dict[str, Any],
+) -> None:
+    audit_path = _audit_path(scenario_id)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    prev_hash = "0" * 64
+    if audit_path.exists():
+        last_line = ""
+        with audit_path.open("r", encoding="utf-8") as handle:
+            for last_line in handle:
+                pass
+        if last_line:
+            try:
+                prev_hash = json.loads(last_line).get("entry_hash", prev_hash)
+            except json.JSONDecodeError:
+                prev_hash = "0" * 64
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scenario_id": scenario_id,
+        "event_type": event_type,
+        "actor": actor,
+        "correlation_id": correlation_id,
+        "details": details,
+        "prev_hash": prev_hash,
+    }
+    entry["entry_hash"] = _hash_bytes(_audit_payload(entry))
+    with audit_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
 def create_scenario_network(scenario_id: str) -> str:
@@ -517,11 +584,25 @@ async def complete_scenario(
     )
 
     try:
+        append_audit_event(
+            scenario_id=scenario_id,
+            event_type="scenario.complete",
+            actor="operator",
+            correlation_id=request_id_ctx.get(),
+            details={
+                "reason": completion_reason,
+                "subject": state.subject,
+                "tenant_id": state.tenant_id,
+            },
+        )
         await _trigger_scoreboard(
             scenario_id,
             state.track,
             completion_reason,
             completed_at,
+            state.subject,
+            state.tenant_id,
+            request_id_ctx.get(),
         )
         state.status = ScenarioStatus.COMPLETED
     except Exception as exc:
@@ -546,19 +627,21 @@ async def process_spawn_request(msg: Any) -> None:
         scenario_id = data.get("scenario_id")
         track = data.get("track")
         request_id = data.get("request_id")
+        tier = data.get("tier")
         sat = data.get("sat")
 
-        if not scenario_id or not track:
-            logger.warning("Spawn request missing scenario_id or track")
+        if not scenario_id or not track or not tier:
+            logger.warning("Spawn request missing scenario_id, track, or tier")
             await msg.ack()
             return
 
         try:
-            await enforce_sat(sat, scenario_id, track, track)
+            claims = await enforce_sat(sat, scenario_id, track, track, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
             await msg.ack()
             return
+        correlation_id = data.get("correlation_id") or request_id or "-"
 
         logger.info(
             "Processing spawn request: scenario_id=%s track=%s request_id=%s",
@@ -582,9 +665,19 @@ async def process_spawn_request(msg: Any) -> None:
             scenario_id=scenario_id,
             request_id=request_id,
             track=track,
+            subject=claims.subject,
+            tenant_id=claims.tenant_id,
+            tier=claims.tier,
             status=ScenarioStatus.CREATING,
         )
         scenarios[scenario_id] = state
+        append_audit_event(
+            scenario_id=scenario_id,
+            event_type="scenario.create",
+            actor=claims.subject,
+            correlation_id=correlation_id,
+            details={"track": track, "tenant_id": claims.tenant_id},
+        )
 
         # Create network
         network_id = create_scenario_network(scenario_id)
@@ -731,7 +824,7 @@ async def create_scenario(
     token = http_request.headers.get("x-sat")
     if not token:
         token = _parse_bearer_token(http_request.headers.get("authorization", ""))
-    await enforce_sat(token, scenario_id, track, track)
+    claims = await enforce_sat(token, scenario_id, track, track, request.tier)
 
     # Check if already exists
     if scenario_id in scenarios:
@@ -747,9 +840,19 @@ async def create_scenario(
         scenario_id=scenario_id,
         request_id=request.request_id,
         track=track,
+        subject=claims.subject,
+        tenant_id=claims.tenant_id,
+        tier=claims.tier,
         status=ScenarioStatus.CREATING,
     )
     scenarios[scenario_id] = state
+    append_audit_event(
+        scenario_id=scenario_id,
+        event_type="scenario.create",
+        actor=claims.subject,
+        correlation_id=request_id_ctx.get(),
+        details={"track": track, "tenant_id": claims.tenant_id},
+    )
 
     # Load and validate template
     template = load_template(track)
