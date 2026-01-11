@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import hmac
 import json
 import logging
@@ -14,6 +15,33 @@ import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+
+request_id_ctx = contextvars.ContextVar("request_id", default="-")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "correlation_id": request_id_ctx.get(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+configure_logging()
 
 app = FastAPI(title="FrostGate Forge Spawn Service")
 logger = logging.getLogger("forge_spawn_service")
@@ -30,6 +58,20 @@ _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
     logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+        or str(uuid.uuid4())
+    )
+    token = request_id_ctx.set(request_id)
+    response = await call_next(request)
+    request_id_ctx.reset(token)
+    response.headers["x-request-id"] = request_id
+    return response
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -80,6 +122,59 @@ def verify_access_token(token: str) -> AccessTokenPayload:
     return payload
 
 
+def verify_spawn_authorization(token: str) -> SpawnAuthorizationPayload:
+    try:
+        payload_encoded, signature_encoded = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    sat_secret = os.getenv("SAT_SECRET") or _TOKEN_SECRET
+    expected_signature = hmac.new(
+        sat_secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+
+    try:
+        payload = SpawnAuthorizationPayload.model_validate(
+            json.loads(_b64url_decode(payload_encoded))
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    expires_at = datetime.fromisoformat(payload.expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="spawn authorization expired")
+
+    return payload
+
+
+def parse_bearer_token(value: str) -> Optional[str]:
+    if not value:
+        return None
+    parts = value.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
+def enforce_spawn_authorization(request: Request) -> Optional[SpawnAuthorizationPayload]:
+    sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
+    token = request.headers.get("x-sat")
+    if not token:
+        token = parse_bearer_token(request.headers.get("authorization", ""))
+
+    if not token:
+        if sat_required:
+            raise HTTPException(status_code=401, detail="spawn authorization required")
+        return None
+
+    return verify_spawn_authorization(token)
+
+
 class SpawnRequest(BaseModel):
     track: str = Field(..., description="Training track identifier")
     request_id: Optional[str] = Field(
@@ -100,6 +195,14 @@ class AccessTokenPayload(BaseModel):
     request_id: str
     track: str
     expires_at: str
+
+
+class SpawnAuthorizationPayload(BaseModel):
+    subject: str
+    issued_at: str
+    expires_at: str
+    tenant_id: Optional[str] = None
+    scope: Optional[str] = None
 
 
 def load_template(track: str) -> dict:
@@ -144,13 +247,7 @@ def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]
     return payload.request_id or request.headers.get(header_name)
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": "forge_spawn_service"}
-
-
-@app.post("/v1/spawn", response_model=SpawnResponse)
-def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnResponse:
     request_id = resolve_request_id(payload, request)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id required")
@@ -188,6 +285,33 @@ def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
     REQUEST_CACHE[request_id] = response.model_dump()
 
     return response
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "service": "forge_spawn_service"}
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"status": "ok", "service": "forge_spawn_service"}
+
+
+@app.get("/readyz")
+def readyz() -> dict:
+    return {"status": "ready", "service": "forge_spawn_service"}
+
+
+@app.post("/v1/spawn", response_model=SpawnResponse)
+def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+    enforce_spawn_authorization(request)
+    return build_spawn_response(payload, request)
+
+
+@app.post("/api/spawn", response_model=SpawnResponse)
+def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
+    enforce_spawn_authorization(request)
+    return build_spawn_response(payload, request)
 
 
 @app.get("/v1/access/{scenario_id}")

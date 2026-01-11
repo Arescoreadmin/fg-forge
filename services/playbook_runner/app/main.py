@@ -6,18 +6,47 @@ Provides a structured way to define and run evaluation steps.
 
 from __future__ import annotations
 
+import contextvars
+import json
 import logging
 import os
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import docker
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+request_id_ctx = contextvars.ContextVar("request_id", default="-")
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "correlation_id": request_id_ctx.get(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+configure_logging()
 logger = logging.getLogger("forge_playbook_runner")
 
 # Configuration
@@ -370,9 +399,33 @@ def run_playbook(scenario_id: str, playbook: Playbook) -> PlaybookRunResult:
 app = FastAPI(title="FrostGate Forge Playbook Runner")
 
 
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = (
+        request.headers.get("x-request-id")
+        or request.headers.get("x-correlation-id")
+        or str(uuid.uuid4())
+    )
+    token = request_id_ctx.set(request_id)
+    response = await call_next(request)
+    request_id_ctx.reset(token)
+    response.headers["x-request-id"] = request_id
+    return response
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_playbook_runner"}
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"status": "ok", "service": "forge_playbook_runner"}
+
+
+@app.get("/readyz")
+def readyz() -> dict:
+    return {"status": "ready", "service": "forge_playbook_runner"}
 
 
 @app.post("/v1/run/{scenario_id}")
