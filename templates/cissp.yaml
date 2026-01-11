@@ -1,0 +1,23 @@
+metadata:
+  name: cissp-risk-assessment
+  labels:
+    - class:cissp
+    - tier:foundation
+limits:
+  cpu: 2
+  memory_mb: 2048
+  attacker_max_exploits: 5
+network:
+  egress: deny
+  allowlist_profile: null
+assets:
+  containers:
+    - name: analyst_vm
+      image: alpine:3.19
+      read_only: true
+successCriteria:
+  - id: cissp-risk-register
+    description: "Learner can document a risk entry"
+    evidence:
+      - type: file
+        path: "/workspace/risk_register.json"

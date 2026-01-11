@@ -1,0 +1,23 @@
+metadata:
+  name: ccna-routing-basics
+  labels:
+    - class:ccna
+    - tier:foundation
+limits:
+  cpu: 2
+  memory_mb: 3072
+  attacker_max_exploits: 0
+network:
+  egress: deny
+  allowlist_profile: null
+assets:
+  containers:
+    - name: learner_router
+      image: alpine:3.19
+      read_only: true
+successCriteria:
+  - id: ccna-static-route
+    description: "Learner can add a static route"
+    evidence:
+      - type: command
+        command: "ip route add 10.20.0.0/24 via 10.10.0.1"
