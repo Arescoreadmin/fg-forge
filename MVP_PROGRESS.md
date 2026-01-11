@@ -4,6 +4,7 @@
 - Added `/healthz` and `/readyz` endpoints for all HTTP services.
 - Implemented structured JSON logging with correlation IDs across services.
 - Added `POST /api/spawn` with Spawn Authorization Token (SAT) scaffolding and basic tests.
+- Implemented SAT minting/verification with expiry and replay protection, plus orchestrator SAT enforcement and OPA pre-launch gating tests.
 
 ## Remaining
 - Enforce evidence bundle format (`evidence.tar.zst`) and integrate hash validation in scoring.
@@ -12,4 +13,3 @@
 - Implement quota enforcement in orchestrator spawn flow and NATS admission gates.
 - Integrate KMS-backed signing keys for verdict signatures.
 - Add CI pipeline configuration to run tests and policy checks.
-

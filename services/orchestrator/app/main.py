@@ -7,16 +7,19 @@ enforces OPA policies, creates isolated networks, and manages container lifecycl
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+import hmac
 import json
 import logging
 import os
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import docker
 import httpx
@@ -94,8 +97,71 @@ class CreateScenarioResponse(BaseModel):
     network_id: str | None = None
 
 
+class SatClaims(BaseModel):
+    jti: str
+    exp: int
+    iat: int
+    track: str
+    template_id: str
+    subject: str
+    tier: str
+    requested_limits: Optional[dict[str, int]] = None
+    scenario_id: Optional[str] = None
+
+
+class ReplayProtector:
+    def __init__(self) -> None:
+        self._redis_url = os.getenv("REDIS_URL")
+        self._redis_client: Any | None = None
+        self._cache: OrderedDict[str, int] = OrderedDict()
+        self._max_size = int(os.getenv("SAT_REPLAY_CACHE_SIZE", "10000"))
+        self._lock = asyncio.Lock()
+
+    async def _get_redis(self) -> Any | None:
+        if not self._redis_url:
+            return None
+        if self._redis_client is None:
+            import redis.asyncio as redis
+
+            self._redis_client = redis.from_url(self._redis_url, decode_responses=True)
+        return self._redis_client
+
+    def _purge_expired(self, now: int) -> None:
+        expired_keys = [key for key, exp in self._cache.items() if exp <= now]
+        for key in expired_keys:
+            self._cache.pop(key, None)
+
+    async def check_and_store(self, jti: str, exp: int) -> bool:
+        now = int(datetime.now(timezone.utc).timestamp())
+        ttl = exp - now
+        if ttl <= 0:
+            return False
+
+        client = await self._get_redis()
+        if client:
+            try:
+                key = f"sat:jti:{jti}"
+                stored = await client.set(key, "1", nx=True, ex=ttl)
+                return bool(stored)
+            except Exception as exc:
+                logger.warning("Redis replay check failed: %s", exc)
+                return False
+
+        async with self._lock:
+            self._purge_expired(now)
+            if jti in self._cache:
+                return False
+            self._cache[jti] = exp
+            self._cache.move_to_end(jti)
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+            return True
+
+
 # In-memory state store (production would use Redis/NATS KV)
 scenarios: dict[str, ScenarioState] = {}
+
+replay_protector = ReplayProtector()
 
 # Docker client
 docker_client: docker.DockerClient | None = None
@@ -119,6 +185,91 @@ def load_template(track: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Template not found: {track}")
     with template_path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _get_sat_secret() -> str:
+    sat_secret = os.getenv("SAT_SECRET")
+    if not sat_secret:
+        raise HTTPException(status_code=500, detail="SAT secret not configured")
+    return sat_secret
+
+
+def _parse_bearer_token(value: str) -> Optional[str]:
+    if not value:
+        return None
+    parts = value.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
+def verify_sat(token: str) -> SatClaims:
+    try:
+        header_encoded, payload_encoded, signature_encoded = token.split(".", 2)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid sat") from exc
+
+    try:
+        header = json.loads(_b64url_decode(header_encoded))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid sat") from exc
+
+    if header.get("alg") != "HS256" or header.get("typ") != "SAT":
+        raise HTTPException(status_code=401, detail="invalid sat")
+
+    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    expected_signature = hmac.new(
+        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid sat")
+
+    try:
+        payload = SatClaims.model_validate(json.loads(_b64url_decode(payload_encoded)))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid sat") from exc
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if payload.iat > payload.exp:
+        raise HTTPException(status_code=401, detail="invalid sat")
+    if payload.exp < now:
+        raise HTTPException(status_code=401, detail="sat expired")
+
+    return payload
+
+
+async def enforce_sat(
+    token: str | None,
+    scenario_id: str | None,
+    track: str | None,
+    template_id: str | None,
+) -> SatClaims:
+    if not token:
+        raise HTTPException(status_code=401, detail="sat required")
+
+    claims = verify_sat(token)
+    if scenario_id and claims.scenario_id and claims.scenario_id != scenario_id:
+        raise HTTPException(status_code=403, detail="sat scenario mismatch")
+    if track and claims.track != track:
+        raise HTTPException(status_code=403, detail="sat track mismatch")
+    if template_id and claims.template_id != template_id:
+        raise HTTPException(status_code=403, detail="sat template mismatch")
+
+    stored = await replay_protector.check_and_store(claims.jti, claims.exp)
+    if not stored:
+        raise HTTPException(status_code=401, detail="sat replayed")
+
+    return claims
 
 
 async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
@@ -271,6 +422,19 @@ async def process_spawn_request(msg: Any) -> None:
         scenario_id = data.get("scenario_id")
         track = data.get("track")
         request_id = data.get("request_id")
+        sat = data.get("sat")
+
+        if not scenario_id or not track:
+            logger.warning("Spawn request missing scenario_id or track")
+            await msg.ack()
+            return
+
+        try:
+            await enforce_sat(sat, scenario_id, track, track)
+        except HTTPException as exc:
+            logger.warning("Spawn request denied: %s", exc.detail)
+            await msg.ack()
+            return
 
         logger.info(
             "Processing spawn request: scenario_id=%s track=%s request_id=%s",
@@ -278,6 +442,16 @@ async def process_spawn_request(msg: Any) -> None:
             track,
             request_id,
         )
+
+        # Load and validate template
+        template = load_template(track)
+
+        # Check OPA policy
+        allowed, reason = await check_opa_policy(template)
+        if not allowed:
+            logger.warning("Scenario %s denied by policy: %s", scenario_id, reason)
+            await msg.ack()
+            return
 
         # Create scenario state
         state = ScenarioState(
@@ -287,18 +461,6 @@ async def process_spawn_request(msg: Any) -> None:
             status=ScenarioStatus.CREATING,
         )
         scenarios[scenario_id] = state
-
-        # Load and validate template
-        template = load_template(track)
-
-        # Check OPA policy
-        allowed, reason = await check_opa_policy(template)
-        if not allowed:
-            state.status = ScenarioStatus.FAILED
-            state.error = reason
-            logger.warning("Scenario %s denied by policy: %s", scenario_id, reason)
-            await msg.ack()
-            return
 
         # Create network
         network_id = create_scenario_network(scenario_id)
@@ -421,10 +583,16 @@ def readyz() -> dict:
 
 
 @app.post("/v1/scenarios", response_model=CreateScenarioResponse)
-async def create_scenario(request: CreateScenarioRequest) -> CreateScenarioResponse:
+async def create_scenario(
+    request: CreateScenarioRequest, http_request: Request
+) -> CreateScenarioResponse:
     """Create a new scenario (direct API, bypasses NATS)."""
     scenario_id = request.scenario_id
     track = request.template
+    token = http_request.headers.get("x-sat")
+    if not token:
+        token = _parse_bearer_token(http_request.headers.get("authorization", ""))
+    await enforce_sat(token, scenario_id, track, track)
 
     # Check if already exists
     if scenario_id in scenarios:
