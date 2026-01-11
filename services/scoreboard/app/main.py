@@ -67,6 +67,7 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "forgeadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "forgeadmin123")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "forge-evidence")
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "storage"))
+SIGNING_KEY_PATH = os.getenv("SIGNING_KEY_PATH")
 
 # Signing key (in production, load from Vault/KMS)
 SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
@@ -158,9 +159,16 @@ def get_signing_key() -> ed25519.Ed25519PrivateKey:
     """Get or generate signing key."""
     global SIGNING_KEY
     if SIGNING_KEY is None:
-        # In production, load from secure storage
-        SIGNING_KEY = ed25519.Ed25519PrivateKey.generate()
-        logger.warning("Generated ephemeral signing key - use KMS in production")
+        if SIGNING_KEY_PATH:
+            key_path = Path(SIGNING_KEY_PATH)
+            if not key_path.exists():
+                raise FileNotFoundError("SIGNING_KEY_PATH does not exist")
+            key_bytes = key_path.read_bytes()
+            SIGNING_KEY = serialization.load_pem_private_key(key_bytes, password=None)
+        else:
+            # In production, load from secure storage
+            SIGNING_KEY = ed25519.Ed25519PrivateKey.generate()
+            logger.warning("Generated ephemeral signing key - use KMS in production")
     return SIGNING_KEY
 
 
@@ -237,6 +245,31 @@ def _require_internal_auth(request: Request) -> None:
 
 def _results_dir(scenario_id: str) -> Path:
     return STORAGE_ROOT / "scenarios" / scenario_id / "results"
+
+
+def _check_storage_writable() -> None:
+    scenarios_dir = STORAGE_ROOT / "scenarios"
+    try:
+        scenarios_dir.mkdir(parents=True, exist_ok=True)
+        test_file = scenarios_dir / ".readyz"
+        test_file.write_bytes(b"")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503, detail=f"storage not writable: {exc}"
+        ) from exc
+    finally:
+        test_file = scenarios_dir / ".readyz"
+        if test_file.exists():
+            test_file.unlink()
+
+
+def _check_signing_key_ready() -> None:
+    try:
+        get_signing_key()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail=f"signing key unavailable: {exc}"
+        ) from exc
 
 
 def _public_key_b64() -> str:
@@ -510,6 +543,8 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz() -> dict:
+    _check_storage_writable()
+    _check_signing_key_ready()
     return {"status": "ready", "service": "forge_scoreboard"}
 
 
