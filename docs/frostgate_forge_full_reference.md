@@ -152,11 +152,12 @@ environment:
 **Key Operations**:
 1. Receive spawn request from NATS `spawn.request`
 2. Load template from `/templates`
-3. Query OPA for policy decision
-4. Create scenario network (Docker network or k8s namespace)
-5. Launch scenario containers
-6. Publish `scenario.created` event
-7. Monitor for completion/timeout
+3. Query OPA for training policy decision
+4. Query OPA for capabilities policy decision (track/tier capability allowlist + privileged capability enforcement)
+5. Create scenario network (Docker network or k8s namespace)
+6. Launch scenario containers
+7. Publish `scenario.created` event
+8. Monitor for completion/timeout
 
 ### forge_worker_agent
 
@@ -615,6 +616,83 @@ deny_reasons[msg] {
 }
 ```
 
+**Capabilities Policy (example)**:
+```rego
+package frostgate.forge.capabilities
+
+default allow = false
+
+privileged_caps := {
+    "SYS_ADMIN",
+    "SYS_MODULE",
+    "SYS_PTRACE",
+    "SYS_TIME",
+    "DAC_OVERRIDE",
+}
+
+track_tier_caps := {
+    "netplus": {
+        "foundation": [],
+        "intermediate": ["NET_ADMIN"],
+        "advanced": ["NET_ADMIN", "NET_RAW"],
+    },
+    "ccna": {
+        "foundation": ["NET_ADMIN"],
+        "intermediate": ["NET_ADMIN", "NET_RAW"],
+        "advanced": ["NET_ADMIN", "NET_RAW"],
+    },
+    "cissp": {
+        "foundation": ["NET_ADMIN"],
+        "intermediate": ["NET_ADMIN", "NET_RAW"],
+        "advanced": ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_PTRACE"],
+    },
+}
+
+get_track(labels) = track {
+    some label
+    label := labels[_]
+    startswith(label, "class:")
+    track := substring(label, 6, -1)
+}
+
+get_tier(labels) = tier {
+    some label
+    label := labels[_]
+    startswith(label, "tier:")
+    tier := substring(label, 5, -1)
+}
+
+allow {
+    track := get_track(input.metadata.labels)
+    tier := get_tier(input.metadata.labels)
+    allowed_caps := track_tier_caps[track][tier]
+    containers_caps_allowed(input.spec.assets.containers, allowed_caps)
+}
+
+containers_caps_allowed(containers, allowed_caps) {
+    count([c |
+        c := containers[_]
+        cap := object.get(c, "capabilities", [])[_]
+        not cap_in_allowlist(cap, allowed_caps)
+    ]) == 0
+}
+
+cap_in_allowlist(cap, allowed_caps) {
+    allowed_caps[_] == cap
+}
+
+deny_reasons[msg] {
+    track := get_track(input.metadata.labels)
+    tier := get_tier(input.metadata.labels)
+    allowed_caps := track_tier_caps[track][tier]
+    container := input.spec.assets.containers[_]
+    cap := object.get(container, "capabilities", [])[_]
+    privileged_caps[cap]
+    not cap_in_allowlist(cap, allowed_caps)
+    msg := sprintf("privileged capability %s not allowed for %s/%s", [cap, track, tier])
+}
+```
+
 ### Network Isolation
 
 Each scenario runs in an isolated Docker network:
@@ -757,6 +835,24 @@ spec:
             exit_code: 0
             stdout_contains: "nginx"
 ```
+
+### Capabilities by Track/Tier
+
+The `spec.assets.containers[].capabilities` field is optional. When provided, each container's capability list **must** be a subset of the allowlist for its track and tier. Capabilities not listed below are rejected by policy. Privileged capabilities require explicit allowlist inclusion for that track/tier.
+
+**Privileged capability set** (always denied unless explicitly allowed): `SYS_ADMIN`, `SYS_MODULE`, `SYS_PTRACE`, `SYS_TIME`, `DAC_OVERRIDE`.
+
+| Track | Tier | Allowed Linux Capabilities |
+| --- | --- | --- |
+| netplus | foundation | *(none)* |
+| netplus | intermediate | `NET_ADMIN` |
+| netplus | advanced | `NET_ADMIN`, `NET_RAW` |
+| ccna | foundation | `NET_ADMIN` |
+| ccna | intermediate | `NET_ADMIN`, `NET_RAW` |
+| ccna | advanced | `NET_ADMIN`, `NET_RAW` |
+| cissp | foundation | `NET_ADMIN` |
+| cissp | intermediate | `NET_ADMIN`, `NET_RAW` |
+| cissp | advanced | `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, `SYS_PTRACE` |
 
 ### DSL Validation Schema
 
