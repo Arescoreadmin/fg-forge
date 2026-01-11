@@ -94,6 +94,13 @@ FrostGate Forge delivers training-as-a-service with the following core capabilit
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Egress Routing Model
+
+- Scenario containers attach only to the isolated scenario network and use the egress gateway container as their default route for `0.0.0.0/0`.
+- The egress gateway is the only container with a second interface on an upstream "egress" network; it performs NAT (masquerade) on outbound traffic so external destinations never see per-container IPs.
+- By default, nftables applies a deny-all policy. Allowlisted destinations are the only paths that traverse the gateway; everything else is dropped and logged.
+- If the gateway is absent or disabled, the scenario network remains internal and no external egress is possible.
+
 ### Service Registry
 
 | Service | Port | Purpose |
@@ -244,6 +251,20 @@ playbook:
 
 **Purpose**: Enforce deny-all egress with optional allowlist profiles.
 
+**Routing & Attachment**:
+- Each scenario network sets the egress gateway as the default route for containers that require outbound access.
+- The gateway container attaches to the scenario network plus a dedicated upstream egress network, making it the single chokepoint for outbound traffic.
+- Containers never get direct connectivity to the upstream network; they only reach it through the gateway.
+
+**NAT Enforcement**:
+- The gateway performs outbound NAT (masquerade) so external endpoints see only the gateway IP.
+- Reply traffic is permitted for established/related flows; unsolicited inbound is dropped.
+
+**Egress Blocking**:
+- nftables uses a default drop policy on outbound paths.
+- When no allowlist profile is applied, only internal RFC1918 traffic is permitted; all other destinations are logged and dropped.
+- When a profile is applied, only explicitly allowed destinations and ports are permitted; everything else is logged and dropped.
+
 **nftables Rules**:
 ```nft
 table inet forge_egress {
@@ -267,6 +288,11 @@ table inet forge_egress {
     }
 }
 ```
+
+**Allowlist Governance & Policy Checks**:
+- **Source-of-truth**: Allowed destination sets are defined by the egress gateway profile catalog (see `services/egress_gateway/app/main.py` and `services/egress_gateway/scripts/setup_nftables.sh`), and are the only profiles that can be selected by `network.allowlist_profile`.
+- **Approval workflow**: New profiles or changes require a policy/infra review with explicit approval in version control before deployment (change request + PR approval from the platform security owner).
+- **OPA checks**: Training gate policy must validate that `network.egress == "allowlist"` only when `network.allowlist_profile` is present and matches an approved profile name; any missing or unknown profile is denied.
 
 ---
 
@@ -1036,6 +1062,21 @@ curl -X POST http://localhost:8181/v1/data/frostgate/forge/training/allow \
 **View Active Scenarios**:
 ```bash
 docker ps --filter "label=forge.scenario_id"
+```
+
+**Verify Egress Enforcement**:
+```bash
+# Confirm gateway ruleset is loaded
+curl http://localhost:8089/v1/ruleset
+
+# From a scenario container, verify external egress is blocked (should fail)
+docker exec -it <scenario_container> curl -sS https://example.com --max-time 5
+
+# If the scenario uses an allowlist profile, verify an allowed destination succeeds
+docker exec -it <scenario_container> curl -sS https://repo.alpine.org --max-time 5
+
+# Inspect gateway deny logs (should include blocked attempts)
+curl http://localhost:8089/v1/logs | tail -n 20
 ```
 
 **Cleanup Stale Scenarios**:
