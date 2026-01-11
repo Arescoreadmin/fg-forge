@@ -63,6 +63,7 @@ TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 OPA_URL = os.getenv("OPA_URL", "http://forge_opa:8181")
 NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
 NETWORK_PREFIX = "forge_scn_"
+SCOREBOARD_URL = os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080")
 
 
 class ScenarioStatus(str, Enum):
@@ -70,6 +71,7 @@ class ScenarioStatus(str, Enum):
     CREATING = "creating"
     RUNNING = "running"
     COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
     FAILED = "failed"
     TIMEOUT = "timeout"
 
@@ -83,6 +85,8 @@ class ScenarioState(BaseModel):
     containers: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: datetime | None = None
+    completion_reason: str | None = None
     error: str | None = None
 
 
@@ -96,6 +100,11 @@ class CreateScenarioResponse(BaseModel):
     scenario_id: str
     status: ScenarioStatus
     network_id: str | None = None
+
+
+class ScenarioCompletionRequest(BaseModel):
+    completion_reason: str
+    completion_timestamp: datetime | None = None
 
 
 class SatClaims(BaseModel):
@@ -222,6 +231,46 @@ def _parse_bearer_token(value: str) -> Optional[str]:
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None
+
+
+def _require_internal_auth(request: Request) -> None:
+    expected = os.getenv("ORCHESTRATOR_INTERNAL_TOKEN")
+    if not expected:
+        logger.error("ORCHESTRATOR_INTERNAL_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="internal auth not configured")
+    token = request.headers.get("x-internal-token", "")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="internal auth required")
+
+
+def _scoreboard_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=5.0)
+
+
+async def _trigger_scoreboard(
+    scenario_id: str,
+    track: str,
+    completion_reason: str,
+    completed_at: datetime,
+) -> None:
+    token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
+    if not token:
+        raise RuntimeError("SCOREBOARD_INTERNAL_TOKEN not configured")
+    payload = {
+        "scenario_id": scenario_id,
+        "track": track,
+        "completion_reason": completion_reason,
+        "completed_at": completed_at.isoformat(),
+    }
+    headers = {"x-internal-token": token}
+    async with _scoreboard_client() as client:
+        response = await client.post(
+            f"/internal/scenario/{scenario_id}/score", json=payload, headers=headers
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"scoreboard error {response.status_code}: {response.text}"
+            )
 
 
 def verify_sat(token: str) -> SatClaims:
@@ -425,6 +474,45 @@ def cleanup_scenario(scenario_id: str) -> None:
             logger.warning("Failed to remove network %s: %s", network.name, e)
 
 
+async def complete_scenario(
+    scenario_id: str, completion_reason: str, completion_timestamp: datetime | None = None
+) -> ScenarioState:
+    if scenario_id not in scenarios:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    state = scenarios[scenario_id]
+    completed_at = completion_timestamp or datetime.now(timezone.utc)
+    state.completed_at = completed_at
+    state.completion_reason = completion_reason
+    state.updated_at = datetime.now(timezone.utc)
+
+    logger.info(
+        "Scenario completed: scenario_id=%s reason=%s completed_at=%s",
+        scenario_id,
+        completion_reason,
+        completed_at.isoformat(),
+    )
+
+    try:
+        await _trigger_scoreboard(
+            scenario_id,
+            state.track,
+            completion_reason,
+            completed_at,
+        )
+        state.status = ScenarioStatus.COMPLETED
+    except Exception as exc:
+        state.status = ScenarioStatus.COMPLETED_WITH_ERRORS
+        state.error = str(exc)
+        logger.error(
+            "Scenario %s scoring failed: %s",
+            scenario_id,
+            exc,
+        )
+        raise HTTPException(status_code=502, detail=f"scoring failed: {exc}") from exc
+
+    return state
+
+
 async def process_spawn_request(msg: Any) -> None:
     """Process incoming spawn request from NATS."""
     try:
@@ -592,7 +680,19 @@ def healthz() -> dict:
 
 
 @app.get("/readyz")
-def readyz() -> dict:
+async def readyz() -> dict:
+    try:
+        async with _scoreboard_client() as client:
+            response = await client.get("/readyz")
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503, detail=f"scoreboard unavailable: {exc}"
+        ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503,
+            detail=f"scoreboard unhealthy: {response.status_code}",
+        )
     return {"status": "ready", "service": "forge_orchestrator"}
 
 
@@ -688,3 +788,17 @@ async def delete_scenario(scenario_id: str) -> dict:
 async def list_scenarios() -> list[ScenarioState]:
     """List all scenarios."""
     return list(scenarios.values())
+
+
+@app.post("/internal/scenario/{scenario_id}/complete")
+async def complete_scenario_endpoint(
+    scenario_id: str,
+    payload: ScenarioCompletionRequest,
+    request: Request,
+) -> ScenarioState:
+    _require_internal_auth(request)
+    return await complete_scenario(
+        scenario_id,
+        payload.completion_reason,
+        payload.completion_timestamp,
+    )
