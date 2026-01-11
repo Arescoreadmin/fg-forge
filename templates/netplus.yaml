@@ -1,0 +1,23 @@
+metadata:
+  name: netplus-foundations
+  labels:
+    - class:netplus
+    - tier:foundation
+limits:
+  cpu: 2
+  memory_mb: 2048
+  attacker_max_exploits: 0
+network:
+  egress: deny
+  allowlist_profile: null
+assets:
+  containers:
+    - name: learner_vm
+      image: alpine:3.19
+      read_only: true
+successCriteria:
+  - id: netplus-ping
+    description: "Learner can reach gateway interface"
+    evidence:
+      - type: command
+        command: "ping -c 1 10.10.0.1"

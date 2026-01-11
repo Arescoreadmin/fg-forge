@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: forge_spawn_service
+    static_configs:
+      - targets: ["forge_spawn_service:8080"]
