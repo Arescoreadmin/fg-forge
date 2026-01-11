@@ -273,6 +273,10 @@ table inet forge_egress {
 
 Create a new training scenario.
 
+**Authentication**:
+- OAuth2/JWT bearer token (`Authorization: Bearer <token>`) is required for all non-health endpoints.
+- Tokens must include tenant and role claims (see [Tenant Boundaries and Claims](#tenant-boundaries-and-claims)).
+
 **Request**:
 ```json
 {
@@ -297,13 +301,18 @@ Create a new training scenario.
 
 **Errors**:
 - `400`: Missing request_id or unsupported track
-- `403`: OPA policy denied
+- `401`: Missing/invalid bearer token
+- `403`: OPA policy denied or insufficient role/tenant scope
+- `429`: Rate limit exceeded (per-tenant quotas; retry with backoff)
 - `502`: OPA unavailable
 - `500`: Internal error
 
 #### GET /health
 
 Health check endpoint.
+
+**Authentication**:
+- None (public/internal readiness probe)
 
 **Response**:
 ```json
@@ -318,6 +327,11 @@ Health check endpoint.
 #### POST /v1/scenarios
 
 Internal API for scenario creation.
+
+**Authentication**:
+- Mutual TLS (mTLS) between services for internal calls.
+- OAuth2/JWT bearer token may be required when called from external control planes.
+- Tokens must include tenant and role claims (see [Tenant Boundaries and Claims](#tenant-boundaries-and-claims)).
 
 **Request**:
 ```json
@@ -337,9 +351,19 @@ Internal API for scenario creation.
 }
 ```
 
+**Errors**:
+- `401`: Missing/invalid bearer token (when token auth is enabled)
+- `403`: mTLS identity or token claims not authorized for tenant or role
+- `429`: Rate limit exceeded (per-tenant quotas; retry with backoff)
+
 #### GET /v1/scenarios/{scenario_id}
 
 Get scenario status.
+
+**Authentication**:
+- Mutual TLS (mTLS) between services for internal calls.
+- OAuth2/JWT bearer token may be required when called from external control planes.
+- Tokens must include tenant and role claims (see [Tenant Boundaries and Claims](#tenant-boundaries-and-claims)).
 
 **Response**:
 ```json
@@ -352,11 +376,20 @@ Get scenario status.
 }
 ```
 
+**Errors**:
+- `401`: Missing/invalid bearer token (when token auth is enabled)
+- `403`: mTLS identity or token claims not authorized for tenant or role
+- `429`: Rate limit exceeded (per-tenant quotas; retry with backoff)
+
 ### Scoreboard API
 
 #### GET /v1/scores/{scenario_id}
 
 Retrieve scenario score.
+
+**Authentication**:
+- OAuth2/JWT bearer token (`Authorization: Bearer <token>`) is required.
+- Tokens must include tenant and role claims (see [Tenant Boundaries and Claims](#tenant-boundaries-and-claims)).
 
 **Response**:
 ```json
@@ -371,6 +404,42 @@ Retrieve scenario score.
   "verdict_url": "s3://forge-evidence/scn-def456789012/verdict.sig"
 }
 ```
+
+**Errors**:
+- `401`: Missing/invalid bearer token
+- `403`: Token claims not authorized for tenant or role
+- `429`: Rate limit exceeded (per-tenant quotas; retry with backoff)
+
+### Tenant Boundaries and Claims
+
+All API calls are scoped to a tenant boundary. The caller must present identity claims that bind the request to a single tenant, and policies enforce that access is limited to that tenant's resources.
+
+**Required claims**:
+- `tenant_id`: Identifier for the tenant owning the scenario and data.
+- `roles`: One or more roles (e.g., `forge.spawn`, `forge.orchestrator`, `forge.score.read`).
+
+**Enforcement**:
+- Spawn requests are authorized only when the caller's `tenant_id` matches the requested tenant context (or is resolved from the caller identity) and the `roles` claim includes `forge.spawn`.
+- Orchestrator operations require `forge.orchestrator` and must operate only on scenarios tagged to the caller's `tenant_id`.
+- Score retrieval requires `forge.score.read` and is limited to scores for scenarios under the same `tenant_id`.
+- OPA policies enforce tenant isolation at request time and deny cross-tenant access with `403`.
+
+### Rate Limiting and Abuse Protections
+
+Rate limits and quotas are enforced per tenant to prevent noisy-neighbor and abuse scenarios.
+
+**Per-tenant quotas**:
+- Request budgets are applied to create, status, and score endpoints.
+- Burst limits are enforced using token bucket or leaky bucket controls.
+
+**Retry and backoff guidance**:
+- When receiving `429 Too Many Requests`, clients should retry with exponential backoff and jitter.
+- The service may return `Retry-After` to indicate a safe delay window.
+
+**Error codes**:
+- `401`: Authentication required or invalid token.
+- `403`: Authorization failed (wrong tenant or missing roles).
+- `429`: Rate limit exceeded (per-tenant quota).
 
 ---
 
