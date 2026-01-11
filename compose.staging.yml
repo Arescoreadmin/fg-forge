@@ -8,6 +8,7 @@ services:
       - OPA_URL=http://forge_opa:8181
       - NATS_URL=nats://forge_nats:4222
       - MINIO_URL=http://forge_minio:9000
+      - TEMPLATE_DIR=/templates
     depends_on:
       - forge_opa
       - forge_nats
