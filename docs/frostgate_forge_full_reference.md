@@ -187,6 +187,10 @@ evidence_types = [
 - `score.json`: Normalized scores per success criterion
 - `evidence.tar.zst`: Compressed evidence artifacts
 - `verdict.sig`: Ed25519 signature over content hashes
+  - **Generation**: Produced after `score.json` and `evidence.tar.zst` are finalized; the signer builds a manifest of SHA-256 hashes for each output plus scenario metadata (scenario_id, run_id, timestamp) and signs the manifest bytes.
+  - **Rotation cadence**: Signing keys rotate every 90 days or on-demand for incident response; old keys remain valid for verification until the retention window expires.
+  - **Storage backend**: Signatures are stored alongside evidence in the primary artifact store (S3-compatible bucket) with immutable object locking enabled when supported.
+  - **Verification steps**: Consumers fetch `verdict.sig`, load the corresponding public key, rebuild the manifest from retrieved artifacts, and verify the Ed25519 signature before accepting scores.
 
 **Scoring Algorithm**:
 ```python
@@ -646,6 +650,29 @@ class AuditEvent(BaseModel):
     details: dict = {}
     signature: str | None = None  # Ed25519 signature
 ```
+
+**Signing authority**: Audit events are signed by the forge_audit service using a dedicated Ed25519 keypair scoped to audit logs.
+
+**Verification endpoints**:
+- `GET /audit/keys/current`: Returns the active audit public key and key_id.
+- `GET /audit/keys/{key_id}`: Returns a specific historical public key for verification.
+- `GET /audit/events/{event_id}/signature`: Returns the detached signature for an audit event.
+
+**Downstream validation**:
+- Consumers fetch the public key from the verification endpoint, compute a canonical JSON representation of the audit event (sorted keys, RFC3339 timestamps), and verify the detached signature.
+- Failed validation results in rejecting the event and alerting the audit pipeline.
+
+**Operational runbook**:
+1. **Key rotation**
+   - Generate a new Ed25519 keypair in the HSM/KMS-backed key store.
+   - Update forge_audit and forge_scoreboard configurations to reference the new key_id.
+   - Publish the new public key via `GET /audit/keys/current` and keep the previous key available through `GET /audit/keys/{key_id}` for the retention window.
+   - Verify rotation by validating a new audit event and a new `verdict.sig` in a staging environment before promoting to production.
+2. **Incident response: suspected key compromise**
+   - Immediately revoke the compromised key_id and remove it from `current` endpoints.
+   - Rotate to a new keypair and re-sign any in-flight audit events or evidence bundles.
+   - Invalidate cached public keys across downstream consumers and force a refresh from verification endpoints.
+   - Run an integrity sweep on the artifact store to identify unsigned or unverifiable evidence and quarantine affected records.
 
 ---
 
