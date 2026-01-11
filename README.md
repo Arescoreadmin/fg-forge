@@ -12,6 +12,7 @@ The canonical architecture and security requirements live in
 
 ```bash
 cp .env.example .env
+echo "SAT_HMAC_SECRET=change-me" >> .env
 docker compose -f compose.yml -f compose.staging.yml up -d --build
 ./scripts/setup_nats_streams.sh
 ```

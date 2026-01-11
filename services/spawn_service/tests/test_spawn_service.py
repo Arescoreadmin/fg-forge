@@ -18,11 +18,12 @@ def b64url_decode(value: str) -> bytes:
 
 
 
-def load_app():
+def load_module():
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
     os.environ.pop("OPA_URL", None)
-    os.environ.setdefault("SAT_SECRET", "test-sat-secret")
+    if "SAT_HMAC_SECRET" not in os.environ and "SAT_SECRET" not in os.environ:
+        os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
 
     module_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
     module_name = f"spawn_service_main_{uuid.uuid4().hex}"
@@ -32,7 +33,11 @@ def load_app():
     if spec.loader is None:
         raise RuntimeError("Failed to load spawn_service module")
     spec.loader.exec_module(module)
-    return module.app
+    return module
+
+
+def load_app():
+    return load_module().app
 
 
 async def request(
@@ -114,7 +119,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_spawn_api_mints_sat_claims(self):
         os.environ["SAT_REQUIRED"] = "false"
-        os.environ["SAT_SECRET"] = "test-sat-secret"
+        os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
         app = load_app()
         response = asyncio.run(
             request(
@@ -135,7 +140,7 @@ class SpawnServiceTests(unittest.TestCase):
         header_encoded, payload_encoded, signature = token.split(".")
         signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
         expected_signature = hmac.new(
-            os.environ["SAT_SECRET"].encode("utf-8"), signing_input, "sha256"
+            os.environ["SAT_HMAC_SECRET"].encode("utf-8"), signing_input, "sha256"
         ).digest()
         expected_encoded = (
             base64.urlsafe_b64encode(expected_signature).rstrip(b"=").decode("utf-8")
@@ -149,6 +154,16 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(payload["template_id"], "netplus")
         self.assertEqual(payload["subject"], "user-789")
         self.assertEqual(payload["tier"], "pro")
+
+    def test_sat_secret_alias_warning_emitted_once(self):
+        os.environ.pop("SAT_HMAC_SECRET", None)
+        os.environ["SAT_SECRET"] = "legacy-secret"
+        module = load_module()
+        with self.assertLogs("forge_spawn_service", level="WARNING") as logs:
+            module._get_sat_secret()
+            module._get_sat_secret()
+        warnings = [record for record in logs.output if "SAT_SECRET is deprecated" in record]
+        self.assertEqual(len(warnings), 1)
 
 
 if __name__ == "__main__":

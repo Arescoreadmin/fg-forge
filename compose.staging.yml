@@ -9,6 +9,7 @@ services:
       - NATS_URL=nats://forge_nats:4222
       - MINIO_URL=http://forge_minio:9000
       - TEMPLATE_DIR=/templates
+      - SAT_HMAC_SECRET=${SAT_HMAC_SECRET}
     depends_on:
       - forge_opa
       - forge_nats

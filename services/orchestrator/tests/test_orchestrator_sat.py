@@ -32,7 +32,8 @@ def mint_sat(secret: str, claims: dict) -> str:
 def load_module():
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
-    os.environ["SAT_SECRET"] = "test-sat-secret"
+    if "SAT_HMAC_SECRET" not in os.environ and "SAT_SECRET" not in os.environ:
+        os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
 
     module_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
     module_name = f"orchestrator_main_{uuid.uuid4().hex}"
@@ -72,7 +73,7 @@ class OrchestratorSatTests(unittest.TestCase):
             "subject": "user-1",
             "tier": "free",
         }
-        token = mint_sat(os.environ["SAT_SECRET"], claims)
+        token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
         asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus"))
         with self.assertRaises(module.HTTPException):
             asyncio.run(module.enforce_sat(token, "scn-1", "netplus", "netplus"))
@@ -101,7 +102,7 @@ class OrchestratorSatTests(unittest.TestCase):
             "tier": "pro",
             "scenario_id": "scn-opa",
         }
-        token = mint_sat(os.environ["SAT_SECRET"], claims)
+        token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
 
         async def deny_policy(_template: dict):
             return False, "OPA unavailable"
@@ -119,6 +120,16 @@ class OrchestratorSatTests(unittest.TestCase):
         asyncio.run(module.process_spawn_request(msg))
         self.assertTrue(msg.acked)
         self.assertEqual(module.scenarios, {})
+
+    def test_sat_secret_alias_warning_emitted_once(self):
+        os.environ.pop("SAT_HMAC_SECRET", None)
+        os.environ["SAT_SECRET"] = "legacy-secret"
+        module = load_module()
+        with self.assertLogs("forge_orchestrator", level="WARNING") as logs:
+            module._get_sat_secret()
+            module._get_sat_secret()
+        warnings = [record for record in logs.output if "SAT_SECRET is deprecated" in record]
+        self.assertEqual(len(warnings), 1)
 
 
 if __name__ == "__main__":

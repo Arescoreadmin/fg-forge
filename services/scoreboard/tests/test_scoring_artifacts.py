@@ -1,0 +1,89 @@
+import base64
+import gzip
+import importlib.util
+import json
+import sys
+import tarfile
+import tempfile
+import unittest
+import uuid
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+
+
+def load_module():
+    repo_root = Path(__file__).resolve().parents[3]
+    module_path = repo_root / "services" / "scoreboard" / "app" / "main.py"
+    module_name = f"scoreboard_main_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    if spec.loader is None:
+        raise RuntimeError("Failed to load scoreboard module")
+    spec.loader.exec_module(module)
+    return module
+
+
+class ScoreboardArtifactsTests(unittest.TestCase):
+    def test_score_json_deterministic(self):
+        module = load_module()
+        fixed_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        score = module.ScoreResult(
+            scenario_id="scn-1",
+            track="netplus",
+            score=0.5,
+            passed=1,
+            total=2,
+            criteria=[],
+            computed_at=fixed_time,
+        )
+        first = module._score_json_bytes(score)
+        second = module._score_json_bytes(score)
+        self.assertEqual(first, second)
+        payload = json.loads(first.decode("utf-8"))
+        self.assertEqual(payload["computed_at"], fixed_time.isoformat())
+
+    def test_build_evidence_bundle_includes_artifacts(self):
+        module = load_module()
+        scenario_id = "scn-123"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts_dir = Path(tmpdir) / scenario_id / "artifacts"
+            artifacts_dir.mkdir(parents=True)
+            (artifacts_dir / "sample.txt").write_text("artifact-data", encoding="utf-8")
+            bundle = module.build_evidence_bundle(
+                scenario_id,
+                "netplus",
+                "s3://forge-evidence/scn-123/evidence.tar.gz",
+                tmpdir,
+            )
+
+            if bundle.filename.endswith(".zst"):
+                try:
+                    import zstandard as zstd
+                except ImportError as exc:  # pragma: no cover
+                    self.fail(f"zstandard unavailable for {bundle.filename}: {exc}")
+                raw_tar = zstd.ZstdDecompressor().decompress(bundle.payload)
+            else:
+                raw_tar = gzip.decompress(bundle.payload)
+
+            with tarfile.open(fileobj=BytesIO(raw_tar), mode="r:") as tar:
+                names = tar.getnames()
+            self.assertIn("logs/scoreboard.log", names)
+            self.assertIn("telemetry/scoreboard.json", names)
+            self.assertIn("source_evidence.txt", names)
+            self.assertIn("artifacts/sample.txt", names)
+
+    def test_sign_verdict_uses_hashes(self):
+        module = load_module()
+        module.SIGNING_KEY = module.ed25519.Ed25519PrivateKey.generate()
+        score_hash = "a" * 64
+        evidence_hash = "b" * 64
+        verdict = module.sign_verdict(score_hash, evidence_hash, "scn-1")
+        message = f"{score_hash}:{evidence_hash}".encode("utf-8")
+        signature_bytes = base64.b64decode(verdict.signature)
+        module.SIGNING_KEY.public_key().verify(signature_bytes, message)
+
+
+if __name__ == "__main__":
+    unittest.main()
