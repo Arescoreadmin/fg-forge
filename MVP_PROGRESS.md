@@ -7,6 +7,16 @@
 - Implemented SAT minting/verification with expiry and replay protection, plus orchestrator SAT enforcement and OPA pre-launch gating tests.
 - Standardized SAT_HMAC_SECRET with legacy SAT_SECRET warnings and updated compose/docs.
 - Implemented scoring artifacts pipeline with deterministic score.json, evidence bundles, and verdict signatures plus tests.
+- Added internal scenario completion endpoint in orchestrator with auth guard, scoreboard-triggered scoring, and completion status handling.
+- Wrote scoring artifacts to storage/scenarios/<scenario_id>/results with verdict signatures and public keys.
+- Added an end-to-end integration test covering SAT mint/verify, completion, scoring artifacts, and signature verification.
+
+## How to run locally
+```
+python -m unittest discover -s services/spawn_service/tests
+python -m unittest discover -s services/orchestrator/tests
+python -m unittest discover -s services/scoreboard/tests
+```
 
 ## Remaining
 - Enable non-dry-run deny-all egress enforcement with NET_ADMIN capabilities in production compose.

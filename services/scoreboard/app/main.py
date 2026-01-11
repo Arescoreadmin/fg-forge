@@ -11,6 +11,7 @@ import base64
 import contextvars
 import gzip
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import nats
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
 from minio import Minio
@@ -64,6 +66,7 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "forge_minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "forgeadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "forgeadmin123")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "forge-evidence")
+STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "storage"))
 
 # Signing key (in production, load from Vault/KMS)
 SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
@@ -101,6 +104,17 @@ class ScoreboardEntry(BaseModel):
     evidence_url: str
     verdict_url: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ScenarioCompletionPayload(BaseModel):
+    scenario_id: str
+    track: str
+    completion_reason: str
+    completed_at: datetime
+    score: float | None = None
+    passed: int | None = None
+    total: int | None = None
+    criteria: list[dict] = Field(default_factory=list)
 
 
 # In-memory scoreboard (production would use persistent storage)
@@ -211,6 +225,58 @@ def _tar_add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
     tar.addfile(info, BytesIO(data))
 
 
+def _require_internal_auth(request: Request) -> None:
+    expected = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
+    if not expected:
+        logger.error("SCOREBOARD_INTERNAL_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="internal auth not configured")
+    token = request.headers.get("x-internal-token", "")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="internal auth required")
+
+
+def _results_dir(scenario_id: str) -> Path:
+    return STORAGE_ROOT / "scenarios" / scenario_id / "results"
+
+
+def _public_key_b64() -> str:
+    public_key = get_signing_key().public_key()
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(public_bytes).decode("utf-8")
+
+
+def store_score_artifacts_filesystem(
+    scenario_id: str,
+    score_bytes: bytes,
+    evidence: EvidenceBundle,
+    verdict: Verdict,
+) -> tuple[str, str, str, str]:
+    results_dir = _results_dir(scenario_id)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    score_path = results_dir / "score.json"
+    score_path.write_bytes(score_bytes)
+
+    evidence_path = results_dir / evidence.filename
+    evidence_path.write_bytes(evidence.payload)
+
+    verdict_path = results_dir / "verdict.sig"
+    verdict_path.write_text(verdict.model_dump_json(indent=2), encoding="utf-8")
+
+    public_key_path = results_dir / "verdict.pub"
+    public_key_path.write_text(_public_key_b64(), encoding="utf-8")
+
+    return (
+        score_path.as_posix(),
+        evidence_path.as_posix(),
+        verdict_path.as_posix(),
+        public_key_path.as_posix(),
+    )
+
+
 def build_evidence_bundle(
     scenario_id: str,
     track: str,
@@ -280,52 +346,56 @@ def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdi
     )
 
 
-def store_score_artifacts(
-    scenario_id: str,
-    score_bytes: bytes,
-    evidence: EvidenceBundle,
-    verdict: Verdict,
-) -> tuple[str, str, str]:
-    """Store score.json, evidence bundle, and verdict.sig in MinIO."""
-    client = get_minio_client()
-
-    # Store score.json
-    score_object = f"{scenario_id}/score.json"
-    client.put_object(
-        MINIO_BUCKET,
-        score_object,
-        BytesIO(score_bytes),
-        len(score_bytes),
-        content_type="application/json",
+def build_score_result(payload: ScenarioCompletionPayload) -> ScoreResult:
+    if payload.criteria:
+        score = calculate_score(payload.criteria)
+        score.scenario_id = payload.scenario_id
+        score.track = payload.track
+        return score
+    return ScoreResult(
+        scenario_id=payload.scenario_id,
+        track=payload.track,
+        score=payload.score or 0.0,
+        passed=payload.passed or 0,
+        total=payload.total or 0,
+        criteria=payload.criteria,
     )
 
-    evidence_object = f"{scenario_id}/{evidence.filename}"
-    client.put_object(
-        MINIO_BUCKET,
-        evidence_object,
-        BytesIO(evidence.payload),
-        len(evidence.payload),
-        content_type=evidence.content_type,
+
+def finalize_scoring(
+    payload: ScenarioCompletionPayload,
+    evidence_url: str,
+    artifacts_root: str | None,
+) -> ScoreboardEntry:
+    score = build_score_result(payload)
+    score_bytes = _score_json_bytes(score)
+    score_hash = _hash_bytes(score_bytes)
+    evidence_bundle = build_evidence_bundle(
+        payload.scenario_id,
+        payload.track,
+        evidence_url,
+        artifacts_root,
+    )
+    evidence_hash = _hash_bytes(evidence_bundle.payload)
+    verdict = sign_verdict(score_hash, evidence_hash, payload.scenario_id)
+
+    score_path, evidence_path, verdict_path, _ = store_score_artifacts_filesystem(
+        payload.scenario_id,
+        score_bytes,
+        evidence_bundle,
+        verdict,
     )
 
-    # Store verdict.sig
-    verdict_json = verdict.model_dump_json(indent=2)
-    verdict_bytes = verdict_json.encode()
-    verdict_object = f"{scenario_id}/verdict.sig"
-    client.put_object(
-        MINIO_BUCKET,
-        verdict_object,
-        BytesIO(verdict_bytes),
-        len(verdict_bytes),
-        content_type="application/json",
+    entry = ScoreboardEntry(
+        scenario_id=payload.scenario_id,
+        track=payload.track,
+        score=score,
+        evidence_url=f"file://{evidence_path}",
+        verdict_url=f"file://{verdict_path}",
     )
-
-    logger.info("Stored score artifacts for %s", scenario_id)
-    return (
-        f"s3://{MINIO_BUCKET}/{score_object}",
-        f"s3://{MINIO_BUCKET}/{evidence_object}",
-        f"s3://{MINIO_BUCKET}/{verdict_object}",
-    )
+    scoreboard[payload.scenario_id] = entry
+    logger.info("Stored score artifacts for %s", payload.scenario_id)
+    return entry
 
 
 async def process_scenario_completed(msg: Any) -> None:
@@ -338,50 +408,29 @@ async def process_scenario_completed(msg: Any) -> None:
 
         logger.info("Processing scenario.completed: %s", scenario_id)
 
-        # Build score result from incoming data
-        score = ScoreResult(
+        payload = ScenarioCompletionPayload(
             scenario_id=scenario_id,
             track=track,
-            score=data.get("score", 0.0),
-            passed=data.get("passed", 0),
-            total=data.get("total", 0),
+            completion_reason=data.get("completion_reason", "nats_event"),
+            completed_at=datetime.now(timezone.utc),
+            score=data.get("score"),
+            passed=data.get("passed"),
+            total=data.get("total"),
             criteria=data.get("criteria", []),
         )
 
-        score_bytes = _score_json_bytes(score)
-        score_hash = _hash_bytes(score_bytes)
-        evidence_bundle = build_evidence_bundle(
-            scenario_id,
-            track,
+        entry = finalize_scoring(
+            payload,
             evidence_url,
             os.getenv("SCENARIO_ARTIFACTS_ROOT"),
         )
-        evidence_hash = _hash_bytes(evidence_bundle.payload)
-
-        # Create signed verdict
-        verdict = sign_verdict(score_hash, evidence_hash, scenario_id)
-
-        # Store artifacts
-        score_url, evidence_url, verdict_url = store_score_artifacts(
-            scenario_id, score_bytes, evidence_bundle, verdict
-        )
-
-        # Update scoreboard
-        entry = ScoreboardEntry(
-            scenario_id=scenario_id,
-            track=track,
-            score=score,
-            evidence_url=evidence_url,
-            verdict_url=verdict_url,
-        )
-        scoreboard[scenario_id] = entry
 
         logger.info(
             "Finalized score for %s: %.2f (%d/%d)",
             scenario_id,
-            score.score,
-            score.passed,
-            score.total,
+            entry.score.score,
+            entry.score.passed,
+            entry.score.total,
         )
 
         await msg.ack()
@@ -462,6 +511,38 @@ def healthz() -> dict:
 @app.get("/readyz")
 def readyz() -> dict:
     return {"status": "ready", "service": "forge_scoreboard"}
+
+
+@app.post("/internal/scenario/{scenario_id}/score")
+async def score_internal(
+    scenario_id: str,
+    payload: ScenarioCompletionPayload,
+    request: Request,
+) -> dict:
+    _require_internal_auth(request)
+    if payload.scenario_id != scenario_id:
+        raise HTTPException(status_code=400, detail="scenario_id mismatch")
+
+    logger.info(
+        "Internal scoring request: scenario_id=%s reason=%s completed_at=%s",
+        scenario_id,
+        payload.completion_reason,
+        payload.completed_at.isoformat(),
+    )
+
+    entry = finalize_scoring(
+        payload,
+        evidence_url="",
+        artifacts_root=os.getenv("SCENARIO_ARTIFACTS_ROOT"),
+    )
+    results_dir = _results_dir(scenario_id)
+    return {
+        "scenario_id": scenario_id,
+        "status": "scored",
+        "results_dir": results_dir.as_posix(),
+        "evidence_url": entry.evidence_url,
+        "verdict_url": entry.verdict_url,
+    }
 
 
 @app.get("/v1/scores/{scenario_id}")

@@ -84,6 +84,39 @@ class ScoreboardArtifactsTests(unittest.TestCase):
         signature_bytes = base64.b64decode(verdict.signature)
         module.SIGNING_KEY.public_key().verify(signature_bytes, message)
 
+    def test_store_score_artifacts_filesystem(self):
+        module = load_module()
+        module.SIGNING_KEY = module.ed25519.Ed25519PrivateKey.generate()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module.STORAGE_ROOT = Path(tmpdir)
+            scenario_id = "scn-local"
+            score = module.ScoreResult(
+                scenario_id=scenario_id,
+                track="netplus",
+                score=1.0,
+                passed=1,
+                total=1,
+                criteria=[],
+            )
+            score_bytes = module._score_json_bytes(score)
+            score_hash = module._hash_bytes(score_bytes)
+            evidence = module.build_evidence_bundle(
+                scenario_id, "netplus", "", artifacts_root=None
+            )
+            evidence_hash = module._hash_bytes(evidence.payload)
+            verdict = module.sign_verdict(score_hash, evidence_hash, scenario_id)
+            score_path, evidence_path, verdict_path, pub_path = (
+                module.store_score_artifacts_filesystem(
+                    scenario_id, score_bytes, evidence, verdict
+                )
+            )
+
+            results_dir = Path(tmpdir) / "scenarios" / scenario_id / "results"
+            self.assertEqual(Path(score_path), results_dir / "score.json")
+            self.assertTrue(Path(evidence_path).exists())
+            self.assertTrue(Path(verdict_path).exists())
+            self.assertTrue(Path(pub_path).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
