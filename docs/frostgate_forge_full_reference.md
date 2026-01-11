@@ -1057,6 +1057,8 @@ GRAFANA_PASSWORD=<secure-password>
 - [ ] Enable audit logging
 - [ ] Set up alerting
 - [ ] Configure backup retention
+- [ ] Define RPO/RTO targets (for example: RPO ≤ 15 minutes, RTO ≤ 60 minutes)
+- [ ] Schedule backup testing (for example: restore validation at least quarterly)
 - [ ] Document runbooks
 
 ---
@@ -1118,6 +1120,59 @@ curl http://localhost:8089/v1/logs | tail -n 20
 4. Confirm:
    - Run a post-delete inventory to validate no remaining objects for the tenant.
    - Record completion in the ticket and notify the requester.
+
+### Backup & Restore Procedures
+
+**MinIO Restore (Evidence Bucket)**:
+1. Freeze writes:
+   - Pause scenario creation and evidence uploads (scale orchestrator to 0 or enable maintenance mode).
+2. Identify restore point:
+   - Select the latest validated backup set for the `forge-evidence` bucket.
+3. Restore objects:
+   - If using `mc` + object storage snapshots, restore the bucket to the chosen snapshot.
+   - If using filesystem backups, stop MinIO and restore the data directory (`/data`) from backup.
+4. Validate:
+   - List objects and compare against backup manifest.
+   - Spot-check recent evidence objects and hashes.
+5. Resume writes and notify stakeholders.
+
+**NATS JetStream Recovery**:
+1. Quiesce publishers:
+   - Scale orchestrator and scenario services to stop new event writes.
+2. Restore state:
+   - Restore the JetStream storage directory from backup (commonly `/data/jetstream`).
+   - If running clustered, restore all members consistently before restart.
+3. Restart NATS and verify:
+   - Confirm streams and consumers with `nats stream ls` and `nats consumer ls <stream>`.
+   - Validate sequence continuity for key streams.
+4. Resume publishers and monitor lag.
+
+**Orchestrator Failover**:
+1. Promote standby:
+   - If using a hot standby, switch routing to the standby service or scale standby to active.
+2. Validate dependencies:
+   - Confirm OPA, NATS, and MinIO connectivity from the new primary.
+3. Recover in-flight state:
+   - Reconcile active scenarios by reconciling container labels and DB state.
+4. Notify stakeholders and record incident timeline.
+
+### Release Rollback Procedures
+
+**Compose Rollback**:
+1. Identify the last known good release tag or image digest.
+2. Update `compose.yml` or override file to pin images to the prior version.
+3. Run:
+   ```bash
+   docker compose -f compose.yml -f compose.staging.yml up -d --no-deps --force-recreate
+   ```
+4. Verify health endpoints and critical workflows (scenario spawn, policy check).
+
+**Schema Compatibility Checks**:
+1. Confirm database schema version matches application expectations.
+2. If a migration ran, determine if it is reversible:
+   - If reversible, run the down migration and re-verify application start.
+   - If irreversible, keep schema at the newer version and deploy the app version that supports it.
+3. Re-run smoke tests and monitor logs for schema errors.
 
 ### Troubleshooting
 
