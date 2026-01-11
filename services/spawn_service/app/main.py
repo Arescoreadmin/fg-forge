@@ -83,6 +83,22 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
+def _get_sat_secret() -> str:
+    sat_secret = os.getenv("SAT_SECRET")
+    if not sat_secret:
+        raise HTTPException(status_code=500, detail="SAT secret not configured")
+    return sat_secret
+
+
+def _sat_issued_at() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def _sat_expiration(issued_at: int) -> int:
+    ttl_seconds = int(os.getenv("SAT_TTL_SECONDS", "300"))
+    return issued_at + ttl_seconds
+
+
 def generate_access_token(payload: AccessTokenPayload) -> str:
     payload_json = payload.model_dump_json()
     payload_encoded = _b64url_encode(payload_json.encode("utf-8"))
@@ -122,31 +138,49 @@ def verify_access_token(token: str) -> AccessTokenPayload:
     return payload
 
 
-def verify_spawn_authorization(token: str) -> SpawnAuthorizationPayload:
+def generate_sat(payload: SatClaims) -> str:
+    header = {"alg": "HS256", "typ": "SAT"}
+    header_encoded = _b64url_encode(json.dumps(header).encode("utf-8"))
+    payload_encoded = _b64url_encode(payload.model_dump_json().encode("utf-8"))
     try:
-        payload_encoded, signature_encoded = token.split(".", 1)
+        header = json.loads(_b64url_decode(header_encoded))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    if header.get("alg") != "HS256" or header.get("typ") != "SAT":
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+
+    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    signature = hmac.new(_get_sat_secret().encode("utf-8"), signing_input, "sha256").digest()
+    signature_encoded = _b64url_encode(signature)
+    return f"{header_encoded}.{payload_encoded}.{signature_encoded}"
+
+
+def verify_sat(token: str) -> SatClaims:
+    try:
+        header_encoded, payload_encoded, signature_encoded = token.split(".", 2)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
 
-    sat_secret = os.getenv("SAT_SECRET") or _TOKEN_SECRET
+    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
     expected_signature = hmac.new(
-        sat_secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
     ).digest()
     expected_encoded = _b64url_encode(expected_signature)
     if not hmac.compare_digest(expected_encoded, signature_encoded):
         raise HTTPException(status_code=401, detail="invalid spawn authorization")
 
     try:
-        payload = SpawnAuthorizationPayload.model_validate(
+        payload = SatClaims.model_validate(
             json.loads(_b64url_decode(payload_encoded))
         )
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
 
-    expires_at = datetime.fromisoformat(payload.expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
+    now = int(datetime.now(timezone.utc).timestamp())
+    if payload.iat > payload.exp:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+    if payload.exp < now:
         raise HTTPException(status_code=401, detail="spawn authorization expired")
 
     return payload
@@ -161,7 +195,7 @@ def parse_bearer_token(value: str) -> Optional[str]:
     return None
 
 
-def enforce_spawn_authorization(request: Request) -> Optional[SpawnAuthorizationPayload]:
+def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
     sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
     token = request.headers.get("x-sat")
     if not token:
@@ -172,11 +206,22 @@ def enforce_spawn_authorization(request: Request) -> Optional[SpawnAuthorization
             raise HTTPException(status_code=401, detail="spawn authorization required")
         return None
 
-    return verify_spawn_authorization(token)
+    return verify_sat(token)
 
 
 class SpawnRequest(BaseModel):
     track: str = Field(..., description="Training track identifier")
+    subject: str = Field(..., description="User or session identifier")
+    tier: str = Field(..., description="Billing tier")
+    template_id: Optional[str] = Field(
+        None, description="Template identifier override"
+    )
+    requested_limits: Optional[dict[str, int]] = Field(
+        None, description="Requested resource limits"
+    )
+    scenario_id: Optional[str] = Field(
+        None, description="Optional pre-allocated scenario id"
+    )
     request_id: Optional[str] = Field(
         None, description="Client-supplied idempotency key"
     )
@@ -188,6 +233,7 @@ class SpawnResponse(BaseModel):
     access_url: str
     access_token: str
     expires_at: str
+    sat: str
 
 
 class AccessTokenPayload(BaseModel):
@@ -197,12 +243,16 @@ class AccessTokenPayload(BaseModel):
     expires_at: str
 
 
-class SpawnAuthorizationPayload(BaseModel):
+class SatClaims(BaseModel):
+    jti: str
+    exp: int
+    iat: int
+    track: str
+    template_id: str
     subject: str
-    issued_at: str
-    expires_at: str
-    tenant_id: Optional[str] = None
-    scope: Optional[str] = None
+    tier: str
+    requested_limits: Optional[dict[str, int]] = None
+    scenario_id: Optional[str] = None
 
 
 def load_template(track: str) -> dict:
@@ -256,13 +306,28 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
         raise HTTPException(status_code=400, detail="unsupported track")
 
     if request_id in REQUEST_CACHE:
-        return SpawnResponse(**REQUEST_CACHE[request_id])
+        cached = REQUEST_CACHE[request_id]
+        issued_at = _sat_issued_at()
+        sat_token = generate_sat(
+            SatClaims(
+                jti=str(uuid.uuid4()),
+                exp=_sat_expiration(issued_at),
+                iat=issued_at,
+                track=cached["track"],
+                template_id=cached["template_id"],
+                subject=payload.subject,
+                tier=payload.tier,
+                requested_limits=payload.requested_limits,
+                scenario_id=cached["scenario_id"],
+            )
+        )
+        return SpawnResponse(**cached, sat=sat_token)
 
     template = load_template(payload.track)
     opa_allows(template)
     record_billing(request_id, payload.track)
 
-    scenario_id = f"scn-{uuid.uuid4().hex[:12]}"
+    scenario_id = payload.scenario_id or f"scn-{uuid.uuid4().hex[:12]}"
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     base_url = os.getenv("SPAWN_BASE_URL", "http://localhost:8082")
     token_payload = AccessTokenPayload(
@@ -273,6 +338,20 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
     )
     access_token = generate_access_token(token_payload)
     access_url = f"{base_url}/v1/access/{scenario_id}?token={access_token}"
+    issued_at = _sat_issued_at()
+    sat_token = generate_sat(
+        SatClaims(
+            jti=str(uuid.uuid4()),
+            exp=_sat_expiration(issued_at),
+            iat=issued_at,
+            track=payload.track,
+            template_id=payload.template_id or payload.track,
+            subject=payload.subject,
+            tier=payload.tier,
+            requested_limits=payload.requested_limits,
+            scenario_id=scenario_id,
+        )
+    )
 
     response = SpawnResponse(
         request_id=request_id,
@@ -280,9 +359,18 @@ def build_spawn_response(payload: SpawnRequest, request: Request) -> SpawnRespon
         access_url=access_url,
         access_token=access_token,
         expires_at=expires_at,
+        sat=sat_token,
     )
 
-    REQUEST_CACHE[request_id] = response.model_dump()
+    REQUEST_CACHE[request_id] = {
+        "request_id": response.request_id,
+        "scenario_id": response.scenario_id,
+        "access_url": response.access_url,
+        "access_token": response.access_token,
+        "expires_at": response.expires_at,
+        "track": payload.track,
+        "template_id": payload.template_id or payload.track,
+    }
 
     return response
 
