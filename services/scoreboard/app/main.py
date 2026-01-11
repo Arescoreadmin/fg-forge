@@ -1,0 +1,382 @@
+"""FrostGate Forge Scoreboard Service.
+
+Calculates scores, generates evidence bundles, and produces signed verdicts.
+Subscribes to scenario.completed events and stores final scoring artifacts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any
+
+import nats
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from fastapi import FastAPI, HTTPException
+from minio import Minio
+from nats.js.api import ConsumerConfig, DeliverPolicy
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("forge_scoreboard")
+
+# Configuration
+NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "forge_minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "forgeadmin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "forgeadmin123")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "forge-evidence")
+
+# Signing key (in production, load from Vault/KMS)
+SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
+
+
+class CriterionScore(BaseModel):
+    criterion_id: str
+    passed: bool
+    weight: float = 1.0
+    weighted_score: float
+
+
+class ScoreResult(BaseModel):
+    scenario_id: str
+    track: str
+    score: float  # 0.0 to 1.0
+    passed: int
+    total: int
+    criteria: list[CriterionScore] = Field(default_factory=list)
+    computed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class Verdict(BaseModel):
+    scenario_id: str
+    score_hash: str
+    evidence_hash: str
+    computed_at: str
+    signature: str
+
+
+class ScoreboardEntry(BaseModel):
+    scenario_id: str
+    track: str
+    score: ScoreResult
+    evidence_url: str
+    verdict_url: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# In-memory scoreboard (production would use persistent storage)
+scoreboard: dict[str, ScoreboardEntry] = {}
+
+# NATS client
+nc: nats.NATS | None = None
+js: Any = None
+
+# MinIO client
+minio_client: Minio | None = None
+
+
+def get_minio_client() -> Minio:
+    global minio_client
+    if minio_client is None:
+        minio_client = Minio(
+            MINIO_ENDPOINT,
+            access_key=MINIO_ACCESS_KEY,
+            secret_key=MINIO_SECRET_KEY,
+            secure=False,
+        )
+        if not minio_client.bucket_exists(MINIO_BUCKET):
+            minio_client.make_bucket(MINIO_BUCKET)
+    return minio_client
+
+
+def get_signing_key() -> ed25519.Ed25519PrivateKey:
+    """Get or generate signing key."""
+    global SIGNING_KEY
+    if SIGNING_KEY is None:
+        # In production, load from secure storage
+        SIGNING_KEY = ed25519.Ed25519PrivateKey.generate()
+        logger.warning("Generated ephemeral signing key - use KMS in production")
+    return SIGNING_KEY
+
+
+def calculate_score(
+    criteria_results: list[dict], weights: dict[str, float] | None = None
+) -> ScoreResult:
+    """Calculate weighted score from criteria results."""
+    weights = weights or {}
+    criteria_scores = []
+    total_weight = 0.0
+    weighted_sum = 0.0
+
+    for result in criteria_results:
+        criterion_id = result.get("criterion_id", "unknown")
+        passed = result.get("passed", False)
+        weight = weights.get(criterion_id, 1.0)
+
+        weighted_score = weight if passed else 0.0
+        total_weight += weight
+        weighted_sum += weighted_score
+
+        criteria_scores.append(
+            CriterionScore(
+                criterion_id=criterion_id,
+                passed=passed,
+                weight=weight,
+                weighted_score=weighted_score,
+            )
+        )
+
+    final_score = weighted_sum / total_weight if total_weight > 0 else 0.0
+    passed_count = sum(1 for c in criteria_scores if c.passed)
+
+    return ScoreResult(
+        scenario_id="",  # Set by caller
+        track="",  # Set by caller
+        score=final_score,
+        passed=passed_count,
+        total=len(criteria_scores),
+        criteria=criteria_scores,
+    )
+
+
+def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdict:
+    """Create a signed verdict for a scenario completion."""
+    key = get_signing_key()
+    computed_at = datetime.now(timezone.utc).isoformat()
+
+    # Create message to sign
+    message = f"{scenario_id}:{score_hash}:{evidence_hash}:{computed_at}"
+    signature_bytes = key.sign(message.encode())
+    signature = base64.b64encode(signature_bytes).decode()
+
+    return Verdict(
+        scenario_id=scenario_id,
+        score_hash=score_hash,
+        evidence_hash=evidence_hash,
+        computed_at=computed_at,
+        signature=signature,
+    )
+
+
+def store_score_artifacts(
+    scenario_id: str, score: ScoreResult, verdict: Verdict
+) -> tuple[str, str]:
+    """Store score.json and verdict.sig in MinIO."""
+    client = get_minio_client()
+    from io import BytesIO
+
+    # Store score.json
+    score_json = score.model_dump_json(indent=2)
+    score_bytes = score_json.encode()
+    score_object = f"{scenario_id}/score.json"
+    client.put_object(
+        MINIO_BUCKET,
+        score_object,
+        BytesIO(score_bytes),
+        len(score_bytes),
+        content_type="application/json",
+    )
+
+    # Store verdict.sig
+    verdict_json = verdict.model_dump_json(indent=2)
+    verdict_bytes = verdict_json.encode()
+    verdict_object = f"{scenario_id}/verdict.sig"
+    client.put_object(
+        MINIO_BUCKET,
+        verdict_object,
+        BytesIO(verdict_bytes),
+        len(verdict_bytes),
+        content_type="application/json",
+    )
+
+    logger.info("Stored score artifacts for %s", scenario_id)
+    return (
+        f"s3://{MINIO_BUCKET}/{score_object}",
+        f"s3://{MINIO_BUCKET}/{verdict_object}",
+    )
+
+
+async def process_scenario_completed(msg: Any) -> None:
+    """Process scenario.completed events and finalize scoring."""
+    try:
+        data = json.loads(msg.data.decode())
+        scenario_id = data.get("scenario_id")
+        track = data.get("track")
+        evidence_url = data.get("evidence_url", "")
+
+        logger.info("Processing scenario.completed: %s", scenario_id)
+
+        # Build score result from incoming data
+        score = ScoreResult(
+            scenario_id=scenario_id,
+            track=track,
+            score=data.get("score", 0.0),
+            passed=data.get("passed", 0),
+            total=data.get("total", 0),
+        )
+
+        # Calculate hashes
+        score_hash = hashlib.sha256(score.model_dump_json().encode()).hexdigest()
+        evidence_hash = hashlib.sha256(evidence_url.encode()).hexdigest()
+
+        # Create signed verdict
+        verdict = sign_verdict(score_hash, evidence_hash, scenario_id)
+
+        # Store artifacts
+        score_url, verdict_url = store_score_artifacts(scenario_id, score, verdict)
+
+        # Update scoreboard
+        entry = ScoreboardEntry(
+            scenario_id=scenario_id,
+            track=track,
+            score=score,
+            evidence_url=evidence_url,
+            verdict_url=verdict_url,
+        )
+        scoreboard[scenario_id] = entry
+
+        logger.info(
+            "Finalized score for %s: %.2f (%d/%d)",
+            scenario_id,
+            score.score,
+            score.passed,
+            score.total,
+        )
+
+        await msg.ack()
+
+    except Exception as e:
+        logger.exception("Error processing scenario.completed: %s", e)
+        if msg:
+            await msg.nak()
+
+
+async def nats_subscriber() -> None:
+    """Subscribe to NATS scenario events."""
+    global nc, js
+
+    try:
+        nc = await nats.connect(NATS_URL)
+        js = nc.jetstream()
+
+        consumer_config = ConsumerConfig(
+            durable_name="scoreboard",
+            deliver_policy=DeliverPolicy.ALL,
+            ack_wait=30,
+        )
+
+        await js.subscribe(
+            "scenario.completed",
+            cb=process_scenario_completed,
+            config=consumer_config,
+        )
+        logger.info("Subscribed to scenario.completed")
+
+        while True:
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.error("NATS subscriber error: %s", e)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    task = asyncio.create_task(nats_subscriber())
+    logger.info("Scoreboard started")
+    yield
+    task.cancel()
+    if nc:
+        await nc.close()
+    logger.info("Scoreboard stopped")
+
+
+app = FastAPI(title="FrostGate Forge Scoreboard", lifespan=lifespan)
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "service": "forge_scoreboard"}
+
+
+@app.get("/v1/scores/{scenario_id}")
+async def get_score(scenario_id: str) -> ScoreboardEntry:
+    """Get score for a scenario."""
+    if scenario_id not in scoreboard:
+        raise HTTPException(status_code=404, detail="Score not found")
+    return scoreboard[scenario_id]
+
+
+@app.get("/v1/scores")
+async def list_scores(
+    track: str | None = None, limit: int = 100
+) -> list[ScoreboardEntry]:
+    """List all scores, optionally filtered by track."""
+    entries = list(scoreboard.values())
+    if track:
+        entries = [e for e in entries if e.track == track]
+    # Sort by score descending
+    entries.sort(key=lambda e: e.score.score, reverse=True)
+    return entries[:limit]
+
+
+@app.get("/v1/leaderboard/{track}")
+async def get_leaderboard(track: str, limit: int = 10) -> list[dict]:
+    """Get leaderboard for a specific track."""
+    entries = [e for e in scoreboard.values() if e.track == track]
+    entries.sort(key=lambda e: e.score.score, reverse=True)
+
+    return [
+        {
+            "rank": i + 1,
+            "scenario_id": e.scenario_id,
+            "score": e.score.score,
+            "passed": e.score.passed,
+            "total": e.score.total,
+            "completed_at": e.created_at.isoformat(),
+        }
+        for i, e in enumerate(entries[:limit])
+    ]
+
+
+@app.get("/v1/stats")
+async def get_stats() -> dict:
+    """Get aggregate scoring statistics."""
+    if not scoreboard:
+        return {
+            "total_scenarios": 0,
+            "by_track": {},
+        }
+
+    by_track: dict[str, dict] = {}
+    for entry in scoreboard.values():
+        track = entry.track
+        if track not in by_track:
+            by_track[track] = {
+                "count": 0,
+                "total_score": 0.0,
+                "pass_count": 0,
+            }
+        by_track[track]["count"] += 1
+        by_track[track]["total_score"] += entry.score.score
+        if entry.score.score >= 0.7:  # 70% threshold for "pass"
+            by_track[track]["pass_count"] += 1
+
+    # Calculate averages
+    for track_stats in by_track.values():
+        count = track_stats["count"]
+        track_stats["avg_score"] = track_stats["total_score"] / count if count > 0 else 0
+        track_stats["pass_rate"] = track_stats["pass_count"] / count if count > 0 else 0
+
+    return {
+        "total_scenarios": len(scoreboard),
+        "by_track": by_track,
+    }
