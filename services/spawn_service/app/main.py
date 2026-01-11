@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hmac
+import json
 import logging
 import os
 import uuid
@@ -23,6 +26,58 @@ TRACK_TEMPLATE = {
 }
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 REQUEST_CACHE: Dict[str, dict] = {}
+_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
+if not _TOKEN_SECRET:
+    _TOKEN_SECRET = uuid.uuid4().hex
+    logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def generate_access_token(payload: AccessTokenPayload) -> str:
+    payload_json = payload.model_dump_json()
+    payload_encoded = _b64url_encode(payload_json.encode("utf-8"))
+    signature = hmac.new(
+        _TOKEN_SECRET.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+    ).digest()
+    signature_encoded = _b64url_encode(signature)
+    return f"{payload_encoded}.{signature_encoded}"
+
+
+def verify_access_token(token: str) -> AccessTokenPayload:
+    try:
+        payload_encoded, signature_encoded = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+
+    expected_signature = hmac.new(
+        _TOKEN_SECRET.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    try:
+        payload = AccessTokenPayload.model_validate(
+            json.loads(_b64url_decode(payload_encoded))
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+
+    expires_at = datetime.fromisoformat(payload.expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="token expired")
+
+    return payload
 
 
 class SpawnRequest(BaseModel):
@@ -36,6 +91,14 @@ class SpawnResponse(BaseModel):
     request_id: str
     scenario_id: str
     access_url: str
+    access_token: str
+    expires_at: str
+
+
+class AccessTokenPayload(BaseModel):
+    scenario_id: str
+    request_id: str
+    track: str
     expires_at: str
 
 
@@ -105,15 +168,41 @@ def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
     scenario_id = f"scn-{uuid.uuid4().hex[:12]}"
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     base_url = os.getenv("SPAWN_BASE_URL", "http://localhost:8082")
-    access_url = f"{base_url}/access/{scenario_id}"  # placeholder for broker
+    token_payload = AccessTokenPayload(
+        scenario_id=scenario_id,
+        request_id=request_id,
+        track=payload.track,
+        expires_at=expires_at,
+    )
+    access_token = generate_access_token(token_payload)
+    access_url = f"{base_url}/v1/access/{scenario_id}?token={access_token}"
 
     response = SpawnResponse(
         request_id=request_id,
         scenario_id=scenario_id,
         access_url=access_url,
+        access_token=access_token,
         expires_at=expires_at,
     )
 
     REQUEST_CACHE[request_id] = response.model_dump()
 
     return response
+
+
+@app.get("/v1/access/{scenario_id}")
+def access_scenario(scenario_id: str, request: Request) -> dict:
+    token = request.query_params.get("token") or request.headers.get("x-access-token")
+    if not token:
+        raise HTTPException(status_code=401, detail="token required")
+
+    payload = verify_access_token(token)
+    if payload.scenario_id != scenario_id:
+        raise HTTPException(status_code=403, detail="token mismatch")
+
+    return {
+        "scenario_id": payload.scenario_id,
+        "request_id": payload.request_id,
+        "track": payload.track,
+        "expires_at": payload.expires_at,
+    }
