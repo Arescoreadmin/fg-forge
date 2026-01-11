@@ -11,8 +11,11 @@ services:
       - BILLING_MODE=stub
       - SPAWN_BASE_URL=http://localhost:8082
       - REQUEST_ID_HEADER=x-request-id
+      - TEMPLATE_DIR=/templates
     ports:
       - "8082:8080"
+    volumes:
+      - ./templates:/templates:ro
     read_only: true
     tmpfs:
       - /tmp
