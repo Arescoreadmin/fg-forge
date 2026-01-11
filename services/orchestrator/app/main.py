@@ -56,6 +56,7 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("forge_orchestrator")
+_sat_secret_warning_emitted = False
 
 # Configuration
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
@@ -197,10 +198,21 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def _get_sat_secret() -> str:
-    sat_secret = os.getenv("SAT_SECRET")
-    if not sat_secret:
-        raise HTTPException(status_code=500, detail="SAT secret not configured")
-    return sat_secret
+    sat_secret = os.getenv("SAT_HMAC_SECRET")
+    if sat_secret:
+        return sat_secret
+    legacy_secret = os.getenv("SAT_SECRET")
+    if legacy_secret:
+        _warn_sat_secret_alias()
+        return legacy_secret
+    raise HTTPException(status_code=500, detail="SAT secret not configured")
+
+
+def _warn_sat_secret_alias() -> None:
+    global _sat_secret_warning_emitted
+    if not _sat_secret_warning_emitted:
+        logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
+        _sat_secret_warning_emitted = True
 
 
 def _parse_bearer_token(value: str) -> Optional[str]:
@@ -539,6 +551,8 @@ async def nats_subscriber() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
+        _warn_sat_secret_alias()
     # Start NATS subscriber in background
     task = asyncio.create_task(nats_subscriber())
     logger.info("Orchestrator started")

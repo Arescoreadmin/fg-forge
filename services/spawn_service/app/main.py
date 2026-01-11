@@ -58,6 +58,13 @@ _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
     logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
+_sat_secret_warning_emitted = False
+
+
+@app.on_event("startup")
+def warn_deprecated_sat_secret() -> None:
+    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
+        _warn_sat_secret_alias()
 
 
 @app.middleware("http")
@@ -84,10 +91,21 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def _get_sat_secret() -> str:
-    sat_secret = os.getenv("SAT_SECRET")
-    if not sat_secret:
-        raise HTTPException(status_code=500, detail="SAT secret not configured")
-    return sat_secret
+    sat_secret = os.getenv("SAT_HMAC_SECRET")
+    if sat_secret:
+        return sat_secret
+    legacy_secret = os.getenv("SAT_SECRET")
+    if legacy_secret:
+        _warn_sat_secret_alias()
+        return legacy_secret
+    raise HTTPException(status_code=500, detail="SAT secret not configured")
+
+
+def _warn_sat_secret_alias() -> None:
+    global _sat_secret_warning_emitted
+    if not _sat_secret_warning_emitted:
+        logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
+        _sat_secret_warning_emitted = True
 
 
 def _sat_issued_at() -> int:

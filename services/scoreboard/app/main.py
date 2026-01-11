@@ -9,17 +9,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import gzip
 import hashlib
 import json
 import logging
 import os
+import tarfile
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import nats
-from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
 from minio import Minio
@@ -109,6 +113,18 @@ js: Any = None
 # MinIO client
 minio_client: Minio | None = None
 
+try:
+    import zstandard as zstd
+except ImportError:  # pragma: no cover - optional dependency
+    zstd = None
+
+
+@dataclass(frozen=True)
+class EvidenceBundle:
+    filename: str
+    content_type: str
+    payload: bytes
+
 
 def get_minio_client() -> Minio:
     global minio_client
@@ -174,13 +190,84 @@ def calculate_score(
     )
 
 
+def _score_json_bytes(score: ScoreResult) -> bytes:
+    payload = score.model_dump()
+    payload["computed_at"] = score.computed_at.isoformat()
+    score_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return score_json.encode("utf-8")
+
+
+def _hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tar_add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(data)
+    info.mtime = 0
+    info.mode = 0o644
+    info.uid = 0
+    info.gid = 0
+    tar.addfile(info, BytesIO(data))
+
+
+def build_evidence_bundle(
+    scenario_id: str,
+    track: str,
+    source_evidence_url: str,
+    artifacts_root: str | None = None,
+) -> EvidenceBundle:
+    buffer = BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        log_payload = (
+            f"scoreboard evidence placeholder for {scenario_id} ({track})\n"
+        ).encode("utf-8")
+        _tar_add_bytes(tar, "logs/scoreboard.log", log_payload)
+
+        telemetry_payload = json.dumps(
+            {"scenario_id": scenario_id, "track": track}, sort_keys=True
+        ).encode("utf-8")
+        _tar_add_bytes(tar, "telemetry/scoreboard.json", telemetry_payload)
+
+        if source_evidence_url:
+            _tar_add_bytes(
+                tar,
+                "source_evidence.txt",
+                f"{source_evidence_url}\n".encode("utf-8"),
+            )
+
+        if artifacts_root:
+            artifacts_dir = Path(artifacts_root) / scenario_id / "artifacts"
+            if artifacts_dir.is_dir():
+                for path in sorted(p for p in artifacts_dir.rglob("*") if p.is_file()):
+                    relative = path.relative_to(artifacts_dir).as_posix()
+                    _tar_add_bytes(tar, f"artifacts/{relative}", path.read_bytes())
+
+    raw_tar = buffer.getvalue()
+    if zstd is not None:
+        compressor = zstd.ZstdCompressor(level=3)
+        payload = compressor.compress(raw_tar)
+        return EvidenceBundle(
+            filename="evidence.tar.zst",
+            content_type="application/zstd",
+            payload=payload,
+        )
+
+    payload = gzip.compress(raw_tar)
+    return EvidenceBundle(
+        filename="evidence.tar.gz",
+        content_type="application/gzip",
+        payload=payload,
+    )
+
+
 def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdict:
     """Create a signed verdict for a scenario completion."""
     key = get_signing_key()
     computed_at = datetime.now(timezone.utc).isoformat()
 
     # Create message to sign
-    message = f"{scenario_id}:{score_hash}:{evidence_hash}:{computed_at}"
+    message = f"{score_hash}:{evidence_hash}"
     signature_bytes = key.sign(message.encode())
     signature = base64.b64encode(signature_bytes).decode()
 
@@ -194,15 +281,15 @@ def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdi
 
 
 def store_score_artifacts(
-    scenario_id: str, score: ScoreResult, verdict: Verdict
-) -> tuple[str, str]:
-    """Store score.json and verdict.sig in MinIO."""
+    scenario_id: str,
+    score_bytes: bytes,
+    evidence: EvidenceBundle,
+    verdict: Verdict,
+) -> tuple[str, str, str]:
+    """Store score.json, evidence bundle, and verdict.sig in MinIO."""
     client = get_minio_client()
-    from io import BytesIO
 
     # Store score.json
-    score_json = score.model_dump_json(indent=2)
-    score_bytes = score_json.encode()
     score_object = f"{scenario_id}/score.json"
     client.put_object(
         MINIO_BUCKET,
@@ -210,6 +297,15 @@ def store_score_artifacts(
         BytesIO(score_bytes),
         len(score_bytes),
         content_type="application/json",
+    )
+
+    evidence_object = f"{scenario_id}/{evidence.filename}"
+    client.put_object(
+        MINIO_BUCKET,
+        evidence_object,
+        BytesIO(evidence.payload),
+        len(evidence.payload),
+        content_type=evidence.content_type,
     )
 
     # Store verdict.sig
@@ -227,6 +323,7 @@ def store_score_artifacts(
     logger.info("Stored score artifacts for %s", scenario_id)
     return (
         f"s3://{MINIO_BUCKET}/{score_object}",
+        f"s3://{MINIO_BUCKET}/{evidence_object}",
         f"s3://{MINIO_BUCKET}/{verdict_object}",
     )
 
@@ -248,17 +345,26 @@ async def process_scenario_completed(msg: Any) -> None:
             score=data.get("score", 0.0),
             passed=data.get("passed", 0),
             total=data.get("total", 0),
+            criteria=data.get("criteria", []),
         )
 
-        # Calculate hashes
-        score_hash = hashlib.sha256(score.model_dump_json().encode()).hexdigest()
-        evidence_hash = hashlib.sha256(evidence_url.encode()).hexdigest()
+        score_bytes = _score_json_bytes(score)
+        score_hash = _hash_bytes(score_bytes)
+        evidence_bundle = build_evidence_bundle(
+            scenario_id,
+            track,
+            evidence_url,
+            os.getenv("SCENARIO_ARTIFACTS_ROOT"),
+        )
+        evidence_hash = _hash_bytes(evidence_bundle.payload)
 
         # Create signed verdict
         verdict = sign_verdict(score_hash, evidence_hash, scenario_id)
 
         # Store artifacts
-        score_url, verdict_url = store_score_artifacts(scenario_id, score, verdict)
+        score_url, evidence_url, verdict_url = store_score_artifacts(
+            scenario_id, score_bytes, evidence_bundle, verdict
+        )
 
         # Update scoreboard
         entry = ScoreboardEntry(
