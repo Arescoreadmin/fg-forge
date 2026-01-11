@@ -1,0 +1,35 @@
+name: netplus-basic
+description: Basic Network+ verification playbook
+
+playbook:
+  - step: execute_command
+    name: verify_network_tools
+    container: learner_vm
+    command: "which ping && which ip"
+    expect:
+      exit_code: 0
+
+  - step: execute_command
+    name: check_ip_configuration
+    container: learner_vm
+    command: "ip addr show"
+    expect:
+      exit_code: 0
+      stdout_contains: "inet"
+
+  - step: execute_command
+    name: ping_gateway
+    container: learner_vm
+    command: "ping -c 1 10.10.0.1"
+    timeout: 10
+    expect:
+      exit_code: 0
+      stdout_contains: "1 packets transmitted"
+
+  - step: check_file
+    name: verify_hosts_file
+    container: learner_vm
+    path: /etc/hosts
+    expect:
+      file_exists: true
+      contains: "localhost"

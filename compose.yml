@@ -1,6 +1,10 @@
 version: "3.9"
 
 services:
+  # ============================================================================
+  # Core Platform Services
+  # ============================================================================
+
   forge_spawn_service:
     build:
       context: ./services/spawn_service
@@ -12,6 +16,8 @@ services:
       - SPAWN_BASE_URL=http://localhost:8082
       - REQUEST_ID_HEADER=x-request-id
       - TEMPLATE_DIR=/templates
+      - OPA_URL=http://forge_opa:8181
+      - NATS_URL=nats://forge_nats:4222
     ports:
       - "8082:8080"
     volumes:
@@ -23,7 +29,149 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      - forge_opa
+      - forge_nats
     restart: unless-stopped
+
+  forge_orchestrator:
+    build:
+      context: ./services/orchestrator
+    image: forge_orchestrator:local
+    container_name: forge_orchestrator
+    environment:
+      - FORGE_ENV=dev
+      - TEMPLATE_DIR=/templates
+      - OPA_URL=http://forge_opa:8181
+      - NATS_URL=nats://forge_nats:4222
+      - LOG_LEVEL=INFO
+    ports:
+      - "8083:8080"
+    volumes:
+      - ./templates:/templates:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_opa
+      - forge_nats
+    restart: unless-stopped
+
+  forge_worker_agent:
+    build:
+      context: ./services/worker_agent
+    image: forge_worker_agent:local
+    container_name: forge_worker_agent
+    environment:
+      - FORGE_ENV=dev
+      - TEMPLATE_DIR=/templates
+      - NATS_URL=nats://forge_nats:4222
+      - MINIO_ENDPOINT=forge_minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-forgeadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      - MINIO_BUCKET=forge-evidence
+      - LOG_LEVEL=INFO
+    ports:
+      - "8084:8080"
+    volumes:
+      - ./templates:/templates:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_minio
+    restart: unless-stopped
+
+  forge_scoreboard:
+    build:
+      context: ./services/scoreboard
+    image: forge_scoreboard:local
+    container_name: forge_scoreboard
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - MINIO_ENDPOINT=forge_minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-forgeadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      - MINIO_BUCKET=forge-evidence
+      - LOG_LEVEL=INFO
+    ports:
+      - "8086:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_minio
+    restart: unless-stopped
+
+  forge_observer_hub:
+    build:
+      context: ./services/observer_hub
+    image: forge_observer_hub:local
+    container_name: forge_observer_hub
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - LOKI_URL=http://forge_loki:3100
+      - LOG_LEVEL=INFO
+    ports:
+      - "8085:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_loki
+    restart: unless-stopped
+
+  forge_playbook_runner:
+    build:
+      context: ./services/playbook_runner
+    image: forge_playbook_runner:local
+    container_name: forge_playbook_runner
+    environment:
+      - FORGE_ENV=dev
+      - TEMPLATE_DIR=/templates
+      - PLAYBOOK_DIR=/playbooks
+      - LOG_LEVEL=INFO
+    ports:
+      - "8087:8080"
+    volumes:
+      - ./templates:/templates:ro
+      - ./playbooks:/playbooks:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # ============================================================================
+  # Infrastructure Services
+  # ============================================================================
 
   forge_opa:
     image: openpolicyagent/opa:latest
@@ -75,6 +223,10 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  # ============================================================================
+  # Telemetry Stack
+  # ============================================================================
+
   forge_loki:
     image: grafana/loki:2.9.4
     container_name: forge_loki
@@ -120,3 +272,8 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+
+networks:
+  default:
+    name: forge_platform
+    driver: bridge
