@@ -10,12 +10,17 @@
 - Added internal scenario completion endpoint in orchestrator with auth guard, scoreboard-triggered scoring, and completion status handling.
 - Wrote scoring artifacts to storage/scenarios/<scenario_id>/results with verdict signatures and public keys.
 - Added an end-to-end integration test covering SAT mint/verify, completion, scoring artifacts, and signature verification.
+- Added offline verdict verification CLI and unit tests for verdict integrity checks.
+- Implemented retention cleanup script with operator auth, dry-run support, investigation-flag protection, and unit tests.
+- Hardened /readyz checks to include OPA/scoreboard dependencies, storage writability, and signing key availability with tests.
+- Enforced operator-only access on scenario completion and retention cleanup with tests.
 
 ## How to run locally
 ```
 python -m unittest discover -s services/spawn_service/tests
 python -m unittest discover -s services/orchestrator/tests
 python -m unittest discover -s services/scoreboard/tests
+python -m unittest discover -s scripts/tests
 ```
 
 ## Remaining

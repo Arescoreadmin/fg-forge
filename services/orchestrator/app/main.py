@@ -243,6 +243,16 @@ def _require_internal_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="internal auth required")
 
 
+def _require_operator_auth(request: Request) -> None:
+    expected = os.getenv("OPERATOR_TOKEN")
+    if not expected:
+        logger.error("OPERATOR_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="operator auth not configured")
+    token = request.headers.get("x-operator-token", "")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="operator auth required")
+
+
 def _scoreboard_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=5.0)
 
@@ -352,6 +362,20 @@ async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
         except httpx.RequestError as e:
             logger.warning("OPA request failed: %s", e)
             return False, f"OPA unavailable: {e}"
+
+
+async def _check_opa_ready() -> None:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            response = await client.get(f"{OPA_URL}/health")
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"opa unavailable: {exc}"
+            ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503, detail=f"opa unhealthy: {response.status_code}"
+        )
 
 
 def create_scenario_network(scenario_id: str) -> str:
@@ -681,6 +705,7 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 async def readyz() -> dict:
+    await _check_opa_ready()
     try:
         async with _scoreboard_client() as client:
             response = await client.get("/readyz")
@@ -797,6 +822,7 @@ async def complete_scenario_endpoint(
     request: Request,
 ) -> ScenarioState:
     _require_internal_auth(request)
+    _require_operator_auth(request)
     return await complete_scenario(
         scenario_id,
         payload.completion_reason,
