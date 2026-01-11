@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  forge_spawn_service:
+    environment:
+      - FORGE_ENV=staging
+      - BILLING_MODE=fake_charge
+      - OPA_URL=http://forge_opa:8181
+      - NATS_URL=nats://forge_nats:4222
+      - MINIO_URL=http://forge_minio:9000
+    depends_on:
+      - forge_opa
+      - forge_nats
+      - forge_minio
