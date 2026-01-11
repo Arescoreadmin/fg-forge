@@ -968,6 +968,27 @@ labels:
 - Max 1000 unique label value combinations per service
 - Use structured JSON for high-cardinality data
 
+### Data Governance
+
+**Retention** (configurable per environment):
+- **Metrics** (Prometheus): 13 months for capacity planning and SLA reporting.
+- **Logs** (Loki): 30 days for operational troubleshooting.
+- **Traces** (distributed tracing backend): 14 days for performance analysis.
+- **Evidence bundles** (MinIO `forge-evidence` bucket): 365 days unless contractually overridden.
+
+**PII redaction rules**:
+- Redact or hash direct identifiers before emission: emails, phone numbers, usernames, external account IDs.
+- Truncate or tokenize IP addresses (retain /24 or /48 prefixes only).
+- Strip secrets/tokens from headers, query parameters, and payloads (`Authorization`, `Cookie`, API keys).
+- Evidence bundles must exclude raw learner submissions that contain PII unless explicitly required for assessment; when required, encrypt and restrict access to scoring/audit roles only.
+
+**Storage locations & least-privilege access**:
+- **Metrics**: Prometheus TSDB (PVC). Access limited to `telemetry-reader` (read) and `telemetry-admin` (admin/retention).
+- **Logs**: Loki object store/PVC. Access limited to `log-reader` (read) and `log-admin` (retention/index).
+- **Traces**: Tracing backend store. Access limited to `trace-reader` and `trace-admin`.
+- **Evidence bundles**: MinIO `forge-evidence` bucket. Access limited to `evidence-reader` (read-only), `evidence-writer` (ingest), and `evidence-admin` (delete/export).
+- All roles map to RBAC groups; default access is deny-all with explicit grants per tenant.
+
 ---
 
 ## Deployment Guide
@@ -1083,6 +1104,20 @@ curl http://localhost:8089/v1/logs | tail -n 20
 ```bash
 ./scripts/cleanup_scenarios.sh --older-than 2h
 ```
+
+**Evidence Deletion & Tenant Data Export**:
+1. Verify request authorization (ticket ID + tenant ID) and log an audit event.
+2. Export:
+   - Generate a signed manifest of evidence objects for the tenant (`tenant_id`, `scenario_id`, `object_key`, `sha256`).
+   - Copy objects from MinIO `forge-evidence` to a time-bound export bucket or encrypted archive.
+   - Deliver export via pre-signed URL scoped to the tenant and expiry window.
+3. Delete:
+   - Delete evidence objects for the tenant from MinIO (`forge-evidence`).
+   - Remove associated metadata from the scoreboard database and telemetry indices.
+   - Emit audit events for export and deletion with `request_id` and `tenant_id`.
+4. Confirm:
+   - Run a post-delete inventory to validate no remaining objects for the tenant.
+   - Record completion in the ticket and notify the requester.
 
 ### Troubleshooting
 
