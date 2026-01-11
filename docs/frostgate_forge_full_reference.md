@@ -585,13 +585,15 @@ All containers MUST apply:
 ```yaml
 security_opt:
   - no-new-privileges:true
-  - seccomp:unconfined  # Replace with custom profile in production
+  - seccomp:default  # Use restrictive profile by default
 cap_drop:
   - ALL
 read_only: true
 tmpfs:
   - /tmp:size=64M
 ```
+
+**Deviation note**: Only relax seccomp in CI or test environments when required for tooling. Use a documented dev override (for example, `seccomp:unconfined`) and never ship this override to production.
 
 ### OPA Policy Structure
 
@@ -1050,7 +1052,7 @@ GRAFANA_PASSWORD=<secure-password>
 
 - [ ] Replace default passwords
 - [ ] Enable TLS for all services
-- [ ] Configure seccomp profiles
+- [ ] Enforce restrictive seccomp profile (no unconfined overrides)
 - [ ] Enable AppArmor profiles
 - [ ] Set resource limits
 - [ ] Configure persistent volumes
