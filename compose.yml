@@ -169,6 +169,111 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  forge_metrics_tuner:
+    build:
+      context: ./services/metrics_tuner
+    image: forge_metrics_tuner:local
+    container_name: forge_metrics_tuner
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - REDIS_URL=redis://forge_redis:6379
+      - DEFAULT_QUOTA_SCENARIOS=10
+      - DEFAULT_QUOTA_WINDOW_HOURS=24
+      - ABUSE_THRESHOLD_RATE=5.0
+      - LOG_LEVEL=INFO
+    ports:
+      - "8088:8088"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_redis
+    restart: unless-stopped
+
+  forge_egress_gateway:
+    build:
+      context: ./services/egress_gateway
+    image: forge_egress_gateway:local
+    container_name: forge_egress_gateway
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - DRY_RUN=true
+      - LOG_LEVEL=INFO
+    ports:
+      - "8089:8089"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+    restart: unless-stopped
+
+  forge_llm_analyzer:
+    build:
+      context: ./services/llm_analyzer
+    image: forge_llm_analyzer:local
+    container_name: forge_llm_analyzer
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - OPA_URL=http://forge_opa:8181
+      - REDIS_URL=redis://forge_redis:6379
+      - CANARY_TIMEOUT_SECONDS=30
+      - LOG_LEVEL=INFO
+    ports:
+      - "8090:8090"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_opa
+      - forge_redis
+    restart: unless-stopped
+
+  forge_overlay_sanitizer:
+    build:
+      context: ./services/overlay_sanitizer
+    image: forge_overlay_sanitizer:local
+    container_name: forge_overlay_sanitizer
+    environment:
+      - FORGE_ENV=dev
+      - NATS_URL=nats://forge_nats:4222
+      - MINIO_ENDPOINT=forge_minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-forgeadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      - MINIO_BUCKET=forge-evidence
+      - SANITIZED_BUCKET=forge-sanitized
+      - LOG_LEVEL=INFO
+    ports:
+      - "8091:8091"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - forge_nats
+      - forge_minio
+    restart: unless-stopped
+
   # ============================================================================
   # Infrastructure Services
   # ============================================================================
@@ -176,11 +281,26 @@ services:
   forge_opa:
     image: openpolicyagent/opa:latest
     container_name: forge_opa
-    command: ["run", "--server", "/policies/training_gate.rego"]
+    command: ["run", "--server", "/policies"]
     volumes:
       - ./policies:/policies:ro
     ports:
       - "8181:8181"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  forge_redis:
+    image: redis:7.2-alpine
+    container_name: forge_redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - ./storage/redis:/data
+    ports:
+      - "6379:6379"
     read_only: true
     cap_drop:
       - ALL

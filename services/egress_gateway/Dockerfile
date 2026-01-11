@@ -1,13 +1,27 @@
-FROM alpine:3.19
+FROM python:3.12-slim
 
-# Install nftables and logging tools
-RUN apk add --no-cache nftables iproute2
+WORKDIR /app
 
-# Copy setup script
-COPY scripts/setup_nftables.sh /usr/local/bin/setup_nftables.sh
-RUN chmod +x /usr/local/bin/setup_nftables.sh
+# Install nftables for network policy management
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends nftables iproute2 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application and scripts
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+RUN chmod +x ./scripts/*.sh
 
 # Note: This container needs NET_ADMIN capability to configure nftables
-# In production, consider running as init container or using CNI plugins
+# Run with: --cap-add=NET_ADMIN
 
-ENTRYPOINT ["/usr/local/bin/setup_nftables.sh"]
+# For non-privileged operation, set DRY_RUN=true
+ENV DRY_RUN=true
+
+EXPOSE 8089
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8089"]
