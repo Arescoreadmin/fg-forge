@@ -87,6 +87,7 @@ class ScenarioState(BaseModel):
     subject: str | None = None
     tenant_id: str | None = None
     tier: str | None = None
+    retention_days: int | None = None
     status: ScenarioStatus = ScenarioStatus.PENDING
     network_id: str | None = None
     containers: list[str] = Field(default_factory=list)
@@ -124,6 +125,7 @@ class SatClaims(BaseModel):
     subject: str
     tenant_id: str
     tier: str
+    retention_days: int | None = None
     requested_limits: Optional[dict[str, int]] = None
     scenario_id: Optional[str] = None
 
@@ -347,6 +349,21 @@ def _scoreboard_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=_httpx_timeout())
 
 
+def _normalize_plan(tier: str | None) -> str | None:
+    if not tier:
+        return None
+    return tier.upper()
+
+
+def _build_opa_input(template: dict, claims: SatClaims) -> dict:
+    payload = dict(template)
+    payload["plan"] = _normalize_plan(claims.tier)
+    payload["retention_days"] = claims.retention_days
+    payload["subject"] = claims.subject
+    payload["tenant_id"] = claims.tenant_id
+    return payload
+
+
 async def _trigger_scoreboard(
     scenario_id: str,
     track: str,
@@ -354,6 +371,8 @@ async def _trigger_scoreboard(
     completed_at: datetime,
     subject: str | None,
     tenant_id: str | None,
+    tier: str | None,
+    retention_days: int | None,
     correlation_id: str | None,
 ) -> None:
     token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
@@ -366,6 +385,8 @@ async def _trigger_scoreboard(
         "completed_at": completed_at.isoformat(),
         "subject": subject,
         "tenant_id": tenant_id,
+        "plan": tier,
+        "retention_days": retention_days,
     }
     headers = {"x-internal-token": token}
     if correlation_id:
@@ -450,7 +471,7 @@ async def enforce_sat(
     return claims
 
 
-async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
+async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
     """Query OPA for policy decision."""
     async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
@@ -458,7 +479,7 @@ async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
                 client,
                 "POST",
                 f"{OPA_URL}/v1/data/frostgate/forge/training/allow",
-                json_body={"input": template},
+                json_body={"input": input_payload},
                 breaker=_opa_breaker,
             )
             if response.status_code >= 400:
@@ -749,6 +770,8 @@ async def complete_scenario(
             completed_at,
             state.subject,
             state.tenant_id,
+            state.tier,
+            state.retention_days,
             request_id_ctx.get(),
         )
         state.status = ScenarioStatus.COMPLETED
@@ -801,7 +824,7 @@ async def process_spawn_request(msg: Any) -> None:
         template = load_template(track)
 
         # Check OPA policy
-        allowed, reason = await check_opa_policy(template)
+        allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
         if not allowed:
             logger.warning("Scenario %s denied by policy: %s", scenario_id, reason)
             await msg.ack()
@@ -814,7 +837,8 @@ async def process_spawn_request(msg: Any) -> None:
             track=track,
             subject=claims.subject,
             tenant_id=claims.tenant_id,
-            tier=claims.tier,
+            tier=_normalize_plan(claims.tier),
+            retention_days=claims.retention_days,
             status=ScenarioStatus.CREATING,
         )
         scenarios[scenario_id] = state
@@ -993,7 +1017,8 @@ async def create_scenario(
         track=track,
         subject=claims.subject,
         tenant_id=claims.tenant_id,
-        tier=claims.tier,
+        tier=_normalize_plan(claims.tier),
+        retention_days=claims.retention_days,
         status=ScenarioStatus.CREATING,
     )
     scenarios[scenario_id] = state
@@ -1009,7 +1034,7 @@ async def create_scenario(
     template = load_template(track)
 
     # Check OPA policy
-    allowed, reason = await check_opa_policy(template)
+    allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
     if not allowed:
         state.status = ScenarioStatus.FAILED
         state.error = reason

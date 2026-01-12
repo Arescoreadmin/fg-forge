@@ -22,6 +22,7 @@
 - Extended /readyz checks with runtime isolation assertions (read-only filesystem probes, egress gateway config validation, OPA readiness where applicable) and updated tests.
 - Added staging smoke test script to run compose, spawn/complete a scenario, and verify verdict artifacts.
 - Added plan tiering with authoritative entitlements in spawn_service, enforcing per-tier limits and track access with tests.
+- Wired SAT-derived plan/retention context through orchestrator OPA inputs, scoring payloads, and scoreboard artifacts with coverage.
 
 ## How to run locally
 ```

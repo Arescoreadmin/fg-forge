@@ -81,7 +81,8 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
                     track="netplus",
                     subject="user-1",
                     tenant_id="tenant-1",
-                    tier="free",
+                    tier="FREE",
+                    retention_days=30,
                     status=orchestrator_module.ScenarioStatus.RUNNING,
                 )
             )

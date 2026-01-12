@@ -32,6 +32,8 @@ class ScoreboardArtifactsTests(unittest.TestCase):
         score = module.ScoreResult(
             scenario_id="scn-1",
             track="netplus",
+            plan="FREE",
+            retention_days=14,
             score=0.5,
             passed=1,
             total=2,
@@ -43,6 +45,8 @@ class ScoreboardArtifactsTests(unittest.TestCase):
         self.assertEqual(first, second)
         payload = json.loads(first.decode("utf-8"))
         self.assertEqual(payload["computed_at"], fixed_time.isoformat())
+        self.assertEqual(payload["plan"], "FREE")
+        self.assertEqual(payload["retention_days"], 14)
 
     def test_build_evidence_bundle_includes_artifacts(self):
         module = load_module()
@@ -67,6 +71,8 @@ class ScoreboardArtifactsTests(unittest.TestCase):
                 module.audit_log_path(scenario_id),
                 "user-1",
                 "tenant-1",
+                "PRO",
+                90,
             )
 
             if bundle.filename.endswith(".zst"):
@@ -88,6 +94,8 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             self.assertIn("audit/audit.jsonl", names)
             self.assertEqual(manifest["subject"], "user-1")
             self.assertEqual(manifest["tenant_id"], "tenant-1")
+            self.assertEqual(manifest["plan"], "PRO")
+            self.assertEqual(manifest["retention_days"], 90)
             self.assertIn("audit_sha256", manifest)
 
     def test_audit_chain_detects_tampering(self):
@@ -118,6 +126,20 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             audit_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             self.assertFalse(module.verify_audit_chain(audit_path))
 
+    def test_score_requires_plan(self):
+        module = load_module()
+        payload = module.ScenarioCompletionPayload(
+            scenario_id="scn-plan",
+            track="netplus",
+            completion_reason="finished",
+            completed_at=datetime.now(timezone.utc),
+            subject="user-1",
+            tenant_id="tenant-1",
+            plan=None,
+        )
+        with self.assertRaises(module.HTTPException):
+            module.build_score_result(payload)
+
     def test_sign_verdict_uses_hashes(self):
         module = load_module()
         module.SIGNING_KEY = module.ed25519.Ed25519PrivateKey.generate()
@@ -137,6 +159,7 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             score = module.ScoreResult(
                 scenario_id=scenario_id,
                 track="netplus",
+                plan="TEAM",
                 score=1.0,
                 passed=1,
                 total=1,
@@ -145,7 +168,7 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             score_bytes = module._score_json_bytes(score)
             score_hash = module._hash_bytes(score_bytes)
             evidence = module.build_evidence_bundle(
-                scenario_id, "netplus", "", artifacts_root=None
+                scenario_id, "netplus", "", artifacts_root=None, plan="TEAM"
             )
             evidence_hash = module._hash_bytes(evidence.payload)
             verdict = module.sign_verdict(score_hash, evidence_hash, scenario_id)
