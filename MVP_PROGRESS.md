@@ -24,6 +24,9 @@
 - Added plan tiering with authoritative entitlements in spawn_service, enforcing per-tier limits and track access with tests.
 - Added receipt-verified + persistent entitlement resolution in spawn_service, minting retention-aware SATs and enforcing resolver priority with tests.
 - Wired SAT-derived plan/retention context through orchestrator OPA inputs, scoring payloads, and scoreboard artifacts with coverage.
+- Added entitlement tokens in spawn_service, deriving SAT plan/retention from ETs with fail-closed secrets and tests.
+- Enforced X-Plan/FREE default guardrails with explicit dev flags and coverage.
+- Added billing audit chain append + tamper detection utilities for receipts with tests.
 
 ## How to run locally
 ```

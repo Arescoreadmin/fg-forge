@@ -83,6 +83,17 @@ class SpawnServiceTests(unittest.TestCase):
     def setUp(self):
         os.environ["ENTITLEMENTS_FILE"] = write_entitlements(DEFAULT_ENTITLEMENTS)
         os.environ.pop("ENTITLEMENTS_REDIS_URL", None)
+        os.environ["ET_HMAC_SECRET"] = "test-et-secret"
+        os.environ.pop("DEV_ALLOW_MISSING_ET_SECRET", None)
+        os.environ.pop("DEV_ALLOW_XPLAN", None)
+        os.environ.pop("ALLOW_FREE_DEFAULT", None)
+        os.environ.pop("DEV_XPLAN_RETENTION_DAYS", None)
+        os.environ.pop("FREE_DEFAULT_RETENTION_DAYS", None)
+        self._audit_dir = tempfile.TemporaryDirectory()
+        os.environ["BILLING_AUDIT_DIR"] = self._audit_dir.name
+
+    def tearDown(self):
+        self._audit_dir.cleanup()
 
     def test_healthz_and_readyz(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -511,6 +522,231 @@ class SpawnServiceTests(unittest.TestCase):
             )
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_et_minted_with_correct_claims(self):
+        _ = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        token = entitlements.mint_entitlement_token(
+            subject="user-1",
+            tenant_id="tenant-1",
+            plan="pro",
+            retention_days=45,
+        )
+        claims = entitlements.verify_entitlement_token(token)
+        self.assertEqual(claims.subject, "user-1")
+        self.assertEqual(claims.tenant_id, "tenant-1")
+        self.assertEqual(claims.plan, "PRO")
+        self.assertEqual(claims.retention_days, 45)
+        self.assertGreater(claims.exp, claims.iat)
+        self.assertTrue(claims.jti)
+
+    def test_sat_derived_from_et(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        module = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        captured = {}
+        real_mint = module.mint_entitlement_token
+
+        def capture_token(*args, **kwargs):
+            token = real_mint(*args, **kwargs)
+            captured["token"] = token
+            return token
+
+        with mock.patch.object(module, "mint_entitlement_token", side_effect=capture_token):
+            app = module.app
+            response = asyncio.run(
+                request(
+                    app,
+                    "POST",
+                    "/api/spawn",
+                    json={
+                        "track": "netplus",
+                        "request_id": "req-et-derived",
+                        "subject": "user-789",
+                        "tier": "pro",
+                    },
+                )
+            )
+        self.assertEqual(response.status_code, 200)
+        token = response.json()["sat"]
+        _, payload_encoded, _ = token.split(".")
+        sat_payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
+        et_claims = entitlements.verify_entitlement_token(captured["token"])
+        self.assertEqual(sat_payload["tier"], et_claims.plan)
+        self.assertEqual(sat_payload["retention_days"], et_claims.retention_days)
+
+    def test_missing_et_secret_fails_closed(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ.pop("ET_HMAC_SECRET", None)
+        os.environ.pop("DEV_ALLOW_MISSING_ET_SECRET", None)
+        module = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        entitlements._et_secret_cache = None
+        app = module.app
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-missing-et",
+                    "subject": "user-1",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 500)
+
+    def test_missing_et_secret_allowed_with_dev_flag(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ.pop("ET_HMAC_SECRET", None)
+        os.environ["DEV_ALLOW_MISSING_ET_SECRET"] = "true"
+        module = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        entitlements._et_secret_cache = None
+        app = module.app
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-missing-et-dev",
+                    "subject": "user-1",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_xplan_rejected_by_default(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ.pop("DEV_ALLOW_XPLAN", None)
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-xplan-block",
+                    "subject": "user-1",
+                    "tier": "free",
+                },
+                headers={"x-plan": "pro"},
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_xplan_allowed_with_flag(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["DEV_ALLOW_XPLAN"] = "true"
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-xplan-allow",
+                    "subject": "user-1",
+                },
+                headers={"x-plan": "team"},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        _, payload_encoded, _ = response.json()["sat"].split(".")
+        payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
+        self.assertEqual(payload["tier"], "TEAM")
+
+    def test_free_default_disabled_by_default(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["ENTITLEMENTS_FILE"] = write_entitlements({})
+        os.environ.pop("ALLOW_FREE_DEFAULT", None)
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-free-default-block",
+                    "subject": "user-missing",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_free_default_allowed_with_flag(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["ENTITLEMENTS_FILE"] = write_entitlements({})
+        os.environ["ALLOW_FREE_DEFAULT"] = "true"
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-free-default-allow",
+                    "subject": "user-missing",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        _, payload_encoded, _ = response.json()["sat"].split(".")
+        payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
+        self.assertEqual(payload["tier"], "FREE")
+
+    def test_billing_audit_chain_integrity(self):
+        _ = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        entitlements.append_billing_audit_event(
+            tenant_id="tenant-1",
+            subject="user-1",
+            plan="free",
+            receipt_exp=int(time.time()) + 3600,
+        )
+        entitlements.append_billing_audit_event(
+            tenant_id="tenant-1",
+            subject="user-2",
+            plan="pro",
+            receipt_exp=int(time.time()) + 7200,
+        )
+        path = Path(self._audit_dir.name) / "tenant-1" / "billing_audit.jsonl"
+        self.assertTrue(entitlements.verify_billing_audit_chain(path))
+
+    def test_billing_audit_chain_tamper_detected(self):
+        _ = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        entitlements.append_billing_audit_event(
+            tenant_id="tenant-2",
+            subject="user-1",
+            plan="free",
+            receipt_exp=int(time.time()) + 3600,
+        )
+        entitlements.append_billing_audit_event(
+            tenant_id="tenant-2",
+            subject="user-2",
+            plan="pro",
+            receipt_exp=int(time.time()) + 7200,
+        )
+        path = Path(self._audit_dir.name) / "tenant-2" / "billing_audit.jsonl"
+        with path.open("r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        tampered = json.loads(lines[1])
+        tampered["plan"] = "ENTERPRISE"
+        lines[1] = json.dumps(tampered) + "\n"
+        with path.open("w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+        self.assertFalse(entitlements.verify_billing_audit_chain(path))
 
 
 if __name__ == "__main__":
