@@ -2,3 +2,14 @@
 # Local artifacts
 *.zip
 frostgate-spear-main/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Dev scripts
+/tmp/
