@@ -45,11 +45,8 @@ jobs:
       - name: OPA policy tests
         run: |
           set -e
-          if compgen -G "policies/*.rego" > /dev/null; then
-            opa test policies/
-          else
-            echo "No OPA policies found; skipping."
-          fi
+          opa version
+          opa test policies/
 
       - name: Unit tests (spawn_service)
         run: python -m unittest discover -s services/spawn_service/tests
