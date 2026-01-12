@@ -76,6 +76,34 @@ SIGNING_KEY_PATH = os.getenv("SIGNING_KEY_PATH")
 SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 
 
+def _enforce_startup_config() -> None:
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    non_dev = forge_env not in {"dev", "development"}
+    errors: list[str] = []
+
+    if non_dev:
+        missing = [
+            name
+            for name in (
+                "SAT_HMAC_SECRET",
+                "ET_HMAC_SECRET",
+                "RECEIPT_HMAC_SECRET",
+                "OPERATOR_TOKEN",
+            )
+            if not os.getenv(name)
+        ]
+        if missing:
+            errors.append(
+                "missing required secrets in non-dev mode: "
+                + ", ".join(sorted(missing))
+            )
+
+    if errors:
+        message = "startup config invalid: " + "; ".join(errors)
+        logger.error(message)
+        raise RuntimeError(message)
+
+
 class CriterionScore(BaseModel):
     criterion_id: str
     passed: bool
@@ -771,6 +799,7 @@ async def nats_subscriber() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    _enforce_startup_config()
     task = asyncio.create_task(nats_subscriber())
     logger.info("Scoreboard started")
     yield

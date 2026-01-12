@@ -27,6 +27,10 @@
 - Added entitlement tokens in spawn_service, deriving SAT plan/retention from ETs with fail-closed secrets and tests.
 - Enforced X-Plan/FREE default guardrails with explicit dev flags and coverage.
 - Added billing audit chain append + tamper detection utilities for receipts with tests.
+- Added CI workflow to run unit tests, syntax linting, OPA policy tests, and a basic secret scan.
+- Added startup config guardrails for required secrets and unsafe dev flags in non-dev modes.
+- Added OPA policy hash logging with optional mismatch enforcement on startup.
+- Added an operator runbook covering required env vars, modes, verification, rotations, and recovery.
 
 ## How to run locally
 ```
@@ -41,4 +45,3 @@ python -m unittest discover -s scripts/tests
 - Introduce template versioning and immutability checks in spawn/orchestrator.
 - Implement quota enforcement in orchestrator spawn flow and NATS admission gates.
 - Integrate KMS-backed signing keys for verdict signatures.
-- Add CI pipeline configuration to run tests and policy checks.

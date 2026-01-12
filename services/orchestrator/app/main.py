@@ -64,6 +64,7 @@ _sat_secret_warning_emitted = False
 # Configuration
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 OPA_URL = os.getenv("OPA_URL", "http://forge_opa:8181")
+OPA_POLICY_DIR = Path(os.getenv("OPA_POLICY_DIR", "/policies"))
 NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
 NETWORK_PREFIX = "forge_scn_"
 SCOREBOARD_URL = os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080")
@@ -314,6 +315,70 @@ def _warn_sat_secret_alias() -> None:
     if not _sat_secret_warning_emitted:
         logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
         _sat_secret_warning_emitted = True
+
+
+def _enforce_startup_config() -> None:
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    non_dev = forge_env not in {"dev", "development"}
+    errors: list[str] = []
+
+    if non_dev:
+        missing = [
+            name
+            for name in (
+                "SAT_HMAC_SECRET",
+                "ET_HMAC_SECRET",
+                "RECEIPT_HMAC_SECRET",
+                "OPERATOR_TOKEN",
+            )
+            if not os.getenv(name)
+        ]
+        if missing:
+            errors.append(
+                "missing required secrets in non-dev mode: "
+                + ", ".join(sorted(missing))
+            )
+
+    if errors:
+        message = "startup config invalid: " + "; ".join(errors)
+        logger.error(message)
+        raise RuntimeError(message)
+
+
+def _compute_policy_hash() -> str | None:
+    if not OPA_POLICY_DIR.exists():
+        return None
+    rego_files = sorted(
+        path
+        for path in OPA_POLICY_DIR.rglob("*.rego")
+        if path.is_file()
+    )
+    if not rego_files:
+        return None
+    digest = hashlib.sha256()
+    for path in rego_files:
+        relative = path.relative_to(OPA_POLICY_DIR)
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _log_and_verify_policy_hash() -> None:
+    policy_hash = _compute_policy_hash()
+    expected_hash = os.getenv("OPA_POLICY_HASH")
+    if policy_hash:
+        logger.info("OPA policy hash: %s", policy_hash)
+    if expected_hash:
+        if not policy_hash:
+            message = "OPA policy hash expected but no policies found"
+            logger.error(message)
+            raise RuntimeError(message)
+        if policy_hash != expected_hash:
+            message = "OPA policy hash mismatch"
+            logger.error(message)
+            raise RuntimeError(message)
 
 
 def _parse_bearer_token(value: str) -> Optional[str]:
@@ -927,6 +992,8 @@ async def nats_subscriber() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    _enforce_startup_config()
+    _log_and_verify_policy_hash()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias()
     # Start NATS subscriber in background

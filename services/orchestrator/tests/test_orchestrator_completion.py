@@ -28,6 +28,9 @@ def _load_module(module_path: Path, prefix: str):
 
 def load_spawn_module():
     repo_root = Path(__file__).resolve().parents[3]
+    spawn_root = repo_root / "services" / "spawn_service"
+    if str(spawn_root) not in sys.path:
+        sys.path.insert(0, str(spawn_root))
     module_path = repo_root / "services" / "spawn_service" / "app" / "main.py"
     return _load_module(module_path, "spawn_main")
 

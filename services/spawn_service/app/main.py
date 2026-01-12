@@ -114,6 +114,7 @@ entitlement_resolver = EntitlementResolver()
 
 @app.on_event("startup")
 def warn_deprecated_sat_secret() -> None:
+    _enforce_startup_config()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias()
 
@@ -157,6 +158,40 @@ def _warn_sat_secret_alias() -> None:
     if not _sat_secret_warning_emitted:
         logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
         _sat_secret_warning_emitted = True
+
+
+def _enforce_startup_config() -> None:
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    non_dev = forge_env not in {"dev", "development"}
+    errors: list[str] = []
+
+    if non_dev:
+        missing = [
+            name
+            for name in (
+                "SAT_HMAC_SECRET",
+                "ET_HMAC_SECRET",
+                "RECEIPT_HMAC_SECRET",
+                "OPERATOR_TOKEN",
+            )
+            if not os.getenv(name)
+        ]
+        if missing:
+            errors.append(
+                "missing required secrets in non-dev mode: "
+                + ", ".join(sorted(missing))
+            )
+
+    if forge_env in {"staging", "prod", "production"}:
+        if os.getenv("DEV_ALLOW_XPLAN", "false").lower() == "true":
+            errors.append("DEV_ALLOW_XPLAN cannot be true in staging/prod")
+        if os.getenv("ALLOW_FREE_DEFAULT", "false").lower() == "true":
+            errors.append("ALLOW_FREE_DEFAULT cannot be true in staging/prod")
+
+    if errors:
+        message = "startup config invalid: " + "; ".join(errors)
+        logger.error(message)
+        raise RuntimeError(message)
 
 
 def _sat_issued_at() -> int:
