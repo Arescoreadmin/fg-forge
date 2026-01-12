@@ -20,7 +20,13 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.entitlements import EntitlementDecision, EntitlementResolver, normalize_tier
+from app.entitlements import (
+    EntitlementDecision,
+    EntitlementResolver,
+    mint_entitlement_token,
+    normalize_tier,
+    verify_entitlement_token,
+)
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
@@ -625,17 +631,36 @@ def build_spawn_response(
     subject = resolve_subject_identifier(payload, request, sat_claims)
     tenant_id = resolve_tenant_identifier(request, sat_claims, subject)
     receipt_token = request.headers.get(ENTITLEMENT_RECEIPT_HEADER, "").strip() or None
-    entitlement = entitlement_resolver.resolve(
-        subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+    plan_override = request.headers.get("x-plan", "").strip()
+    if plan_override:
+        if os.getenv("DEV_ALLOW_XPLAN", "false").lower() != "true":
+            raise HTTPException(status_code=403, detail="x-plan disabled")
+        retention_days = int(os.getenv("DEV_XPLAN_RETENTION_DAYS", "30"))
+        entitlement = EntitlementDecision(
+            tier=normalize_tier(plan_override),
+            retention_days=retention_days,
+            source="x-plan",
+        )
+    else:
+        entitlement = entitlement_resolver.resolve(
+            subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+        )
+
+    et_token = mint_entitlement_token(
+        subject=subject,
+        tenant_id=tenant_id,
+        plan=entitlement.tier,
+        retention_days=entitlement.retention_days,
     )
-    tier = entitlement.tier
+    et_claims = verify_entitlement_token(et_token)
+    tier = normalize_tier(et_claims.plan)
     entitlements = resolve_entitlements(tier)
     if payload.tier and normalize_tier(payload.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and normalize_tier(sat_claims.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and sat_claims.retention_days is not None:
-        if sat_claims.retention_days != entitlement.retention_days:
+        if sat_claims.retention_days != et_claims.retention_days:
             raise HTTPException(status_code=403, detail="retention mismatch")
     if payload.track not in entitlements.allowed_tracks:
         raise HTTPException(status_code=403, detail="track not allowed for tier")
@@ -644,9 +669,11 @@ def build_spawn_response(
     if request_id in REQUEST_CACHE:
         cached = REQUEST_CACHE[request_id]
         cached_tier = cached.get("tier", tier)
-        cached_retention = cached.get("retention_days", entitlement.retention_days)
+        cached_retention = cached.get("retention_days", et_claims.retention_days)
         cached_tenant = cached.get("tenant_id", tenant_id)
         if cached_tier != tier or cached_tenant != tenant_id:
+            raise HTTPException(status_code=403, detail="entitlement mismatch")
+        if cached_retention != et_claims.retention_days:
             raise HTTPException(status_code=403, detail="entitlement mismatch")
         issued_at = _sat_issued_at()
         sat_token = generate_sat(
@@ -659,7 +686,7 @@ def build_spawn_response(
                 subject=subject,
                 tenant_id=cached_tenant,
                 tier=cached_tier,
-                retention_days=cached_retention,
+                retention_days=et_claims.retention_days,
                 requested_limits=payload.requested_limits,
                 scenario_id=cached["scenario_id"],
             )
@@ -692,7 +719,7 @@ def build_spawn_response(
             subject=subject,
             tenant_id=tenant_id,
             tier=tier,
-            retention_days=entitlement.retention_days,
+            retention_days=et_claims.retention_days,
             requested_limits=payload.requested_limits,
             scenario_id=scenario_id,
         )
@@ -726,7 +753,7 @@ def build_spawn_response(
         "track": payload.track,
         "template_id": payload.template_id or payload.track,
         "tier": tier,
-        "retention_days": entitlement.retention_days,
+        "retention_days": et_claims.retention_days,
         "tenant_id": tenant_id,
     }
 
