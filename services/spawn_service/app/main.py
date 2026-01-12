@@ -20,6 +20,8 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.entitlements import EntitlementDecision, EntitlementResolver, normalize_tier
+
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
 
@@ -91,12 +93,17 @@ PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 REQUEST_CACHE: Dict[str, dict] = {}
 CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
+TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
+ENTITLEMENT_RECEIPT_HEADER = os.getenv(
+    "ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token"
+)
 _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
     logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
 _sat_secret_warning_emitted = False
 _fallback_warning_emitted = False
+entitlement_resolver = EntitlementResolver()
 
 
 @app.on_event("startup")
@@ -251,13 +258,6 @@ def parse_bearer_token(value: str) -> Optional[str]:
     return None
 
 
-def normalize_tier(value: str) -> str:
-    tier = (value or "").strip().upper()
-    if not tier:
-        raise HTTPException(status_code=403, detail="tier required")
-    return tier
-
-
 def resolve_entitlements(tier: str) -> PlanEntitlements:
     normalized = normalize_tier(tier)
     entitlements = PLAN_ENTITLEMENTS.get(normalized)
@@ -283,7 +283,7 @@ def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
 class SpawnRequest(BaseModel):
     track: str = Field(..., description="Training track identifier")
     subject: str = Field(..., description="User or session identifier")
-    tier: str = Field(..., description="Billing tier")
+    tier: Optional[str] = Field(None, description="Billing tier (deprecated)")
     template_id: Optional[str] = Field(
         None, description="Template identifier override"
     )
@@ -323,6 +323,7 @@ class SatClaims(BaseModel):
     subject: str
     tenant_id: str
     tier: str
+    retention_days: Optional[int] = None
     requested_limits: Optional[dict[str, int]] = None
     scenario_id: Optional[str] = None
 
@@ -598,9 +599,22 @@ def resolve_subject_identifier(
     return subject
 
 
+def resolve_tenant_identifier(
+    request: Request, sat_claims: Optional[SatClaims], subject: str
+) -> str:
+    tenant_id = request.headers.get(TENANT_ID_HEADER, "").strip()
+    if sat_claims:
+        if tenant_id and sat_claims.tenant_id != tenant_id:
+            raise HTTPException(status_code=403, detail="tenant mismatch")
+        tenant_id = sat_claims.tenant_id
+    if not tenant_id:
+        tenant_id = subject
+    return tenant_id
+
+
 def build_spawn_response(
     payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
-) -> SpawnResponse:
+) -> Tuple[SpawnResponse, EntitlementDecision]:
     request_id = resolve_request_id(payload, request)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id required")
@@ -608,18 +622,32 @@ def build_spawn_response(
     if payload.track not in TRACKS:
         raise HTTPException(status_code=400, detail="unsupported track")
 
-    tier = normalize_tier(payload.tier)
-    entitlements = resolve_entitlements(tier)
-    if payload.track not in entitlements.allowed_tracks:
-        raise HTTPException(status_code=403, detail="track not allowed for tier")
-
     subject = resolve_subject_identifier(payload, request, sat_claims)
+    tenant_id = resolve_tenant_identifier(request, sat_claims, subject)
+    receipt_token = request.headers.get(ENTITLEMENT_RECEIPT_HEADER, "").strip() or None
+    entitlement = entitlement_resolver.resolve(
+        subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+    )
+    tier = entitlement.tier
+    entitlements = resolve_entitlements(tier)
+    if payload.tier and normalize_tier(payload.tier) != tier:
+        raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and normalize_tier(sat_claims.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
+    if sat_claims and sat_claims.retention_days is not None:
+        if sat_claims.retention_days != entitlement.retention_days:
+            raise HTTPException(status_code=403, detail="retention mismatch")
+    if payload.track not in entitlements.allowed_tracks:
+        raise HTTPException(status_code=403, detail="track not allowed for tier")
     spawn_limiter.check_rate_limit(subject, entitlements.max_spawns_per_minute)
 
     if request_id in REQUEST_CACHE:
         cached = REQUEST_CACHE[request_id]
+        cached_tier = cached.get("tier", tier)
+        cached_retention = cached.get("retention_days", entitlement.retention_days)
+        cached_tenant = cached.get("tenant_id", tenant_id)
+        if cached_tier != tier or cached_tenant != tenant_id:
+            raise HTTPException(status_code=403, detail="entitlement mismatch")
         issued_at = _sat_issued_at()
         sat_token = generate_sat(
             SatClaims(
@@ -629,13 +657,14 @@ def build_spawn_response(
                 track=cached["track"],
                 template_id=cached["template_id"],
                 subject=subject,
-                tenant_id=subject,
-                tier=tier,
+                tenant_id=cached_tenant,
+                tier=cached_tier,
+                retention_days=cached_retention,
                 requested_limits=payload.requested_limits,
                 scenario_id=cached["scenario_id"],
             )
         )
-        return SpawnResponse(**cached, sat=sat_token)
+        return SpawnResponse(**cached, sat=sat_token), entitlement
 
     template = load_template(payload.track)
     opa_allows(template)
@@ -661,8 +690,9 @@ def build_spawn_response(
             track=payload.track,
             template_id=payload.template_id or payload.track,
             subject=subject,
-            tenant_id=subject,
+            tenant_id=tenant_id,
             tier=tier,
+            retention_days=entitlement.retention_days,
             requested_limits=payload.requested_limits,
             scenario_id=scenario_id,
         )
@@ -695,13 +725,16 @@ def build_spawn_response(
         "expires_at": response.expires_at,
         "track": payload.track,
         "template_id": payload.template_id or payload.track,
+        "tier": tier,
+        "retention_days": entitlement.retention_days,
+        "tenant_id": tenant_id,
     }
 
-    return response
+    return response, entitlement
 
 
 def notify_orchestrator(
-    payload: SpawnRequest, response: SpawnResponse, request: Request
+    payload: SpawnRequest, response: SpawnResponse, request: Request, tier: str
 ) -> None:
     orchestrator_url = os.getenv("ORCHESTRATOR_URL")
     if not orchestrator_url:
@@ -711,7 +744,7 @@ def notify_orchestrator(
         "scenario_id": response.scenario_id,
         "template": payload.track,
         "request_id": response.request_id,
-        "tier": normalize_tier(payload.tier),
+        "tier": tier,
     }
     try:
         call = _request_with_retries(
@@ -822,16 +855,16 @@ def readyz() -> dict:
 @app.post("/v1/spawn", response_model=SpawnResponse)
 def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
-    response = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request)
+    response, entitlement = build_spawn_response(payload, request, sat_claims)
+    notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 
 @app.post("/api/spawn", response_model=SpawnResponse)
 def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
-    response = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request)
+    response, entitlement = build_spawn_response(payload, request, sat_claims)
+    notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 

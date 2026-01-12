@@ -8,6 +8,8 @@ import asyncio
 import base64
 import hmac
 import json
+import tempfile
+import time
 from unittest import mock
 
 import httpx
@@ -18,6 +20,26 @@ def b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + padding)
 
 
+DEFAULT_ENTITLEMENTS = {
+    "user-1": {"tier": "free", "retention_days": 30},
+    "user-123": {"tier": "free", "retention_days": 30},
+    "user-456": {"tier": "free", "retention_days": 30},
+    "user-789": {"tier": "pro", "retention_days": 90},
+    "user-rate": {"tier": "free", "retention_days": 30},
+    "user-quo": {"tier": "free", "retention_days": 30},
+    "user-redis": {"tier": "free", "retention_days": 30},
+    "user-dev": {"tier": "free", "retention_days": 30},
+    "user-unknown": {"tier": "unknown", "retention_days": 30},
+    "user-track": {"tier": "free", "retention_days": 30},
+}
+
+
+def write_entitlements(entries: dict) -> str:
+    handle = tempfile.NamedTemporaryFile(delete=False, mode="w", encoding="utf-8")
+    json.dump(entries, handle)
+    handle.close()
+    return handle.name
+
 
 def load_module():
     repo_root = Path(__file__).resolve().parents[3]
@@ -26,7 +48,9 @@ def load_module():
     if "SAT_HMAC_SECRET" not in os.environ and "SAT_SECRET" not in os.environ:
         os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
 
-    module_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
+    service_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(service_root))
+    module_path = service_root / "app" / "main.py"
     module_name = f"spawn_service_main_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
@@ -56,6 +80,10 @@ async def request(
 
 
 class SpawnServiceTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["ENTITLEMENTS_FILE"] = write_entitlements(DEFAULT_ENTITLEMENTS)
+        os.environ.pop("ENTITLEMENTS_REDIS_URL", None)
+
     def test_healthz_and_readyz(self):
         os.environ["SAT_REQUIRED"] = "false"
         app = load_app()
@@ -160,6 +188,7 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(payload["subject"], "user-789")
         self.assertEqual(payload["tenant_id"], "user-789")
         self.assertEqual(payload["tier"], "PRO")
+        self.assertEqual(payload["retention_days"], 90)
 
     def test_spawn_api_missing_subject_identifier(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -413,6 +442,75 @@ class SpawnServiceTests(unittest.TestCase):
             )
         )
         self.assertEqual(response.status_code, 403)
+
+    def test_spawn_receipt_overrides_store(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["RECEIPT_HMAC_SECRET"] = "receipt-secret"
+        entries = dict(DEFAULT_ENTITLEMENTS)
+        entries["user-receipt"] = {"tier": "free", "retention_days": 30}
+        os.environ["ENTITLEMENTS_FILE"] = write_entitlements(entries)
+        app = load_app()
+        exp = int(time.time()) + 3600
+        receipt_payload = {
+            "tenant_id": "user-receipt",
+            "tier": "pro",
+            "retention_days": 45,
+            "exp": exp,
+            "subject": "user-receipt",
+        }
+        payload_encoded = base64.urlsafe_b64encode(
+            json.dumps(receipt_payload).encode("utf-8")
+        ).rstrip(b"=").decode("utf-8")
+        signature = hmac.new(
+            os.environ["RECEIPT_HMAC_SECRET"].encode("utf-8"),
+            payload_encoded.encode("utf-8"),
+            "sha256",
+        ).digest()
+        signature_encoded = (
+            base64.urlsafe_b64encode(signature).rstrip(b"=").decode("utf-8")
+        )
+        receipt = f"{payload_encoded}.{signature_encoded}"
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "ccna",
+                    "request_id": "req-receipt",
+                    "subject": "user-receipt",
+                },
+                headers={"x-receipt-token": receipt},
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        token = response.json()["sat"]
+        _, payload_encoded, _ = token.split(".")
+        payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
+        self.assertEqual(payload["tier"], "PRO")
+        self.assertEqual(payload["retention_days"], 45)
+
+    def test_spawn_receipt_invalid_fails_closed(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["RECEIPT_HMAC_SECRET"] = "receipt-secret"
+        entries = dict(DEFAULT_ENTITLEMENTS)
+        entries["user-bad-receipt"] = {"tier": "free", "retention_days": 30}
+        os.environ["ENTITLEMENTS_FILE"] = write_entitlements(entries)
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-bad-receipt",
+                    "subject": "user-bad-receipt",
+                },
+                headers={"x-receipt-token": "invalid.token"},
+            )
+        )
+        self.assertEqual(response.status_code, 401)
 
 
 if __name__ == "__main__":
