@@ -34,7 +34,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install OPA (v1.x)
+      - name: Install OPA (v1.0.0)
         run: |
           set -e
           curl -L -o opa https://openpolicyagent.org/downloads/v1.0.0/opa_linux_amd64
@@ -42,11 +42,12 @@ jobs:
           sudo mv opa /usr/local/bin/opa
           opa version
 
-      - name: OPA policy tests
+      - name: OPA policy tests (strict)
         run: |
           set -e
           if compgen -G "policies/*.rego" > /dev/null; then
-            opa test policies/
+            opa capabilities > /tmp/capabilities.json
+            opa test --capabilities /tmp/capabilities.json --verbose policies/
           else
             echo "No OPA policies found; skipping."
           fi
