@@ -159,7 +159,7 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(payload["template_id"], "netplus")
         self.assertEqual(payload["subject"], "user-789")
         self.assertEqual(payload["tenant_id"], "user-789")
-        self.assertEqual(payload["tier"], "pro")
+        self.assertEqual(payload["tier"], "PRO")
 
     def test_spawn_api_missing_subject_identifier(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -181,8 +181,13 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_spawn_rate_limit_exceeded(self):
         os.environ["SAT_REQUIRED"] = "false"
-        os.environ["SPAWN_RATE_LIMIT_PER_MINUTE"] = "1"
-        app = load_app()
+        module = load_module()
+        module.PLAN_ENTITLEMENTS["FREE"] = module.PlanEntitlements(
+            max_spawns_per_minute=1,
+            max_concurrent_scenarios=module.PLAN_ENTITLEMENTS["FREE"].max_concurrent_scenarios,
+            allowed_tracks=module.PLAN_ENTITLEMENTS["FREE"].allowed_tracks,
+        )
+        app = module.app
         first = asyncio.run(
             request(
                 app,
@@ -214,8 +219,13 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_spawn_concurrent_quota_exceeded(self):
         os.environ["SAT_REQUIRED"] = "false"
-        os.environ["SPAWN_MAX_CONCURRENT_SCENARIOS"] = "1"
-        app = load_app()
+        module = load_module()
+        module.PLAN_ENTITLEMENTS["FREE"] = module.PlanEntitlements(
+            max_spawns_per_minute=module.PLAN_ENTITLEMENTS["FREE"].max_spawns_per_minute,
+            max_concurrent_scenarios=1,
+            allowed_tracks=module.PLAN_ENTITLEMENTS["FREE"].allowed_tracks,
+        )
+        app = module.app
         first = asyncio.run(
             request(
                 app,
@@ -364,6 +374,42 @@ class SpawnServiceTests(unittest.TestCase):
                     "tier": "free",
                 },
                 headers={"x-sat": sat},
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_spawn_api_rejects_unknown_tier(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-unknown-tier",
+                    "subject": "user-unknown",
+                    "tier": "unknown",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_spawn_api_rejects_track_not_allowed_for_tier(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        app = load_app()
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "cissp",
+                    "request_id": "req-track-tier",
+                    "subject": "user-track",
+                    "tier": "free",
+                },
             )
         )
         self.assertEqual(response.status_code, 403)

@@ -21,6 +21,7 @@
 - Added timeout/retry/jitter handling with cooldown circuit breakers for inter-service HTTP calls, with unit tests for retry bounds.
 - Extended /readyz checks with runtime isolation assertions (read-only filesystem probes, egress gateway config validation, OPA readiness where applicable) and updated tests.
 - Added staging smoke test script to run compose, spawn/complete a scenario, and verify verdict artifacts.
+- Added plan tiering with authoritative entitlements in spawn_service, enforcing per-tier limits and track access with tests.
 
 ## How to run locally
 ```
