@@ -88,6 +88,8 @@ class ScoreResult(BaseModel):
     track: str
     subject: str | None = None
     tenant_id: str | None = None
+    plan: str | None = None
+    retention_days: int | None = None
     score: float  # 0.0 to 1.0
     passed: int
     total: int
@@ -119,6 +121,8 @@ class ScenarioCompletionPayload(BaseModel):
     completed_at: datetime
     subject: str | None = None
     tenant_id: str | None = None
+    plan: str | None = None
+    retention_days: int | None = None
     score: float | None = None
     passed: int | None = None
     total: int | None = None
@@ -516,6 +520,8 @@ def build_evidence_bundle(
     audit_path: Path | None = None,
     subject: str | None = None,
     tenant_id: str | None = None,
+    plan: str | None = None,
+    retention_days: int | None = None,
 ) -> EvidenceBundle:
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
@@ -534,6 +540,8 @@ def build_evidence_bundle(
             "track": track,
             "subject": subject,
             "tenant_id": tenant_id,
+            "plan": plan,
+            "retention_days": retention_days,
         }
 
         if audit_path and audit_path.exists():
@@ -601,18 +609,24 @@ def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdi
 def build_score_result(payload: ScenarioCompletionPayload) -> ScoreResult:
     if not payload.subject or not payload.tenant_id:
         raise HTTPException(status_code=400, detail="subject and tenant_id required")
+    if not payload.plan:
+        raise HTTPException(status_code=400, detail="plan required")
     if payload.criteria:
         score = calculate_score(payload.criteria)
         score.scenario_id = payload.scenario_id
         score.track = payload.track
         score.subject = payload.subject
         score.tenant_id = payload.tenant_id
+        score.plan = payload.plan
+        score.retention_days = payload.retention_days
         return score
     return ScoreResult(
         scenario_id=payload.scenario_id,
         track=payload.track,
         subject=payload.subject,
         tenant_id=payload.tenant_id,
+        plan=payload.plan,
+        retention_days=payload.retention_days,
         score=payload.score or 0.0,
         passed=payload.passed or 0,
         total=payload.total or 0,
@@ -647,6 +661,8 @@ def finalize_scoring(
         audit_log_path(payload.scenario_id),
         payload.subject,
         payload.tenant_id,
+        payload.plan,
+        payload.retention_days,
     )
     evidence_hash = _hash_bytes(evidence_bundle.payload)
     verdict = sign_verdict(score_hash, evidence_hash, payload.scenario_id)
@@ -679,6 +695,8 @@ async def process_scenario_completed(msg: Any) -> None:
         evidence_url = data.get("evidence_url", "")
         subject = data.get("subject")
         tenant_id = data.get("tenant_id")
+        plan = data.get("plan") or data.get("tier")
+        retention_days = data.get("retention_days")
 
         logger.info("Processing scenario.completed: %s", scenario_id)
 
@@ -692,6 +710,8 @@ async def process_scenario_completed(msg: Any) -> None:
             completed_at=datetime.now(timezone.utc),
             subject=subject,
             tenant_id=tenant_id,
+            plan=plan,
+            retention_days=retention_days,
             score=data.get("score"),
             passed=data.get("passed"),
             total=data.get("total"),

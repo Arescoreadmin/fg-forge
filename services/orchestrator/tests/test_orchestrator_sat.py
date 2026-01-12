@@ -106,7 +106,7 @@ class OrchestratorSatTests(unittest.TestCase):
         }
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
 
-        async def deny_policy(_template: dict):
+        async def deny_policy(_input_payload: dict):
             return False, "OPA unavailable"
 
         module.check_opa_policy = deny_policy
@@ -150,6 +150,51 @@ class OrchestratorSatTests(unittest.TestCase):
             module._get_sat_secret()
         warnings = [record for record in logs.output if "SAT_SECRET is deprecated" in record]
         self.assertEqual(len(warnings), 1)
+
+    def test_opa_payload_includes_entitlements(self):
+        module = load_module()
+        module.replay_protector = module.ReplayProtector()
+        now = int(datetime.now(timezone.utc).timestamp())
+        claims = {
+            "jti": "jti-789",
+            "exp": now + 300,
+            "iat": now,
+            "track": "netplus",
+            "template_id": "netplus",
+            "subject": "user-4",
+            "tenant_id": "tenant-4",
+            "tier": "team",
+            "retention_days": 45,
+            "scenario_id": "scn-entitlements",
+        }
+        token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
+        captured = {}
+
+        async def capture_policy(input_payload: dict):
+            captured.update(input_payload)
+            return True, None
+
+        module.check_opa_policy = capture_policy
+        module.create_scenario_network = lambda _scenario_id: "net-1"
+        module.launch_scenario_containers = lambda _scenario_id, _network_id, _template: [
+            "container-1"
+        ]
+        module.scenarios.clear()
+        msg = DummyMsg(
+            {
+                "scenario_id": "scn-entitlements",
+                "track": "netplus",
+                "request_id": "req-entitlements",
+                "tier": "team",
+                "sat": token,
+            }
+        )
+        asyncio.run(module.process_spawn_request(msg))
+        self.assertTrue(msg.acked)
+        self.assertEqual(captured.get("plan"), "TEAM")
+        self.assertEqual(captured.get("retention_days"), 45)
+        self.assertEqual(captured.get("subject"), "user-4")
+        self.assertEqual(captured.get("tenant_id"), "tenant-4")
 
 
 if __name__ == "__main__":
