@@ -45,7 +45,7 @@ tier_quotas := {
 }
 
 # Main allow rule
-allow {
+allow if {
     valid_tenant
     not tenant_blocked
     within_daily_quota
@@ -55,26 +55,26 @@ allow {
 }
 
 # Validation helpers
-valid_tenant {
+valid_tenant if {
     input.tenant_id != ""
 }
 
-tenant_blocked {
+tenant_blocked if {
     input.blocked == true
 }
 
 # Get quota config for tenant tier
-get_quota_config(tier) = config {
+get_quota_config(tier) = config if {
     config := tier_quotas[tier]
 }
 
-get_quota_config(tier) = config {
+get_quota_config(tier) = config if {
     not tier_quotas[tier]
     config := tier_quotas["free"]
 }
 
 # Daily quota check
-within_daily_quota {
+within_daily_quota if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     scenarios_today := object.get(input, "scenarios_today", 0)
@@ -82,7 +82,7 @@ within_daily_quota {
 }
 
 # Concurrent scenario limit
-within_concurrent_limit {
+within_concurrent_limit if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     active_scenarios := object.get(input, "active_scenarios", 0)
@@ -90,7 +90,7 @@ within_concurrent_limit {
 }
 
 # Rate limit check
-within_rate_limit {
+within_rate_limit if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     requests_per_minute := object.get(input, "requests_per_minute", 0)
@@ -98,7 +98,7 @@ within_rate_limit {
 }
 
 # Resource limits check
-within_resource_limits {
+within_resource_limits if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     requested_cpu := object.get(input, "requested_cpu", 1)
@@ -108,32 +108,18 @@ within_resource_limits {
 }
 
 # Calculate remaining quota
-remaining_daily_quota = remaining {
-    tier := object.get(input, "tier", "free")
-    config := get_quota_config(tier)
-    scenarios_today := object.get(input, "scenarios_today", 0)
-    remaining := config.max_scenarios_per_day - scenarios_today
-}
-
-remaining_concurrent_slots = remaining {
-    tier := object.get(input, "tier", "free")
-    config := get_quota_config(tier)
-    active_scenarios := object.get(input, "active_scenarios", 0)
-    remaining := config.max_concurrent - active_scenarios
-}
-
 # Deny reasons
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.tenant_id == ""
     msg := "missing tenant_id"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.blocked == true
     msg := "tenant is blocked"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     scenarios_today := object.get(input, "scenarios_today", 0)
@@ -141,7 +127,7 @@ deny_reasons[msg] {
     msg := sprintf("daily quota exceeded: %d/%d scenarios", [scenarios_today, config.max_scenarios_per_day])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     active_scenarios := object.get(input, "active_scenarios", 0)
@@ -149,7 +135,7 @@ deny_reasons[msg] {
     msg := sprintf("concurrent limit reached: %d/%d active scenarios", [active_scenarios, config.max_concurrent])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     requests_per_minute := object.get(input, "requests_per_minute", 0)
@@ -157,7 +143,7 @@ deny_reasons[msg] {
     msg := sprintf("rate limit exceeded: %d/%d requests per minute", [requests_per_minute, config.rate_limit_per_minute])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     requested_cpu := object.get(input, "requested_cpu", 0)
@@ -165,7 +151,7 @@ deny_reasons[msg] {
     msg := sprintf("CPU request %d exceeds limit %d for tier %s", [requested_cpu, config.max_cpu_per_scenario, tier])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     tier := object.get(input, "tier", "free")
     config := get_quota_config(tier)
     requested_memory := object.get(input, "requested_memory_mb", 0)
@@ -176,7 +162,22 @@ deny_reasons[msg] {
 # Quota metadata for response
 quota_metadata := {
     "tier": object.get(input, "tier", "free"),
-    "daily_remaining": remaining_daily_quota,
-    "concurrent_remaining": remaining_concurrent_slots,
+    "daily_remaining": remaining_daily_quota(),
+    "concurrent_remaining": remaining_concurrent_slots(),
     "limits": get_quota_config(object.get(input, "tier", "free"))
+}
+
+# Calculate remaining quota (v1-safe functions)
+remaining_daily_quota() = remaining if {
+    tier := object.get(input, "tier", "free")
+    config := get_quota_config(tier)
+    scenarios_today := object.get(input, "scenarios_today", 0)
+    remaining := config.max_scenarios_per_day - scenarios_today
+}
+
+remaining_concurrent_slots() = remaining if {
+    tier := object.get(input, "tier", "free")
+    config := get_quota_config(tier)
+    active_scenarios := object.get(input, "active_scenarios", 0)
+    remaining := config.max_concurrent - active_scenarios
 }

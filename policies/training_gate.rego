@@ -34,15 +34,15 @@ track_configs := {
 }
 
 # Get track from labels
-get_track(labels) = track {
-    some label
-    label := labels[_]
+get_track(labels) = track if {
+    some i
+    label := labels[i]
     startswith(label, "class:")
     track := substring(label, 6, -1)
 }
 
 # Main allow rule
-allow {
+allow if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
 
@@ -63,7 +63,7 @@ allow {
 }
 
 # Alternative allow for egress-allowed tracks
-allow {
+allow if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     config.egress_allowed
@@ -76,57 +76,57 @@ allow {
 }
 
 # Helper: Check all containers are safe
-all_containers_safe(containers, privileged_allowed) {
+all_containers_safe(containers, privileged_allowed) if {
     count([c | c := containers[_]; not container_safe(c, privileged_allowed)]) == 0
 }
 
-container_safe(container, privileged_allowed) {
+container_safe(container, privileged_allowed) if {
     # Read-only filesystem required
     container.read_only == true
 }
 
-container_safe(container, privileged_allowed) {
+container_safe(container, privileged_allowed) if {
     # Or privileged is allowed and explicitly set
     privileged_allowed
     container.privileged == true
 }
 
 # Deny reasons for debugging
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     not track_configs[track]
     msg := sprintf("unsupported track: %s", [track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     input.limits.cpu > config.max_cpu
     msg := sprintf("CPU limit %d exceeds maximum %d for track %s", [input.limits.cpu, config.max_cpu, track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     input.limits.memory_mb > config.max_memory_mb
     msg := sprintf("memory limit %d MB exceeds maximum %d MB for track %s", [input.limits.memory_mb, config.max_memory_mb, track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     input.limits.attacker_max_exploits > config.attacker_max_exploits
     msg := sprintf("attacker exploits %d exceeds maximum %d for track %s", [input.limits.attacker_max_exploits, config.attacker_max_exploits, track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     count(input.assets.containers) > config.max_containers
     msg := sprintf("container count %d exceeds maximum %d for track %s", [count(input.assets.containers), config.max_containers, track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     track := get_track(input.metadata.labels)
     config := track_configs[track]
     not config.egress_allowed
@@ -134,7 +134,7 @@ deny_reasons[msg] {
     msg := sprintf("egress must be 'deny' for track %s", [track])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     some i
     container := input.assets.containers[i]
     container.read_only != true

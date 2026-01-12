@@ -23,7 +23,7 @@ tier_quotas := {
 }
 
 # Main allow rule
-allow {
+allow if {
     valid_request_id
     valid_track
     billing_authorized
@@ -32,94 +32,94 @@ allow {
 }
 
 # Validation helpers
-valid_request_id {
+valid_request_id if {
     input.request_id != ""
     count(input.request_id) >= 8
     count(input.request_id) <= 64
 }
 
-valid_track {
+valid_track if {
     input.track != ""
     allowed_tracks[input.track]
 }
 
-billing_authorized {
+billing_authorized if {
     input.billing_ok == true
 }
 
-tenant_not_blocked {
+tenant_not_blocked if {
     not input.tenant_blocked
 }
 
-tenant_not_blocked {
+tenant_not_blocked if {
     input.tenant_blocked == false
 }
 
-within_rate_limit {
+within_rate_limit if {
     not input.rate_limit_exceeded
 }
 
-within_rate_limit {
+within_rate_limit if {
     input.rate_limit_exceeded == false
 }
 
 # Quota calculation
-quota_for_track(track) = quota {
+quota_for_track(track) = quota if {
     tier := track_tiers[track]
     quota := tier_quotas[tier]
 }
 
-remaining_quota = remaining {
+remaining_quota = remaining if {
     quota := quota_for_track(input.track)
     used := object.get(input, "scenarios_used", 0)
     remaining := quota - used
 }
 
 # Deny reasons for debugging
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.request_id == ""
     msg := "missing request_id"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.request_id != ""
     count(input.request_id) < 8
     msg := "request_id too short (minimum 8 characters)"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.request_id != ""
     count(input.request_id) > 64
     msg := "request_id too long (maximum 64 characters)"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.track == ""
     msg := "missing track"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.track != ""
     not allowed_tracks[input.track]
     msg := sprintf("unsupported track: %s (allowed: %v)", [input.track, allowed_tracks])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.billing_ok != true
     msg := "billing not authorized"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.tenant_blocked == true
     msg := "tenant is blocked"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.rate_limit_exceeded == true
     msg := "rate limit exceeded - please wait before spawning more scenarios"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     quota := quota_for_track(input.track)
     used := object.get(input, "scenarios_used", 0)
     used >= quota
