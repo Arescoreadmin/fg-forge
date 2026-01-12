@@ -20,7 +20,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.entitlements import (
+from .entitlements import (
     EntitlementDecision,
     EntitlementResolver,
     mint_entitlement_token,
