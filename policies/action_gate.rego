@@ -37,7 +37,7 @@ dangerous_patterns := [
 ]
 
 # Main allow rule
-allow {
+allow if {
     valid_scenario
     valid_actor
     valid_action
@@ -48,125 +48,125 @@ allow {
 }
 
 # Validation helpers
-valid_scenario {
+valid_scenario if {
     input.scenario_id != ""
     count(input.scenario_id) >= 4
 }
 
-valid_actor {
+valid_actor if {
     input.actor != ""
     input.actor != "anonymous"
 }
 
-valid_action {
+valid_action if {
     input.action != ""
     count(input.action) <= 10000
 }
 
-valid_policy_class {
+valid_policy_class if {
     input.policy_class != ""
     policy_classes[input.policy_class]
 }
 
-budget_sufficient {
+budget_sufficient if {
     input.budget_ok == true
 }
 
-budget_sufficient {
+budget_sufficient if {
     budget := object.get(input, "budget_remaining", default_budget)
     cost := class_costs[input.policy_class]
     budget >= cost
 }
 
-authorized {
+authorized if {
     input.authorized == true
 }
 
 # Check for dangerous actions
-dangerous_action {
-    some pattern
-    pattern := dangerous_patterns[_]
+dangerous_action if {
+    some i
+    pattern := dangerous_patterns[i]
     contains(lower(input.action), lower(pattern))
 }
 
 # Check for shell injection patterns
-dangerous_action {
+dangerous_action if {
     contains(input.action, "; rm")
 }
 
-dangerous_action {
+dangerous_action if {
     contains(input.action, "| rm")
 }
 
-dangerous_action {
+dangerous_action if {
     contains(input.action, "&& rm")
 }
 
-dangerous_action {
+dangerous_action if {
     contains(input.action, "`rm")
 }
 
-dangerous_action {
+dangerous_action if {
     contains(input.action, "$(rm")
 }
 
 # Calculate action cost
-action_cost = cost {
+# Calculate remaining budget after action (v1-safe function)
+# Calculate action cost (v1-safe function)
+action_cost := cost if {
     cost := class_costs[input.policy_class]
 }
-
-# Calculate remaining budget after action
-remaining_budget = remaining {
+remaining_budget := remaining if {
     budget := object.get(input, "budget_remaining", default_budget)
     cost := class_costs[input.policy_class]
     remaining := budget - cost
 }
 
 # Deny reasons for debugging
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.scenario_id == ""
     msg := "missing scenario_id"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.scenario_id != ""
     count(input.scenario_id) < 4
     msg := "scenario_id too short"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.actor == ""
     msg := "missing actor"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.actor == "anonymous"
     msg := "anonymous actors not allowed"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.action == ""
     msg := "missing action"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.action != ""
     count(input.action) > 10000
     msg := "action too long (maximum 10000 characters)"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.policy_class == ""
     msg := "missing policy_class"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.policy_class != ""
     not policy_classes[input.policy_class]
     msg := sprintf("invalid policy_class: %s (allowed: %v)", [input.policy_class, policy_classes])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.budget_ok != true
     budget := object.get(input, "budget_remaining", 0)
     cost := class_costs[input.policy_class]
@@ -174,12 +174,12 @@ deny_reasons[msg] {
     msg := sprintf("budget exceeded: %d remaining, %d required for %s action", [budget, cost, input.policy_class])
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     input.authorized != true
     msg := "action not authorized"
 }
 
-deny_reasons[msg] {
+deny_reasons contains msg if {
     dangerous_action
     msg := "action contains dangerous patterns"
 }
