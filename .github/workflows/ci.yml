@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            -r services/spawn_service/requirements.txt \
+            -r services/orchestrator/requirements.txt \
+            -r services/scoreboard/requirements.txt
+
+      - name: Lint (syntax)
+        run: python -m compileall services scripts
+
+      - name: Secret scan
+        run: |
+          if rg -n "BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}" .; then
+            echo "Potential secret material detected."
+            exit 1
+          fi
+
+      - name: Install OPA
+        run: |
+          curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+          chmod +x /usr/local/bin/opa
+
+      - name: OPA policy tests
+        run: |
+          if compgen -G "policies/*.rego" > /dev/null; then
+            opa test policies
+          else
+            echo "No OPA policies found; skipping."
+          fi
+
+      - name: Unit tests (spawn_service)
+        run: python -m unittest discover -s services/spawn_service/tests
+
+      - name: Unit tests (orchestrator)
+        run: python -m unittest discover -s services/orchestrator/tests
+
+      - name: Unit tests (scoreboard)
+        run: python -m unittest discover -s services/scoreboard/tests
+
+      - name: Unit tests (scripts)
+        run: python -m unittest discover -s scripts/tests
