@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+import httpx
 from httpx import ASGITransport, AsyncClient
 
 
@@ -71,6 +72,33 @@ class OrchestratorReadyzTests(unittest.TestCase):
 
         response = asyncio.run(run())
         self.assertEqual(response.status_code, 503)
+
+    def test_request_retries_bounded_on_timeout(self):
+        os.environ["HTTP_MAX_RETRIES"] = "2"
+        module = load_orchestrator_module()
+
+        class DummyClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def request(self, *_args, **_kwargs):
+                self.calls += 1
+                raise httpx.ReadTimeout("timeout")
+
+        client = DummyClient()
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        module._sleep = no_sleep
+
+        async def run():
+            with self.assertRaises(httpx.RequestError):
+                await module._request_with_retries(client, "GET", "http://example.com")
+
+        asyncio.run(run())
+        self.assertEqual(client.calls, 3)
+        os.environ.pop("HTTP_MAX_RETRIES", None)
 
 
 if __name__ == "__main__":
