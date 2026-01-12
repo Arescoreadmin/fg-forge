@@ -22,7 +22,8 @@ jobs:
           pip install \
             -r services/spawn_service/requirements.txt \
             -r services/orchestrator/requirements.txt \
-            -r services/scoreboard/requirements.txt
+            -r services/scoreboard/requirements.txt \
+            -r scripts/requirements.txt
 
       - name: Lint (syntax)
         run: python -m compileall services scripts
