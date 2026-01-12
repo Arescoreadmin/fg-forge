@@ -42,11 +42,11 @@ jobs:
           sudo mv opa /usr/local/bin/opa
           opa version
 
-      - name: OPA policy tests (Rego v1)
+      - name: OPA policy tests
         run: |
           set -e
           if compgen -G "policies/*.rego" > /dev/null; then
-            opa test --v1 policies/
+            opa test policies/
           else
             echo "No OPA policies found; skipping."
           fi
