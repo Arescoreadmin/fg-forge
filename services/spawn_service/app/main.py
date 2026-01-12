@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import threading
 import time
 import uuid
@@ -62,6 +63,7 @@ if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
     logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
 _sat_secret_warning_emitted = False
+_fallback_warning_emitted = False
 
 
 @app.on_event("startup")
@@ -286,18 +288,40 @@ class RateLimitState:
 class SpawnLimiter:
     def __init__(self) -> None:
         self._redis_url = os.getenv("REDIS_URL")
+        self._redis_required = bool(self._redis_url)
         self._redis_client = None
         self._lock = threading.Lock()
         self._rate_cache: dict[str, RateLimitState] = {}
         self._active_cache: dict[str, dict[str, float]] = {}
 
     def _get_redis(self):
+        global _fallback_warning_emitted
         if not self._redis_url:
+            if not _fallback_warning_emitted:
+                logger.warning(
+                    "REDIS_URL not set; using in-memory rate limits (dev only)"
+                )
+                _fallback_warning_emitted = True
             return None
         if self._redis_client is None:
             import redis
 
-            self._redis_client = redis.from_url(self._redis_url, decode_responses=True)
+            try:
+                self._redis_client = redis.from_url(
+                    self._redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=float(
+                        os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")
+                    ),
+                    socket_timeout=float(os.getenv("REDIS_TIMEOUT_SECONDS", "1.0")),
+                )
+            except Exception as exc:
+                logger.warning("Redis client init failed: %s", exc)
+                if self._redis_required:
+                    raise HTTPException(
+                        status_code=503, detail="redis unavailable"
+                    ) from exc
+                return None
         return self._redis_client
 
     def _rate_limit(self) -> int:
@@ -325,6 +349,8 @@ class SpawnLimiter:
                 raise
             except Exception as exc:
                 logger.warning("Redis rate limit failed: %s", exc)
+                if self._redis_required:
+                    raise HTTPException(status_code=503, detail="redis unavailable") from exc
 
         with self._lock:
             state = self._rate_cache.get(subject)
@@ -369,6 +395,8 @@ class SpawnLimiter:
                 raise
             except Exception as exc:
                 logger.warning("Redis quota check failed: %s", exc)
+                if self._redis_required:
+                    raise HTTPException(status_code=503, detail="redis unavailable") from exc
 
         with self._lock:
             self._purge_active(subject, now)
@@ -382,6 +410,89 @@ class SpawnLimiter:
 
 
 spawn_limiter = SpawnLimiter()
+
+
+class CircuitBreaker:
+    def __init__(self, name: str, cooldown_seconds: float) -> None:
+        self._name = name
+        self._cooldown_seconds = cooldown_seconds
+        self._last_failure = 0.0
+
+    def is_open(self) -> bool:
+        return (time.time() - self._last_failure) < self._cooldown_seconds
+
+    def record_success(self) -> None:
+        self._last_failure = 0.0
+
+    def record_failure(self) -> None:
+        self._last_failure = time.time()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _timeout_config() -> tuple[float, float]:
+    connect = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "2.0"))
+    read = float(os.getenv("HTTP_READ_TIMEOUT_SECONDS", "5.0"))
+    return connect, read
+
+
+def _request_with_retries(
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> requests.Response:
+    if breaker and breaker.is_open():
+        raise HTTPException(
+            status_code=503, detail=f"{breaker.name} circuit breaker open"
+        )
+    connect_timeout, read_timeout = _timeout_config()
+    timeout = (connect_timeout, read_timeout)
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.request(
+                method, url, json=json_body, headers=headers, timeout=timeout
+            )
+            if response.status_code >= 500:
+                raise requests.RequestException(
+                    f"upstream {response.status_code}"
+                )
+            if breaker:
+                breaker.record_success()
+            return response
+        except requests.RequestException as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            _sleep(delay)
+    raise requests.RequestException("request failed") from last_exc
+
+
+_opa_breaker = CircuitBreaker(
+    "opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_orchestrator_breaker = CircuitBreaker(
+    "orchestrator", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_egress_breaker = CircuitBreaker(
+    "egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
 
 
 def load_template(track: str) -> dict:
@@ -399,10 +510,11 @@ def opa_allows(template: dict) -> None:
         return
 
     try:
-        response = requests.post(
+        response = _request_with_retries(
+            "POST",
             f"{opa_url}/v1/data/frostgate/forge/training/allow",
-            json={"input": template},
-            timeout=5,
+            json_body={"input": template},
+            breaker=_opa_breaker,
         )
     except requests.RequestException as exc:
         logger.warning("OPA request failed: %s", exc)
@@ -548,17 +660,91 @@ def notify_orchestrator(
         "tier": payload.tier,
     }
     try:
-        call = requests.post(
+        call = _request_with_retries(
+            "POST",
             f"{orchestrator_url}/v1/scenarios",
-            json=body,
+            json_body=body,
             headers=headers,
-            timeout=5,
+            breaker=_orchestrator_breaker,
         )
     except requests.RequestException as exc:
         logger.warning("orchestrator request failed: %s", exc)
         raise HTTPException(status_code=502, detail="orchestrator unavailable") from exc
     if call.status_code >= 400:
         raise HTTPException(status_code=502, detail="orchestrator error")
+
+
+def _read_only_required() -> bool:
+    if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
+        return True
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    return forge_env in {"staging", "prod", "production"}
+
+
+def _check_read_only_fs() -> None:
+    if not _read_only_required():
+        return
+    probe_path = Path("/.forge_read_only_probe")
+    try:
+        probe_path.write_text("probe", encoding="utf-8")
+    except OSError:
+        return
+    else:
+        try:
+            probe_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail="filesystem not read-only")
+
+
+def _check_egress_gateway() -> None:
+    egress_url = os.getenv("EGRESS_GATEWAY_URL")
+    if not egress_url:
+        return
+    expected = os.getenv("EGRESS_DRY_RUN_EXPECTED")
+    if expected is None:
+        forge_env = os.getenv("FORGE_ENV", "dev").lower()
+        expected = "true" if forge_env == "dev" else "false"
+    try:
+        response = _request_with_retries(
+            "GET",
+            f"{egress_url}/readyz",
+            breaker=_egress_breaker,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unavailable: {exc}"
+        ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503, detail="egress gateway invalid response"
+        ) from exc
+    if str(payload.get("dry_run", "")).lower() != expected.lower():
+        raise HTTPException(status_code=503, detail="egress gateway config mismatch")
+
+
+def _check_opa_ready() -> None:
+    opa_url = os.getenv("OPA_URL")
+    if not opa_url:
+        return
+    try:
+        response = _request_with_retries(
+            "GET",
+            f"{opa_url}/health",
+            breaker=_opa_breaker,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail=f"opa unavailable: {exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503, detail=f"opa unhealthy: {response.status_code}"
+        )
 
 
 @app.get("/health")
@@ -573,6 +759,9 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz() -> dict:
+    _check_read_only_fs()
+    _check_egress_gateway()
+    _check_opa_ready()
     return {"status": "ready", "service": "forge_spawn_service"}
 
 

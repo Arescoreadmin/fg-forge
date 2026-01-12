@@ -17,6 +17,8 @@ import logging
 import os
 import tarfile
 import uuid
+import random
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +30,7 @@ import nats
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
+import httpx
 from minio import Minio
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
@@ -143,6 +146,75 @@ class EvidenceBundle:
     filename: str
     content_type: str
     payload: bytes
+
+
+class CircuitBreaker:
+    def __init__(self, name: str, cooldown_seconds: float) -> None:
+        self._name = name
+        self._cooldown_seconds = cooldown_seconds
+        self._last_failure = 0.0
+
+    def is_open(self) -> bool:
+        return (time.time() - self._last_failure) < self._cooldown_seconds
+
+    def record_success(self) -> None:
+        self._last_failure = 0.0
+
+    def record_failure(self) -> None:
+        self._last_failure = time.time()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+
+def _httpx_timeout() -> httpx.Timeout:
+    connect = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "2.0"))
+    read = float(os.getenv("HTTP_READ_TIMEOUT_SECONDS", "5.0"))
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _request_with_retries(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> httpx.Response:
+    if breaker and breaker.is_open():
+        raise httpx.RequestError(f"{breaker.name} circuit breaker open")
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+    last_exc: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            response = client.request(method, url, headers=headers)
+            if response.status_code >= 500:
+                raise httpx.RequestError(f"upstream {response.status_code}")
+            if breaker:
+                breaker.record_success()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            _sleep(delay)
+    raise httpx.RequestError("request failed") from last_exc
+
+
+_egress_breaker = CircuitBreaker(
+    "egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
 
 
 def get_minio_client() -> Minio:
@@ -339,6 +411,63 @@ def _check_signing_key_ready() -> None:
         raise HTTPException(
             status_code=503, detail=f"signing key unavailable: {exc}"
         ) from exc
+
+
+def _read_only_required() -> bool:
+    if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
+        return True
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    return forge_env in {"staging", "prod", "production"}
+
+
+def _check_read_only_fs() -> None:
+    if not _read_only_required():
+        return
+    probe_path = Path("/.forge_read_only_probe")
+    try:
+        probe_path.write_text("probe", encoding="utf-8")
+    except OSError:
+        return
+    else:
+        try:
+            probe_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail="filesystem not read-only")
+
+
+def _check_egress_gateway() -> None:
+    egress_url = os.getenv("EGRESS_GATEWAY_URL")
+    if not egress_url:
+        return
+    expected = os.getenv("EGRESS_DRY_RUN_EXPECTED")
+    if expected is None:
+        forge_env = os.getenv("FORGE_ENV", "dev").lower()
+        expected = "true" if forge_env == "dev" else "false"
+    with httpx.Client(timeout=_httpx_timeout()) as client:
+        try:
+            response = _request_with_retries(
+                client,
+                "GET",
+                f"{egress_url}/readyz",
+                breaker=_egress_breaker,
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"egress gateway unavailable: {exc}"
+            ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503, detail="egress gateway invalid response"
+        ) from exc
+    if str(payload.get("dry_run", "")).lower() != expected.lower():
+        raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
 
 def _public_key_b64() -> str:
@@ -660,6 +789,8 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 def readyz() -> dict:
+    _check_read_only_fs()
+    _check_egress_gateway()
     _check_storage_writable()
     _check_signing_key_ready()
     return {"status": "ready", "service": "forge_scoreboard"}

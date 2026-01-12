@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -65,6 +66,36 @@ class ScoreboardReadyzTests(unittest.TestCase):
             module = load_scoreboard_module(storage_root, str(storage_root / "missing.pem"))
             response = run_readyz(module)
             self.assertEqual(response.status_code, 503)
+
+    def test_readyz_fails_on_egress_config_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage_root = Path(tmpdir)
+            key_path = storage_root / "signing.pem"
+            key = ed25519.Ed25519PrivateKey.generate()
+            key_path.write_bytes(
+                key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+            os.environ["EGRESS_GATEWAY_URL"] = "http://egress"
+            os.environ["EGRESS_DRY_RUN_EXPECTED"] = "false"
+            module = load_scoreboard_module(storage_root, str(key_path))
+
+            class FakeResponse:
+                status_code = 200
+
+                def json(self):
+                    return {"dry_run": True}
+
+            with mock.patch.object(
+                module, "_request_with_retries", return_value=FakeResponse()
+            ):
+                response = run_readyz(module)
+            self.assertEqual(response.status_code, 503)
+            os.environ.pop("EGRESS_GATEWAY_URL", None)
+            os.environ.pop("EGRESS_DRY_RUN_EXPECTED", None)
 
 
 if __name__ == "__main__":

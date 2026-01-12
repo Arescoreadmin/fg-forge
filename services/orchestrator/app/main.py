@@ -14,6 +14,8 @@ import hashlib
 import json
 import logging
 import os
+import random
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -188,6 +190,87 @@ nc: nats.NATS | None = None
 js: Any = None
 
 
+class CircuitBreaker:
+    def __init__(self, name: str, cooldown_seconds: float) -> None:
+        self._name = name
+        self._cooldown_seconds = cooldown_seconds
+        self._last_failure = 0.0
+
+    def is_open(self) -> bool:
+        return (time.time() - self._last_failure) < self._cooldown_seconds
+
+    def record_success(self) -> None:
+        self._last_failure = 0.0
+
+    def record_failure(self) -> None:
+        self._last_failure = time.time()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+
+def _httpx_timeout() -> httpx.Timeout:
+    connect = float(os.getenv("HTTP_CONNECT_TIMEOUT_SECONDS", "2.0"))
+    read = float(os.getenv("HTTP_READ_TIMEOUT_SECONDS", "5.0"))
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _request_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> httpx.Response:
+    if breaker and breaker.is_open():
+        raise httpx.RequestError(f"{breaker.name} circuit breaker open")
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+    last_exc: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            response = await client.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+            )
+            if response.status_code >= 500:
+                raise httpx.RequestError(f"upstream {response.status_code}")
+            if breaker:
+                breaker.record_success()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            await _sleep(delay)
+    raise httpx.RequestError("request failed") from last_exc
+
+
+_opa_breaker = CircuitBreaker(
+    "opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_scoreboard_breaker = CircuitBreaker(
+    "scoreboard", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_egress_breaker = CircuitBreaker(
+    "egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+
+
 def get_docker_client() -> docker.DockerClient:
     global docker_client
     if docker_client is None:
@@ -261,7 +344,7 @@ def _require_operator_auth(request: Request) -> None:
 
 
 def _scoreboard_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=5.0)
+    return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=_httpx_timeout())
 
 
 async def _trigger_scoreboard(
@@ -288,8 +371,13 @@ async def _trigger_scoreboard(
     if correlation_id:
         headers["x-request-id"] = correlation_id
     async with _scoreboard_client() as client:
-        response = await client.post(
-            f"/internal/scenario/{scenario_id}/score", json=payload, headers=headers
+        response = await _request_with_retries(
+            client,
+            "POST",
+            f"/internal/scenario/{scenario_id}/score",
+            json_body=payload,
+            headers=headers,
+            breaker=_scoreboard_breaker,
         )
         if response.status_code >= 400:
             raise RuntimeError(
@@ -364,11 +452,14 @@ async def enforce_sat(
 
 async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
     """Query OPA for policy decision."""
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
-            response = await client.post(
+            response = await _request_with_retries(
+                client,
+                "POST",
                 f"{OPA_URL}/v1/data/frostgate/forge/training/allow",
-                json={"input": template},
+                json_body={"input": template},
+                breaker=_opa_breaker,
             )
             if response.status_code >= 400:
                 return False, f"OPA error: {response.status_code}"
@@ -384,9 +475,11 @@ async def check_opa_policy(template: dict) -> tuple[bool, str | None]:
 
 
 async def _check_opa_ready() -> None:
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
-            response = await client.get(f"{OPA_URL}/health")
+            response = await _request_with_retries(
+                client, "GET", f"{OPA_URL}/health", breaker=_opa_breaker
+            )
         except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=503, detail=f"opa unavailable: {exc}"
@@ -395,6 +488,60 @@ async def _check_opa_ready() -> None:
         raise HTTPException(
             status_code=503, detail=f"opa unhealthy: {response.status_code}"
         )
+
+
+def _read_only_required() -> bool:
+    if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
+        return True
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    return forge_env in {"staging", "prod", "production"}
+
+
+def _check_read_only_fs() -> None:
+    if not _read_only_required():
+        return
+    probe_path = Path("/.forge_read_only_probe")
+    try:
+        probe_path.write_text("probe", encoding="utf-8")
+    except OSError:
+        return
+    else:
+        try:
+            probe_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail="filesystem not read-only")
+
+
+async def _check_egress_gateway() -> None:
+    egress_url = os.getenv("EGRESS_GATEWAY_URL")
+    if not egress_url:
+        return
+    expected = os.getenv("EGRESS_DRY_RUN_EXPECTED")
+    if expected is None:
+        forge_env = os.getenv("FORGE_ENV", "dev").lower()
+        expected = "true" if forge_env == "dev" else "false"
+    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+        try:
+            response = await _request_with_retries(
+                client, "GET", f"{egress_url}/readyz", breaker=_egress_breaker
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=503, detail=f"egress gateway unavailable: {exc}"
+            ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503, detail="egress gateway invalid response"
+        ) from exc
+    if str(payload.get("dry_run", "")).lower() != expected.lower():
+        raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -798,10 +945,14 @@ def healthz() -> dict:
 
 @app.get("/readyz")
 async def readyz() -> dict:
+    _check_read_only_fs()
+    await _check_egress_gateway()
     await _check_opa_ready()
     try:
         async with _scoreboard_client() as client:
-            response = await client.get("/readyz")
+            response = await _request_with_retries(
+                client, "GET", "/readyz", breaker=_scoreboard_breaker
+            )
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503, detail=f"scoreboard unavailable: {exc}"

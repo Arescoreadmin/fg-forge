@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hmac
 import json
+from unittest import mock
 
 import httpx
 
@@ -243,6 +244,85 @@ class SpawnServiceTests(unittest.TestCase):
             )
         )
         self.assertEqual(second.status_code, 409)
+
+    def test_spawn_rate_limit_redis_unavailable_fails_closed(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["REDIS_URL"] = "redis://localhost:6390"
+        module = load_module()
+        app = module.app
+
+        class FakeRedis:
+            def incr(self, _key):
+                raise Exception("down")
+
+            def expire(self, _key, _ttl):
+                return None
+
+        module.spawn_limiter._redis_client = FakeRedis()
+        module.spawn_limiter._redis_required = True
+
+        response = asyncio.run(
+            request(
+                app,
+                "POST",
+                "/api/spawn",
+                json={
+                    "track": "netplus",
+                    "request_id": "req-redis-down",
+                    "subject": "user-redis",
+                    "tier": "free",
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 503)
+        os.environ.pop("REDIS_URL", None)
+
+    def test_spawn_rate_limit_fallback_warning_when_no_redis(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ.pop("REDIS_URL", None)
+        module = load_module()
+        app = module.app
+
+        with self.assertLogs("forge_spawn_service", level="WARNING") as logs:
+            response = asyncio.run(
+                request(
+                    app,
+                    "POST",
+                    "/api/spawn",
+                    json={
+                        "track": "netplus",
+                        "request_id": "req-dev-fallback",
+                        "subject": "user-dev",
+                        "tier": "free",
+                    },
+                )
+            )
+        self.assertEqual(response.status_code, 200)
+        warnings = [
+            record
+            for record in logs.output
+            if "REDIS_URL not set; using in-memory rate limits" in record
+        ]
+        self.assertTrue(warnings)
+
+    def test_request_retries_bounded_on_timeout(self):
+        os.environ["HTTP_MAX_RETRIES"] = "2"
+        module = load_module()
+        call_count = {"count": 0}
+
+        def fake_request(*_args, **_kwargs):
+            call_count["count"] += 1
+            raise module.requests.Timeout("timeout")
+
+        with mock.patch.object(module.requests, "request", side_effect=fake_request):
+            with mock.patch.object(module, "_sleep", return_value=None):
+                with self.assertRaises(module.requests.RequestException):
+                    module._request_with_retries(
+                        "GET",
+                        "http://example.com/health",
+                    )
+        self.assertEqual(call_count["count"], 3)
+        os.environ.pop("HTTP_MAX_RETRIES", None)
 
     def test_sat_secret_alias_warning_emitted_once(self):
         os.environ.pop("SAT_HMAC_SECRET", None)

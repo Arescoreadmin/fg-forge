@@ -17,6 +17,10 @@
 - Added per-subject spawn rate limiting and concurrent scenario quotas with Redis-backed counters and in-memory fallback plus tests.
 - Enforced SAT subject/tenant binding and tier matching, propagated correlation IDs to scoreboard, and recorded subject/tenant in score artifacts.
 - Implemented hash-chained audit logs with evidence bundle coverage and tamper detection tests.
+- Enforced Redis-backed spawn rate limiting/quota with fail-closed behavior when Redis is configured and explicit dev fallback warnings plus staging Redis wiring.
+- Added timeout/retry/jitter handling with cooldown circuit breakers for inter-service HTTP calls, with unit tests for retry bounds.
+- Extended /readyz checks with runtime isolation assertions (read-only filesystem probes, egress gateway config validation, OPA readiness where applicable) and updated tests.
+- Added staging smoke test script to run compose, spawn/complete a scenario, and verify verdict artifacts.
 
 ## How to run locally
 ```
