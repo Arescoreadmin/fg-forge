@@ -47,7 +47,8 @@ jobs:
         run: |
           set -e
           opa version
-          opa test policies/ --v0-compatible
+          opa fmt -w policies/
+          opa test -v policies/
 
       - name: Unit tests (spawn_service)
         run: python -m unittest discover -s services/spawn_service/tests
