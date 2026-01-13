@@ -42,15 +42,15 @@ jobs:
       - name: CI fingerprint
         run: |
           echo "ref=$GITHUB_REF sha=$GITHUB_SHA workflow=$GITHUB_WORKFLOW run_id=$GITHUB_RUN_ID"
-          echo "ci_yml_commit=016d79e branch=ci/fix-opa-v1-flag"
+          echo "ci_yml_sha=$(git rev-parse HEAD:.github/workflows/ci.yml 2>/dev/null || true)"
 
       - name: OPA policy tests (Rego v1)
         run: |
           set -euo pipefail
 
-          if rg -n --hidden --no-ignore-vcs -- "--v1" .; then
-            echo "ERROR: '--v1' flag detected in repo. OPA does not support it."
-            exit 1
+          if rg -n --hidden --no-ignore-vcs '^\s*docker\b.*\bopa\b.*\btest\b.*--v1\b' .github/workflows; then
+          echo "ERROR: '--v1' flag detected in a docker opa test command."
+           exit 1
           fi
 
           OPA_IMAGE="openpolicyagent/opa@sha256:c0609fecc0924743f8648dc4a035d2f57ca163dc723ed1d13f3197ba5bd122b3"
