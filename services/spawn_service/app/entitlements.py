@@ -27,6 +27,12 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
+def _canonical_json(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
 def normalize_tier(value: str) -> str:
     tier = (value or "").strip().upper()
     if not tier:
@@ -47,8 +53,10 @@ class EntitlementTokenClaims(BaseModel):
     tenant_id: str
     plan: str
     retention_days: int = Field(..., ge=0)
-    exp: int
+    issued_at: int
+    expires_at: int
     iat: int
+    exp: int
     jti: str
 
 
@@ -57,6 +65,7 @@ class EntitlementDecision:
     tier: str
     retention_days: int
     source: str
+    receipt_exp: Optional[int] = None
 
 
 class EntitlementResolver:
@@ -137,17 +146,12 @@ class EntitlementResolver:
             raise HTTPException(status_code=403, detail="receipt subject mismatch")
 
         plan = normalize_tier(claims.tier)
-        append_billing_audit_event(
-            tenant_id=tenant_id,
-            subject=subject,
-            plan=plan,
-            receipt_exp=claims.exp,
-        )
 
         return EntitlementDecision(
             tier=plan,
             retention_days=claims.retention_days,
             source="receipt",
+            receipt_exp=claims.exp,
         )
 
     def _resolve_from_store(self, *, tenant_id: str) -> Optional[EntitlementDecision]:
@@ -268,6 +272,95 @@ def _et_expiration(issued_at: int) -> int:
     return issued_at + ttl_seconds
 
 
+def mint_et(claims: dict) -> str:
+    if not isinstance(claims, dict):
+        raise HTTPException(status_code=400, detail="invalid entitlement claims")
+    payload = dict(claims)
+    issued_at = payload.get("issued_at")
+    expires_at = payload.get("expires_at")
+    if issued_at is None:
+        issued_at = _et_issued_at()
+        payload["issued_at"] = issued_at
+    if expires_at is None:
+        expires_at = _et_expiration(int(issued_at))
+        payload["expires_at"] = expires_at
+    if "iat" not in payload:
+        payload["iat"] = payload["issued_at"]
+    if "exp" not in payload:
+        payload["exp"] = payload["expires_at"]
+    payload_bytes = _canonical_json(payload)
+    signature = hmac.new(
+        _get_et_secret().encode("utf-8"), payload_bytes, "sha256"
+    ).digest()
+    return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
+
+
+def verify_et(token: str) -> dict:
+    parts = token.split(".")
+    if len(parts) != 2:
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+    payload_encoded, signature_encoded = parts
+
+    try:
+        payload_bytes = _b64url_decode(payload_encoded)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
+
+    expected_signature = hmac.new(
+        _get_et_secret().encode("utf-8"), payload_bytes, "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+
+    try:
+        payload = json.loads(payload_bytes)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+
+    required = {
+        "subject",
+        "tenant_id",
+        "plan",
+        "retention_days",
+        "issued_at",
+        "expires_at",
+        "iat",
+        "exp",
+        "jti",
+    }
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+
+    try:
+        issued_at = int(payload["issued_at"])
+        expires_at = int(payload["expires_at"])
+        iat = int(payload["iat"])
+        exp = int(payload["exp"])
+        retention_days = int(payload["retention_days"])
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
+
+    if issued_at > expires_at or iat > exp:
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+    if issued_at != iat or expires_at != exp:
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if expires_at < now or exp < now:
+        raise HTTPException(status_code=401, detail="entitlement token expired")
+
+    normalize_tier(str(payload["plan"]))
+    if retention_days < 0:
+        raise HTTPException(status_code=401, detail="invalid entitlement token")
+
+    return payload
+
+
 def mint_entitlement_token(
     *,
     subject: str,
@@ -276,59 +369,31 @@ def mint_entitlement_token(
     retention_days: int,
 ) -> str:
     issued_at = _et_issued_at()
-    claims = EntitlementTokenClaims(
-        subject=subject,
-        tenant_id=tenant_id,
-        plan=normalize_tier(plan),
-        retention_days=retention_days,
-        exp=_et_expiration(issued_at),
-        iat=issued_at,
-        jti=str(uuid.uuid4()),
-    )
-    header = {"alg": "HS256", "typ": "ET"}
-    header_encoded = _b64url_encode(json.dumps(header).encode("utf-8"))
-    payload_encoded = _b64url_encode(claims.model_dump_json().encode("utf-8"))
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    signature = hmac.new(_get_et_secret().encode("utf-8"), signing_input, "sha256").digest()
-    signature_encoded = _b64url_encode(signature)
-    return f"{header_encoded}.{payload_encoded}.{signature_encoded}"
+    expires_at = _et_expiration(issued_at)
+    claims = {
+        "subject": subject,
+        "tenant_id": tenant_id,
+        "plan": normalize_tier(plan),
+        "retention_days": retention_days,
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+        "iat": issued_at,
+        "exp": expires_at,
+        "jti": str(uuid.uuid4()),
+    }
+    return mint_et(claims)
 
 
 def verify_entitlement_token(token: str) -> EntitlementTokenClaims:
+    payload = verify_et(token)
     try:
-        header_encoded, payload_encoded, signature_encoded = token.split(".", 2)
-    except ValueError as exc:
+        return EntitlementTokenClaims.model_validate(payload)
+    except ValidationError as exc:
         raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
 
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    expected_signature = hmac.new(
-        _get_et_secret().encode("utf-8"), signing_input, "sha256"
-    ).digest()
-    expected_encoded = _b64url_encode(expected_signature)
-    if not hmac.compare_digest(expected_encoded, signature_encoded):
-        raise HTTPException(status_code=401, detail="invalid entitlement token")
 
-    try:
-        header = json.loads(_b64url_decode(header_encoded))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
-    if header.get("alg") != "HS256" or header.get("typ") != "ET":
-        raise HTTPException(status_code=401, detail="invalid entitlement token")
-
-    try:
-        payload = EntitlementTokenClaims.model_validate(
-            json.loads(_b64url_decode(payload_encoded))
-        )
-    except (json.JSONDecodeError, ValidationError) as exc:
-        raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
-
-    now = int(datetime.now(timezone.utc).timestamp())
-    if payload.iat > payload.exp:
-        raise HTTPException(status_code=401, detail="invalid entitlement token")
-    if payload.exp < now:
-        raise HTTPException(status_code=401, detail="entitlement token expired")
-    normalize_tier(payload.plan)
-    return payload
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
 
 
 def _billing_audit_dir() -> str:
@@ -339,9 +404,36 @@ def _billing_audit_path(tenant_id: str) -> str:
     return str(Path(_billing_audit_dir()) / tenant_id / "billing_audit.jsonl")
 
 
-def _audit_entry_hash(entry: dict[str, Any]) -> str:
-    payload = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def _audit_entry_hash(prev_hash: str, data: dict[str, Any]) -> str:
+    payload = prev_hash.encode("utf-8") + _canonical_json(data)
     return hashlib.sha256(payload).hexdigest()
+
+
+def append_audit_entry(chain: list[dict], entry: dict) -> list[dict]:
+    prev_hash = chain[-1].get("hash", "") if chain else ""
+    data = dict(entry)
+    entry_hash = _audit_entry_hash(prev_hash, data)
+    new_entry = {"data": data, "prev_hash": prev_hash, "hash": entry_hash}
+    return [*chain, new_entry]
+
+
+def verify_audit_chain(chain: list[dict]) -> bool:
+    prev_hash = ""
+    for entry in chain:
+        if not isinstance(entry, dict):
+            return False
+        data = entry.get("data")
+        entry_hash = entry.get("hash")
+        expected_prev = entry.get("prev_hash")
+        if expected_prev != prev_hash:
+            return False
+        if not isinstance(data, dict) or not isinstance(entry_hash, str):
+            return False
+        expected_hash = _audit_entry_hash(prev_hash, data)
+        if not hmac.compare_digest(entry_hash, expected_hash):
+            return False
+        prev_hash = entry_hash
+    return True
 
 
 def append_billing_audit_event(
@@ -352,41 +444,61 @@ def append_billing_audit_event(
     receipt_exp: int,
 ) -> None:
     audit_path = Path(_billing_audit_path(tenant_id))
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    prev_hash = ""
+    try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if _forge_env() in {"dev", "development"}:
+            logger.warning("Billing audit chain skipped: %s", exc)
+            return
+        raise HTTPException(
+            status_code=500, detail="billing audit chain unavailable"
+        ) from exc
+
+    chain: list[dict] = []
     if audit_path.exists():
         try:
             with audit_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     line = line.strip()
                     if line:
-                        prev_hash = json.loads(line).get("entry_hash", "")
+                        chain.append(json.loads(line))
         except (OSError, json.JSONDecodeError) as exc:
+            if _forge_env() in {"dev", "development"}:
+                logger.warning("Billing audit chain skipped: %s", exc)
+                return
             raise HTTPException(
                 status_code=500, detail="billing audit chain invalid"
             ) from exc
+        if not verify_audit_chain(chain):
+            if _forge_env() in {"dev", "development"}:
+                logger.warning("Billing audit chain skipped: invalid chain")
+                return
+            raise HTTPException(
+                status_code=500, detail="billing audit chain invalid"
+            )
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "tenant_id": tenant_id,
         "subject": subject,
         "plan": normalize_tier(plan),
         "receipt_exp": receipt_exp,
-        "prev_hash": prev_hash,
     }
-    entry_hash = _audit_entry_hash(entry)
-    entry["entry_hash"] = entry_hash
+    new_entry = append_audit_entry(chain, entry)[-1]
     try:
         with audit_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry))
+            handle.write(json.dumps(new_entry, ensure_ascii=False))
             handle.write("\n")
     except OSError as exc:
+        if _forge_env() in {"dev", "development"}:
+            logger.warning("Billing audit chain skipped: %s", exc)
+            return
         raise HTTPException(
             status_code=500, detail="billing audit chain unavailable"
         ) from exc
 
 
 def verify_billing_audit_chain(path: Path) -> bool:
-    prev_hash = ""
+    chain: list[dict] = []
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -397,22 +509,7 @@ def verify_billing_audit_chain(path: Path) -> bool:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     return False
-                entry_hash = entry.get("entry_hash", "")
-                expected_prev = entry.get("prev_hash", "")
-                if expected_prev != prev_hash:
-                    return False
-                payload = {
-                    "ts": entry.get("ts"),
-                    "tenant_id": entry.get("tenant_id"),
-                    "subject": entry.get("subject"),
-                    "plan": entry.get("plan"),
-                    "receipt_exp": entry.get("receipt_exp"),
-                    "prev_hash": entry.get("prev_hash"),
-                }
-                expected_hash = _audit_entry_hash(payload)
-                if not hmac.compare_digest(entry_hash, expected_hash):
-                    return False
-                prev_hash = entry_hash
+                chain.append(entry)
     except OSError:
         return False
-    return True
+    return verify_audit_chain(chain)

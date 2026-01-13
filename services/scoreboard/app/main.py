@@ -72,6 +72,24 @@ MINIO_BUCKET = os.getenv("MINIO_BUCKET", "forge-evidence")
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "storage"))
 SIGNING_KEY_PATH = os.getenv("SIGNING_KEY_PATH")
 
+
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
+
+
+def _enforce_startup_config() -> None:
+    env = _forge_env()
+    if env not in {"dev", "development"}:
+        required = [
+            "SAT_HMAC_SECRET",
+            "ET_HMAC_SECRET",
+            "RECEIPT_HMAC_SECRET",
+            "OPERATOR_TOKEN",
+        ]
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
+
 # Signing key (in production, load from Vault/KMS)
 SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 
@@ -771,6 +789,7 @@ async def nats_subscriber() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    _enforce_startup_config()
     task = asyncio.create_task(nats_subscriber())
     logger.info("Scoreboard started")
     yield

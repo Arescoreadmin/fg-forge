@@ -13,6 +13,7 @@ import time
 from unittest import mock
 
 import httpx
+from fastapi import HTTPException
 
 
 def b64url_decode(value: str) -> bytes:
@@ -83,12 +84,15 @@ class SpawnServiceTests(unittest.TestCase):
     def setUp(self):
         os.environ["ENTITLEMENTS_FILE"] = write_entitlements(DEFAULT_ENTITLEMENTS)
         os.environ.pop("ENTITLEMENTS_REDIS_URL", None)
+        os.environ["FORGE_ENV"] = "dev"
+        os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
         os.environ["ET_HMAC_SECRET"] = "test-et-secret"
         os.environ.pop("DEV_ALLOW_MISSING_ET_SECRET", None)
         os.environ.pop("DEV_ALLOW_XPLAN", None)
         os.environ.pop("ALLOW_FREE_DEFAULT", None)
         os.environ.pop("DEV_XPLAN_RETENTION_DAYS", None)
         os.environ.pop("FREE_DEFAULT_RETENTION_DAYS", None)
+        os.environ.pop("OPERATOR_TOKEN", None)
         self._audit_dir = tempfile.TemporaryDirectory()
         os.environ["BILLING_AUDIT_DIR"] = self._audit_dir.name
 
@@ -523,7 +527,7 @@ class SpawnServiceTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 401)
 
-    def test_et_minted_with_correct_claims(self):
+    def test_et_mint_verify_round_trip(self):
         _ = load_module()
         entitlements = importlib.import_module("app.entitlements")
         token = entitlements.mint_entitlement_token(
@@ -532,13 +536,52 @@ class SpawnServiceTests(unittest.TestCase):
             plan="pro",
             retention_days=45,
         )
-        claims = entitlements.verify_entitlement_token(token)
-        self.assertEqual(claims.subject, "user-1")
-        self.assertEqual(claims.tenant_id, "tenant-1")
-        self.assertEqual(claims.plan, "PRO")
-        self.assertEqual(claims.retention_days, 45)
-        self.assertGreater(claims.exp, claims.iat)
-        self.assertTrue(claims.jti)
+        claims = entitlements.verify_et(token)
+        self.assertEqual(claims["subject"], "user-1")
+        self.assertEqual(claims["tenant_id"], "tenant-1")
+        self.assertEqual(claims["plan"], "PRO")
+        self.assertEqual(claims["retention_days"], 45)
+        self.assertGreater(claims["expires_at"], claims["issued_at"])
+        self.assertTrue(claims["jti"])
+
+    def test_et_signature_failure(self):
+        _ = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        token = entitlements.mint_entitlement_token(
+            subject="user-2",
+            tenant_id="tenant-2",
+            plan="free",
+            retention_days=30,
+        )
+        payload_encoded, signature_encoded = token.split(".")
+        tampered_signature = (
+            signature_encoded[:-1]
+            + ("A" if signature_encoded[-1] != "A" else "B")
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            entitlements.verify_et(f"{payload_encoded}.{tampered_signature}")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_et_expiry_rejected(self):
+        _ = load_module()
+        entitlements = importlib.import_module("app.entitlements")
+        now = int(time.time())
+        token = entitlements.mint_et(
+            {
+                "subject": "user-3",
+                "tenant_id": "tenant-3",
+                "plan": "free",
+                "retention_days": 30,
+                "issued_at": now - 400,
+                "expires_at": now - 10,
+                "iat": now - 400,
+                "exp": now - 10,
+                "jti": "jti-3",
+            }
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            entitlements.verify_et(token)
+        self.assertEqual(ctx.exception.status_code, 401)
 
     def test_sat_derived_from_et(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -571,9 +614,35 @@ class SpawnServiceTests(unittest.TestCase):
         token = response.json()["sat"]
         _, payload_encoded, _ = token.split(".")
         sat_payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
-        et_claims = entitlements.verify_entitlement_token(captured["token"])
-        self.assertEqual(sat_payload["tier"], et_claims.plan)
-        self.assertEqual(sat_payload["retention_days"], et_claims.retention_days)
+        et_claims = entitlements.verify_et(captured["token"])
+        self.assertEqual(sat_payload["tier"], module.normalize_tier(et_claims["plan"]))
+        self.assertEqual(sat_payload["retention_days"], et_claims["retention_days"])
+
+    def test_sat_not_minted_when_et_invalid(self):
+        os.environ["SAT_REQUIRED"] = "false"
+        module = load_module()
+        app = module.app
+        with mock.patch.object(
+            module,
+            "verify_et",
+            side_effect=module.HTTPException(
+                status_code=401, detail="invalid entitlement token"
+            ),
+        ):
+            response = asyncio.run(
+                request(
+                    app,
+                    "POST",
+                    "/api/spawn",
+                    json={
+                        "track": "netplus",
+                        "request_id": "req-et-invalid",
+                        "subject": "user-789",
+                        "tier": "pro",
+                    },
+                )
+            )
+        self.assertEqual(response.status_code, 401)
 
     def test_missing_et_secret_fails_closed(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -620,6 +689,48 @@ class SpawnServiceTests(unittest.TestCase):
             )
         )
         self.assertEqual(response.status_code, 200)
+
+    def test_guardrails_dev_allows_missing_secrets(self):
+        os.environ["FORGE_ENV"] = "dev"
+        os.environ["SAT_REQUIRED"] = "false"
+        os.environ["SAT_HMAC_SECRET"] = ""
+        os.environ["ET_HMAC_SECRET"] = ""
+        os.environ["RECEIPT_HMAC_SECRET"] = ""
+        os.environ["OPERATOR_TOKEN"] = ""
+        module = load_module()
+        module._enforce_startup_config()
+
+    def test_guardrails_non_dev_requires_secrets(self):
+        os.environ["FORGE_ENV"] = "production"
+        os.environ["SAT_HMAC_SECRET"] = ""
+        os.environ["ET_HMAC_SECRET"] = ""
+        os.environ["RECEIPT_HMAC_SECRET"] = ""
+        os.environ["OPERATOR_TOKEN"] = ""
+        module = load_module()
+        with self.assertRaises(RuntimeError):
+            module._enforce_startup_config()
+
+    def test_guardrails_staging_rejects_dev_flags(self):
+        os.environ["FORGE_ENV"] = "staging"
+        os.environ["SAT_HMAC_SECRET"] = "sat"
+        os.environ["ET_HMAC_SECRET"] = "et"
+        os.environ["RECEIPT_HMAC_SECRET"] = "receipt"
+        os.environ["OPERATOR_TOKEN"] = "operator"
+        os.environ["DEV_ALLOW_XPLAN"] = "true"
+        module = load_module()
+        with self.assertRaises(RuntimeError):
+            module._enforce_startup_config()
+
+    def test_guardrails_prod_rejects_free_default(self):
+        os.environ["FORGE_ENV"] = "production"
+        os.environ["SAT_HMAC_SECRET"] = "sat"
+        os.environ["ET_HMAC_SECRET"] = "et"
+        os.environ["RECEIPT_HMAC_SECRET"] = "receipt"
+        os.environ["OPERATOR_TOKEN"] = "operator"
+        os.environ["ALLOW_FREE_DEFAULT"] = "true"
+        module = load_module()
+        with self.assertRaises(RuntimeError):
+            module._enforce_startup_config()
 
     def test_xplan_rejected_by_default(self):
         os.environ["SAT_REQUIRED"] = "false"
@@ -742,7 +853,7 @@ class SpawnServiceTests(unittest.TestCase):
         with path.open("r", encoding="utf-8") as handle:
             lines = handle.readlines()
         tampered = json.loads(lines[1])
-        tampered["plan"] = "ENTERPRISE"
+        tampered["data"]["plan"] = "ENTERPRISE"
         lines[1] = json.dumps(tampered) + "\n"
         with path.open("w", encoding="utf-8") as handle:
             handle.writelines(lines)

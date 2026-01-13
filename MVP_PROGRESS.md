@@ -27,6 +27,9 @@
 - Added entitlement tokens in spawn_service, deriving SAT plan/retention from ETs with fail-closed secrets and tests.
 - Enforced X-Plan/FREE default guardrails with explicit dev flags and coverage.
 - Added billing audit chain append + tamper detection utilities for receipts with tests.
+- Added ET mint/verify helpers with audit chain utilities, spawn-service guardrails, and SAT derivation enforcement.
+- Enforced startup config guardrails in orchestrator/scoreboard and logged/enforced OPA policy hashes.
+- Added CI workflow with OPA v1 docker tests, guardrail scans, and dependency installs plus operator runbook.
 
 ## How to run locally
 ```
