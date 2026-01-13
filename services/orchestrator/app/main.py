@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -28,11 +29,12 @@ import docker
 import httpx
 import nats
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
+router = APIRouter()
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -61,13 +63,363 @@ configure_logging()
 logger = logging.getLogger("forge_orchestrator")
 _sat_secret_warning_emitted = False
 
-# Configuration
-TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
-OPA_URL = os.getenv("OPA_URL", "http://forge_opa:8181")
-NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
 NETWORK_PREFIX = "forge_scn_"
-SCOREBOARD_URL = os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080")
-STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "storage"))
+
+
+@dataclass(frozen=True)
+class OrchestratorConfig:
+    template_dir: Path
+    opa_url: str
+    nats_url: str
+    scoreboard_url: str
+    scoreboard_app: FastAPI | None
+    storage_root: Path
+    policy_backend: str
+    container_backend: str
+    event_bus_backend: str
+    storage_backend: str
+
+    @classmethod
+    def from_env(cls) -> "OrchestratorConfig":
+        return cls(
+            template_dir=Path(os.getenv("TEMPLATE_DIR", "/templates")),
+            opa_url=os.getenv("OPA_URL", "http://forge_opa:8181"),
+            nats_url=os.getenv("NATS_URL", "nats://forge_nats:4222"),
+            scoreboard_url=os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080"),
+            scoreboard_app=None,
+            storage_root=Path(os.getenv("STORAGE_ROOT", "storage")),
+            policy_backend=os.getenv("POLICY_BACKEND", "opa"),
+            container_backend=os.getenv("CONTAINER_RUNTIME", "docker"),
+            event_bus_backend=os.getenv("EVENT_BUS_BACKEND", "nats"),
+            storage_backend=os.getenv("STORAGE_BACKEND", "fs"),
+        )
+
+
+class PolicyEvaluator:
+    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
+        raise NotImplementedError
+
+    async def ready(self) -> None:
+        return None
+
+
+class OpaPolicyEvaluator(PolicyEvaluator):
+    def __init__(self, opa_url: str) -> None:
+        self._opa_url = opa_url.rstrip("/")
+
+    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
+        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+            try:
+                response = await _request_with_retries(
+                    client,
+                    "POST",
+                    f"{self._opa_url}/v1/data/frostgate/forge/training/allow",
+                    json_body={"input": input_payload},
+                    breaker=_opa_breaker,
+                )
+                if response.status_code >= 400:
+                    return False, f"OPA error: {response.status_code}"
+
+                result = response.json()
+                allowed = result.get("result", False)
+                if not allowed:
+                    return False, "Policy denied"
+                return True, None
+            except httpx.RequestError as e:
+                logger.warning("OPA request failed: %s", e)
+                return False, f"OPA unavailable: {e}"
+
+    async def ready(self) -> None:
+        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+            try:
+                response = await _request_with_retries(
+                    client,
+                    "GET",
+                    f"{self._opa_url}/health",
+                    breaker=_opa_breaker,
+                )
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"opa unavailable: {exc}"
+                ) from exc
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=503, detail=f"opa unhealthy: {response.status_code}"
+            )
+
+
+class AllowAllPolicyEvaluator(PolicyEvaluator):
+    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
+        return True, None
+
+
+class ContainerRuntime:
+    def create_network(self, scenario_id: str) -> str:
+        raise NotImplementedError
+
+    def launch_containers(
+        self, scenario_id: str, network_id: str, template: dict
+    ) -> list[str]:
+        raise NotImplementedError
+
+    def cleanup(self, scenario_id: str) -> None:
+        raise NotImplementedError
+
+
+class DockerContainerRuntime(ContainerRuntime):
+    def __init__(self) -> None:
+        self._client: docker.DockerClient | None = None
+
+    def _get_client(self) -> docker.DockerClient:
+        if self._client is None:
+            self._client = docker.from_env()
+        return self._client
+
+    def create_network(self, scenario_id: str) -> str:
+        client = self._get_client()
+        network_name = f"{NETWORK_PREFIX}{scenario_id}"
+
+        network = client.networks.create(
+            name=network_name,
+            driver="bridge",
+            internal=True,
+            labels={
+                "forge.scenario_id": scenario_id,
+                "forge.created_at": datetime.now(timezone.utc).isoformat(),
+                "forge.managed": "true",
+            },
+        )
+        logger.info("Created network %s for scenario %s", network_name, scenario_id)
+        return network.id
+
+    def launch_containers(
+        self, scenario_id: str, network_id: str, template: dict
+    ) -> list[str]:
+        client = self._get_client()
+        container_ids = []
+
+        assets = template.get("assets", {})
+        containers_spec = assets.get("containers", [])
+
+        for container_spec in containers_spec:
+            name = container_spec.get("name", f"container-{uuid.uuid4().hex[:8]}")
+            image = container_spec.get("image", "alpine:3.19")
+            read_only = container_spec.get("read_only", True)
+            environment = container_spec.get("environment", {})
+
+            container_name = f"forge_{scenario_id}_{name}"
+
+            try:
+                container = client.containers.run(
+                    image=image,
+                    name=container_name,
+                    detach=True,
+                    read_only=read_only,
+                    environment=environment,
+                    network=network_id,
+                    labels={
+                        "forge.scenario_id": scenario_id,
+                        "forge.container_name": name,
+                        "forge.managed": "true",
+                    },
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
+                    mem_limit="512m",
+                    cpu_quota=50000,
+                    command="sleep infinity" if "alpine" in image else None,
+                )
+                container_ids.append(container.id)
+            except docker.errors.ImageNotFound:
+                logger.warning("Image %s not found, pulling...", image)
+                client.images.pull(image)
+                container = client.containers.run(
+                    image=image,
+                    name=container_name,
+                    detach=True,
+                    read_only=read_only,
+                    environment=environment,
+                    network=network_id,
+                    labels={
+                        "forge.scenario_id": scenario_id,
+                        "forge.container_name": name,
+                        "forge.managed": "true",
+                    },
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
+                    mem_limit="512m",
+                    cpu_quota=50000,
+                    command="sleep infinity" if "alpine" in image else None,
+                )
+                container_ids.append(container.id)
+            except docker.errors.APIError as e:
+                logger.error("Failed to launch container %s: %s", name, e)
+                raise
+
+        return container_ids
+
+    def cleanup(self, scenario_id: str) -> None:
+        client = self._get_client()
+        containers = client.containers.list(
+            all=True, filters={"label": f"forge.scenario_id={scenario_id}"}
+        )
+        for container in containers:
+            try:
+                container.stop(timeout=5)
+                container.remove(force=True)
+                logger.info("Removed container %s", container.name)
+            except docker.errors.APIError as e:
+                logger.warning("Failed to remove container %s: %s", container.name, e)
+
+        networks = client.networks.list(
+            filters={"label": f"forge.scenario_id={scenario_id}"}
+        )
+        for network in networks:
+            try:
+                network.remove()
+                logger.info("Removed network %s", network.name)
+            except docker.errors.APIError as e:
+                logger.warning("Failed to remove network %s: %s", network.name, e)
+
+
+class StubContainerRuntime(ContainerRuntime):
+    def create_network(self, scenario_id: str) -> str:
+        return f"stub-network-{scenario_id}"
+
+    def launch_containers(
+        self, scenario_id: str, network_id: str, template: dict
+    ) -> list[str]:
+        return [f"stub-container-{scenario_id}"]
+
+    def cleanup(self, scenario_id: str) -> None:
+        return None
+
+
+class Storage:
+    def audit_path(self, scenario_id: str) -> Path:
+        raise NotImplementedError
+
+
+class FileSystemStorage(Storage):
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def audit_path(self, scenario_id: str) -> Path:
+        return self._root / "scenarios" / scenario_id / "results" / "audit.jsonl"
+
+
+class EventBus:
+    async def start(self, app: FastAPI) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def publish(self, subject: str, payload: dict) -> None:
+        return None
+
+
+class MemoryEventBus(EventBus):
+    async def publish(self, subject: str, payload: dict) -> None:
+        logger.debug("MemoryEventBus publish %s", subject)
+
+
+class NatsEventBus(EventBus):
+    def __init__(self, nats_url: str) -> None:
+        self._nats_url = nats_url
+        self._task: asyncio.Task | None = None
+        self._nc: nats.NATS | None = None
+        self._js: Any = None
+
+    async def publish(self, subject: str, payload: dict) -> None:
+        if self._js is None:
+            return
+        await self._js.publish(subject, json.dumps(payload).encode())
+
+    async def start(self, app: FastAPI) -> None:
+        self._task = asyncio.create_task(self._subscriber(app))
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+        if self._nc:
+            await self._nc.close()
+
+    async def _subscriber(self, app: FastAPI) -> None:
+        try:
+            self._nc = await nats.connect(self._nats_url)
+            self._js = self._nc.jetstream()
+
+            try:
+                await self._js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
+            except Exception:
+                pass
+
+            consumer_config = ConsumerConfig(
+                durable_name="orchestrator",
+                deliver_policy=DeliverPolicy.ALL,
+                ack_wait=30,
+            )
+
+            await self._js.subscribe(
+                "spawn.request",
+                cb=lambda msg: process_spawn_request(app, msg),
+                config=consumer_config,
+            )
+            logger.info("Subscribed to spawn.request")
+
+            while True:
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error("NATS subscriber error: %s", e)
+
+
+class ScoreboardClient:
+    async def get_ready(self) -> httpx.Response:
+        raise NotImplementedError
+
+    async def post_score(
+        self, scenario_id: str, payload: dict, headers: dict
+    ) -> httpx.Response:
+        raise NotImplementedError
+
+
+class HttpScoreboardClient(ScoreboardClient):
+    def __init__(
+        self, base_url: str, transport: httpx.BaseTransport | None = None
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._transport = transport
+
+    async def get_ready(self) -> httpx.Response:
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=_httpx_timeout(),
+            transport=self._transport,
+        ) as client:
+            return await _request_with_retries(
+                client, "GET", "/readyz", breaker=_scoreboard_breaker
+            )
+
+    async def post_score(
+        self, scenario_id: str, payload: dict, headers: dict
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=_httpx_timeout(),
+            transport=self._transport,
+        ) as client:
+            return await _request_with_retries(
+                client,
+                "POST",
+                f"/internal/scenario/{scenario_id}/score",
+                json_body=payload,
+                headers=headers,
+                breaker=_scoreboard_breaker,
+            )
+
+
+"""Runtime dependencies are stored on app.state."""
 
 
 def _forge_env() -> str:
@@ -230,17 +582,8 @@ class ReplayProtector:
             return True
 
 
-# In-memory state store (production would use Redis/NATS KV)
-scenarios: dict[str, ScenarioState] = {}
+"""Runtime state stored on app.state."""
 
-replay_protector = ReplayProtector()
-
-# Docker client
-docker_client: docker.DockerClient | None = None
-
-# NATS client
-nc: nats.NATS | None = None
-js: Any = None
 
 
 class CircuitBreaker:
@@ -324,16 +667,11 @@ _egress_breaker = CircuitBreaker(
 )
 
 
-def get_docker_client() -> docker.DockerClient:
-    global docker_client
-    if docker_client is None:
-        docker_client = docker.from_env()
-    return docker_client
 
 
-def load_template(track: str) -> dict:
+def load_template(track: str, template_dir: Path) -> dict:
     """Load scenario template from filesystem."""
-    template_path = TEMPLATE_DIR / f"{track}.yaml"
+    template_path = template_dir / f"{track}.yaml"
     if not template_path.exists():
         raise HTTPException(status_code=404, detail=f"Template not found: {track}")
     with template_path.open("r", encoding="utf-8") as f:
@@ -396,8 +734,8 @@ def _require_operator_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="operator auth required")
 
 
-def _scoreboard_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url=SCOREBOARD_URL, timeout=_httpx_timeout())
+def _get_scoreboard_client(app: FastAPI) -> ScoreboardClient:
+    return app.state.scoreboard_client
 
 
 def _normalize_plan(tier: str | None) -> str | None:
@@ -425,6 +763,7 @@ async def _trigger_scoreboard(
     tier: str | None,
     retention_days: int | None,
     correlation_id: str | None,
+    app: FastAPI,
 ) -> None:
     token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
     if not token:
@@ -442,19 +781,12 @@ async def _trigger_scoreboard(
     headers = {"x-internal-token": token}
     if correlation_id:
         headers["x-request-id"] = correlation_id
-    async with _scoreboard_client() as client:
-        response = await _request_with_retries(
-            client,
-            "POST",
-            f"/internal/scenario/{scenario_id}/score",
-            json_body=payload,
-            headers=headers,
-            breaker=_scoreboard_breaker,
+    client = _get_scoreboard_client(app)
+    response = await client.post_score(scenario_id, payload, headers)
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"scoreboard error {response.status_code}: {response.text}"
         )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"scoreboard error {response.status_code}: {response.text}"
-            )
 
 
 def verify_sat(token: str) -> SatClaims:
@@ -494,6 +826,7 @@ def verify_sat(token: str) -> SatClaims:
 
 
 async def enforce_sat(
+    app: FastAPI,
     token: str | None,
     scenario_id: str | None,
     track: str | None,
@@ -515,51 +848,24 @@ async def enforce_sat(
     if tier and claims.tier != tier:
         raise HTTPException(status_code=403, detail="sat tier mismatch")
 
-    stored = await replay_protector.check_and_store(claims.jti, claims.exp)
+    stored = await app.state.replay_protector.check_and_store(
+        claims.jti, claims.exp
+    )
     if not stored:
         raise HTTPException(status_code=401, detail="sat replayed")
 
     return claims
 
 
-async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
-    """Query OPA for policy decision."""
-    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
-        try:
-            response = await _request_with_retries(
-                client,
-                "POST",
-                f"{OPA_URL}/v1/data/frostgate/forge/training/allow",
-                json_body={"input": input_payload},
-                breaker=_opa_breaker,
-            )
-            if response.status_code >= 400:
-                return False, f"OPA error: {response.status_code}"
-
-            result = response.json()
-            allowed = result.get("result", False)
-            if not allowed:
-                return False, "Policy denied"
-            return True, None
-        except httpx.RequestError as e:
-            logger.warning("OPA request failed: %s", e)
-            return False, f"OPA unavailable: {e}"
+async def check_opa_policy(
+    app: FastAPI, input_payload: dict
+) -> tuple[bool, str | None]:
+    """Query policy evaluator for decision."""
+    return await app.state.policy_evaluator.allow(input_payload)
 
 
-async def _check_opa_ready() -> None:
-    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
-        try:
-            response = await _request_with_retries(
-                client, "GET", f"{OPA_URL}/health", breaker=_opa_breaker
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(
-                status_code=503, detail=f"opa unavailable: {exc}"
-            ) from exc
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503, detail=f"opa unhealthy: {response.status_code}"
-        )
+async def _check_opa_ready(app: FastAPI) -> None:
+    await app.state.policy_evaluator.ready()
 
 
 def _read_only_required() -> bool:
@@ -626,18 +932,19 @@ def _audit_payload(entry: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _audit_path(scenario_id: str) -> Path:
-    return STORAGE_ROOT / "scenarios" / scenario_id / "results" / "audit.jsonl"
+def _audit_path(app: FastAPI, scenario_id: str) -> Path:
+    return app.state.storage.audit_path(scenario_id)
 
 
 def append_audit_event(
+    app: FastAPI,
     scenario_id: str,
     event_type: str,
     actor: str,
     correlation_id: str,
     details: dict[str, Any],
 ) -> None:
-    audit_path = _audit_path(scenario_id)
+    audit_path = _audit_path(app, scenario_id)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     prev_hash = "0" * 64
     if audit_path.exists():
@@ -664,129 +971,32 @@ def append_audit_event(
         handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
-def create_scenario_network(scenario_id: str) -> str:
-    """Create isolated Docker network for scenario."""
-    client = get_docker_client()
-    network_name = f"{NETWORK_PREFIX}{scenario_id}"
-
-    network = client.networks.create(
-        name=network_name,
-        driver="bridge",
-        internal=True,  # No external access by default
-        labels={
-            "forge.scenario_id": scenario_id,
-            "forge.created_at": datetime.now(timezone.utc).isoformat(),
-            "forge.managed": "true",
-        },
-    )
-    logger.info("Created network %s for scenario %s", network_name, scenario_id)
-    return network.id
+def create_scenario_network(app: FastAPI, scenario_id: str) -> str:
+    """Create isolated network for scenario."""
+    return app.state.container_runtime.create_network(scenario_id)
 
 
 def launch_scenario_containers(
-    scenario_id: str, network_id: str, template: dict
+    app: FastAPI, scenario_id: str, network_id: str, template: dict
 ) -> list[str]:
     """Launch containers defined in scenario template."""
-    client = get_docker_client()
-    container_ids = []
-
-    assets = template.get("assets", {})
-    containers_spec = assets.get("containers", [])
-
-    for container_spec in containers_spec:
-        name = container_spec.get("name", f"container-{uuid.uuid4().hex[:8]}")
-        image = container_spec.get("image", "alpine:3.19")
-        read_only = container_spec.get("read_only", True)
-        environment = container_spec.get("environment", {})
-
-        container_name = f"forge_{scenario_id}_{name}"
-
-        try:
-            container = client.containers.run(
-                image=image,
-                name=container_name,
-                detach=True,
-                read_only=read_only,
-                environment=environment,
-                network=network_id,
-                labels={
-                    "forge.scenario_id": scenario_id,
-                    "forge.container_name": name,
-                    "forge.managed": "true",
-                },
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                mem_limit="512m",
-                cpu_quota=50000,  # 50% of one CPU
-                # Keep container running
-                command="sleep infinity" if "alpine" in image else None,
-            )
-            container_ids.append(container.id)
-            logger.info(
-                "Launched container %s (%s) for scenario %s",
-                container_name,
-                image,
-                scenario_id,
-            )
-        except docker.errors.ImageNotFound:
-            logger.warning("Image %s not found, pulling...", image)
-            client.images.pull(image)
-            # Retry after pull
-            container = client.containers.run(
-                image=image,
-                name=container_name,
-                detach=True,
-                read_only=read_only,
-                environment=environment,
-                network=network_id,
-                labels={
-                    "forge.scenario_id": scenario_id,
-                    "forge.container_name": name,
-                    "forge.managed": "true",
-                },
-                cap_drop=["ALL"],
-                security_opt=["no-new-privileges:true"],
-                mem_limit="512m",
-                cpu_quota=50000,
-                command="sleep infinity" if "alpine" in image else None,
-            )
-            container_ids.append(container.id)
-        except docker.errors.APIError as e:
-            logger.error("Failed to launch container %s: %s", name, e)
-            raise
-
-    return container_ids
-
-
-def cleanup_scenario(scenario_id: str) -> None:
-    """Remove all resources associated with a scenario."""
-    client = get_docker_client()
-
-    # Stop and remove containers
-    containers = client.containers.list(
-        all=True, filters={"label": f"forge.scenario_id={scenario_id}"}
+    return app.state.container_runtime.launch_containers(
+        scenario_id, network_id, template
     )
-    for container in containers:
-        try:
-            container.stop(timeout=5)
-            container.remove(force=True)
-            logger.info("Removed container %s", container.name)
-        except docker.errors.APIError as e:
-            logger.warning("Failed to remove container %s: %s", container.name, e)
 
-    # Remove network
-    networks = client.networks.list(filters={"label": f"forge.scenario_id={scenario_id}"})
-    for network in networks:
-        try:
-            network.remove()
-            logger.info("Removed network %s", network.name)
-        except docker.errors.APIError as e:
-            logger.warning("Failed to remove network %s: %s", network.name, e)
+
+def cleanup_scenario(app: FastAPI, scenario_id: str) -> None:
+    """Remove all resources associated with a scenario."""
+    app.state.container_runtime.cleanup(scenario_id)
 
 
 async def complete_scenario(
-    scenario_id: str, completion_reason: str, completion_timestamp: datetime | None = None
+    scenario_id: str,
+    completion_reason: str,
+    app: FastAPI,
+    completion_timestamp: datetime | None = None,
 ) -> ScenarioState:
+    scenarios = app.state.scenarios
     if scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
     state = scenarios[scenario_id]
@@ -804,6 +1014,7 @@ async def complete_scenario(
 
     try:
         append_audit_event(
+            app,
             scenario_id=scenario_id,
             event_type="scenario.complete",
             actor="operator",
@@ -824,6 +1035,7 @@ async def complete_scenario(
             state.tier,
             state.retention_days,
             request_id_ctx.get(),
+            app,
         )
         state.status = ScenarioStatus.COMPLETED
     except Exception as exc:
@@ -839,7 +1051,7 @@ async def complete_scenario(
     return state
 
 
-async def process_spawn_request(msg: Any) -> None:
+async def process_spawn_request(app: FastAPI, msg: Any) -> None:
     """Process incoming spawn request from NATS."""
     try:
         import json
@@ -857,7 +1069,7 @@ async def process_spawn_request(msg: Any) -> None:
             return
 
         try:
-            claims = await enforce_sat(sat, scenario_id, track, track, tier)
+            claims = await enforce_sat(app, sat, scenario_id, track, track, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
             await msg.ack()
@@ -872,10 +1084,12 @@ async def process_spawn_request(msg: Any) -> None:
         )
 
         # Load and validate template
-        template = load_template(track)
+        template = load_template(track, app.state.config.template_dir)
 
         # Check OPA policy
-        allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
+        allowed, reason = await check_opa_policy(
+            app, _build_opa_input(template, claims)
+        )
         if not allowed:
             logger.warning("Scenario %s denied by policy: %s", scenario_id, reason)
             await msg.ack()
@@ -892,8 +1106,10 @@ async def process_spawn_request(msg: Any) -> None:
             retention_days=claims.retention_days,
             status=ScenarioStatus.CREATING,
         )
+        scenarios = app.state.scenarios
         scenarios[scenario_id] = state
         append_audit_event(
+            app,
             scenario_id=scenario_id,
             event_type="scenario.create",
             actor=claims.subject,
@@ -901,12 +1117,17 @@ async def process_spawn_request(msg: Any) -> None:
             details={"track": track, "tenant_id": claims.tenant_id},
         )
 
+        runtime = app.state.container_runtime
+        event_bus = app.state.event_bus
+
         # Create network
-        network_id = create_scenario_network(scenario_id)
+        network_id = create_scenario_network(app, scenario_id)
         state.network_id = network_id
 
         # Launch containers
-        container_ids = launch_scenario_containers(scenario_id, network_id, template)
+        container_ids = launch_scenario_containers(
+            app, scenario_id, network_id, template
+        )
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
         state.updated_at = datetime.now(timezone.utc)
@@ -918,17 +1139,15 @@ async def process_spawn_request(msg: Any) -> None:
         )
 
         # Publish scenario.created event
-        if js:
-            await js.publish(
+        if event_bus:
+            await event_bus.publish(
                 "scenario.created",
-                json.dumps(
-                    {
-                        "scenario_id": scenario_id,
-                        "track": track,
-                        "network_id": network_id,
-                        "containers": container_ids,
-                    }
-                ).encode(),
+                {
+                    "scenario_id": scenario_id,
+                    "track": track,
+                    "network_id": network_id,
+                    "containers": container_ids,
+                },
             )
 
         await msg.ack()
@@ -939,42 +1158,6 @@ async def process_spawn_request(msg: Any) -> None:
             await msg.nak()
 
 
-async def nats_subscriber() -> None:
-    """Subscribe to NATS spawn requests."""
-    global nc, js
-
-    try:
-        nc = await nats.connect(NATS_URL)
-        js = nc.jetstream()
-
-        # Create stream if not exists
-        try:
-            await js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
-        except Exception:
-            pass  # Stream may already exist
-
-        # Subscribe to spawn requests
-        consumer_config = ConsumerConfig(
-            durable_name="orchestrator",
-            deliver_policy=DeliverPolicy.ALL,
-            ack_wait=30,
-        )
-
-        sub = await js.subscribe(
-            "spawn.request",
-            cb=process_spawn_request,
-            config=consumer_config,
-        )
-        logger.info("Subscribed to spawn.request")
-
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
-
-    except Exception as e:
-        logger.error("NATS subscriber error: %s", e)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -982,21 +1165,14 @@ async def lifespan(app: FastAPI):
     _enforce_policy_hash()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias()
-    # Start NATS subscriber in background
-    task = asyncio.create_task(nats_subscriber())
+    event_bus = app.state.event_bus
+    await event_bus.start(app)
     logger.info("Orchestrator started")
     yield
-    # Cleanup
-    task.cancel()
-    if nc:
-        await nc.close()
+    await event_bus.stop()
     logger.info("Orchestrator stopped")
 
 
-app = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
-
-
-@app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = (
         request.headers.get("x-request-id")
@@ -1010,26 +1186,24 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-@app.get("/health")
+@router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_orchestrator"}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "forge_orchestrator"}
 
 
-@app.get("/readyz")
-async def readyz() -> dict:
+@router.get("/readyz")
+async def readyz(request: Request) -> dict:
     _check_read_only_fs()
     await _check_egress_gateway()
-    await _check_opa_ready()
+    await _check_opa_ready(request.app)
     try:
-        async with _scoreboard_client() as client:
-            response = await _request_with_retries(
-                client, "GET", "/readyz", breaker=_scoreboard_breaker
-            )
+        client = _get_scoreboard_client(request.app)
+        response = await client.get_ready()
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503, detail=f"scoreboard unavailable: {exc}"
@@ -1042,7 +1216,7 @@ async def readyz() -> dict:
     return {"status": "ready", "service": "forge_orchestrator"}
 
 
-@app.post("/v1/scenarios", response_model=CreateScenarioResponse)
+@router.post("/v1/scenarios", response_model=CreateScenarioResponse)
 async def create_scenario(
     request: CreateScenarioRequest, http_request: Request
 ) -> CreateScenarioResponse:
@@ -1052,9 +1226,12 @@ async def create_scenario(
     token = http_request.headers.get("x-sat")
     if not token:
         token = _parse_bearer_token(http_request.headers.get("authorization", ""))
-    claims = await enforce_sat(token, scenario_id, track, track, request.tier)
+    claims = await enforce_sat(
+        http_request.app, token, scenario_id, track, track, request.tier
+    )
 
     # Check if already exists
+    scenarios = http_request.app.state.scenarios
     if scenario_id in scenarios:
         state = scenarios[scenario_id]
         return CreateScenarioResponse(
@@ -1062,6 +1239,8 @@ async def create_scenario(
             status=state.status,
             network_id=state.network_id,
         )
+
+    scenarios = app.state.scenarios
 
     # Create scenario state
     state = ScenarioState(
@@ -1076,6 +1255,7 @@ async def create_scenario(
     )
     scenarios[scenario_id] = state
     append_audit_event(
+        http_request.app,
         scenario_id=scenario_id,
         event_type="scenario.create",
         actor=claims.subject,
@@ -1084,10 +1264,12 @@ async def create_scenario(
     )
 
     # Load and validate template
-    template = load_template(track)
+    template = load_template(track, http_request.app.state.config.template_dir)
 
     # Check OPA policy
-    allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
+    allowed, reason = await check_opa_policy(
+        http_request.app, _build_opa_input(template, claims)
+    )
     if not allowed:
         state.status = ScenarioStatus.FAILED
         state.error = reason
@@ -1095,7 +1277,7 @@ async def create_scenario(
 
     # Create network
     try:
-        network_id = create_scenario_network(scenario_id)
+        network_id = create_scenario_network(http_request.app, scenario_id)
         state.network_id = network_id
     except Exception as e:
         state.status = ScenarioStatus.FAILED
@@ -1104,12 +1286,14 @@ async def create_scenario(
 
     # Launch containers
     try:
-        container_ids = launch_scenario_containers(scenario_id, network_id, template)
+        container_ids = launch_scenario_containers(
+            http_request.app, scenario_id, network_id, template
+        )
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
         state.updated_at = datetime.now(timezone.utc)
     except Exception as e:
-        cleanup_scenario(scenario_id)
+        cleanup_scenario(http_request.app, scenario_id)
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
         raise HTTPException(status_code=500, detail=f"Container launch failed: {e}")
@@ -1121,33 +1305,36 @@ async def create_scenario(
     )
 
 
-@app.get("/v1/scenarios/{scenario_id}")
-async def get_scenario(scenario_id: str) -> ScenarioState:
+@router.get("/v1/scenarios/{scenario_id}")
+async def get_scenario(scenario_id: str, request: Request) -> ScenarioState:
     """Get scenario status."""
+    scenarios = request.app.state.scenarios
     if scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return scenarios[scenario_id]
 
 
-@app.delete("/v1/scenarios/{scenario_id}")
-async def delete_scenario(scenario_id: str) -> dict:
+@router.delete("/v1/scenarios/{scenario_id}")
+async def delete_scenario(scenario_id: str, request: Request) -> dict:
     """Delete a scenario and cleanup resources."""
+    scenarios = request.app.state.scenarios
     if scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
-    cleanup_scenario(scenario_id)
+    cleanup_scenario(request.app, scenario_id)
     del scenarios[scenario_id]
 
     return {"status": "deleted", "scenario_id": scenario_id}
 
 
-@app.get("/v1/scenarios")
-async def list_scenarios() -> list[ScenarioState]:
+@router.get("/v1/scenarios")
+async def list_scenarios(request: Request) -> list[ScenarioState]:
     """List all scenarios."""
+    scenarios = request.app.state.scenarios
     return list(scenarios.values())
 
 
-@app.post("/internal/scenario/{scenario_id}/complete")
+@router.post("/internal/scenario/{scenario_id}/complete")
 async def complete_scenario_endpoint(
     scenario_id: str,
     payload: ScenarioCompletionRequest,
@@ -1158,5 +1345,60 @@ async def complete_scenario_endpoint(
     return await complete_scenario(
         scenario_id,
         payload.completion_reason,
+        request.app,
         payload.completion_timestamp,
     )
+
+
+def _build_policy_evaluator(config: OrchestratorConfig) -> PolicyEvaluator:
+    if config.policy_backend == "allow_all":
+        return AllowAllPolicyEvaluator()
+    return OpaPolicyEvaluator(config.opa_url)
+
+
+def _build_container_runtime(config: OrchestratorConfig) -> ContainerRuntime:
+    if config.container_backend == "stub":
+        return StubContainerRuntime()
+    return DockerContainerRuntime()
+
+
+def _build_storage(config: OrchestratorConfig) -> Storage:
+    return FileSystemStorage(config.storage_root)
+
+
+def _build_event_bus(config: OrchestratorConfig) -> EventBus:
+    if config.event_bus_backend == "memory":
+        return MemoryEventBus()
+    return NatsEventBus(config.nats_url)
+
+
+def _build_scoreboard_client(config: OrchestratorConfig) -> ScoreboardClient:
+    if config.scoreboard_app is not None:
+        transport = httpx.ASGITransport(app=config.scoreboard_app)
+        return HttpScoreboardClient("http://scoreboard", transport=transport)
+    return HttpScoreboardClient(config.scoreboard_url)
+
+
+def create_app(config: OrchestratorConfig) -> FastAPI:
+    policy_evaluator = _build_policy_evaluator(config)
+    container_runtime = _build_container_runtime(config)
+    storage = _build_storage(config)
+    event_bus = _build_event_bus(config)
+    scoreboard_client = _build_scoreboard_client(config)
+
+    app = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
+    app.state.config = config
+    app.state.policy_evaluator = policy_evaluator
+    app.state.container_runtime = container_runtime
+    app.state.storage = storage
+    app.state.event_bus = event_bus
+    app.state.scoreboard_client = scoreboard_client
+    app.state.scenarios = {}
+    app.state.replay_protector = ReplayProtector()
+
+    app.middleware("http")(add_request_id)
+    app.include_router(router)
+    return app
+
+
+app = create_app(OrchestratorConfig.from_env())

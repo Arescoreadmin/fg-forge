@@ -12,45 +12,24 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import httpx
 import requests
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-# -------------------------------------------------------------------
-# Import entitlements in a way that survives BOTH:
-# 1) normal package import: services.spawn_service.app.main
-# 2) dumb test loader: spec_from_file_location(main.py) (no package context)
-# -------------------------------------------------------------------
-try:
-    from .entitlements import (
-        EntitlementDecision,
-        EntitlementResolver,
-        append_billing_audit_event,
-        mint_entitlement_token,
-        normalize_tier,
-        verify_et,
-    )
-except ImportError:
-    import sys
-
-    # Make "app.*" importable when this file is loaded as a standalone module.
-    # __file__ = .../services/spawn_service/app/main.py
-    spawn_service_root = Path(__file__).resolve().parent.parent  # .../services/spawn_service
-    if str(spawn_service_root) not in sys.path:
-        sys.path.insert(0, str(spawn_service_root))
-
-    from app.entitlements import (  # type: ignore
-        EntitlementDecision,
-        EntitlementResolver,
-        append_billing_audit_event,
-        mint_entitlement_token,
-        normalize_tier,
-        verify_et,
-    )
+from .entitlements import (
+    EntitlementDecision,
+    EntitlementResolver,
+    append_billing_audit_event,
+    mint_entitlement_token,
+    normalize_tier,
+    verify_et,
+)
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
@@ -79,18 +58,111 @@ def configure_logging() -> None:
 
 configure_logging()
 
-app = FastAPI(title="FrostGate Forge Spawn Service")
-import traceback
-
-@app.middleware("http")
-async def dump_exceptions(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
-        raise
-
 logger = logging.getLogger("forge_spawn_service")
+
+
+@dataclass(frozen=True)
+class SpawnConfig:
+    template_dir: Path
+    opa_url: str | None
+    orchestrator_url: str | None
+    orchestrator_app: FastAPI | None
+    request_id_header: str
+    tenant_id_header: str
+    client_id_header: str
+    entitlement_receipt_header: str
+
+    @classmethod
+    def from_env(cls) -> "SpawnConfig":
+        return cls(
+            template_dir=Path(os.getenv("TEMPLATE_DIR", "/templates")),
+            opa_url=os.getenv("OPA_URL"),
+            orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+            orchestrator_app=None,
+            request_id_header=os.getenv("REQUEST_ID_HEADER", "x-request-id"),
+            tenant_id_header=os.getenv("TENANT_ID_HEADER", "x-tenant-id"),
+            client_id_header=os.getenv("CLIENT_ID_HEADER", "x-client-id"),
+            entitlement_receipt_header=os.getenv(
+                "ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token"
+            ),
+        )
+
+
+class OrchestratorNotifier:
+    async def notify(
+        self,
+        payload: "SpawnRequest",
+        response: "SpawnResponse",
+        request: Request,
+        tier: str,
+    ) -> None:
+        raise NotImplementedError
+
+
+class HttpOrchestratorNotifier(OrchestratorNotifier):
+    def __init__(self, orchestrator_url: str) -> None:
+        self._orchestrator_url = orchestrator_url.rstrip("/")
+
+    async def notify(
+        self,
+        payload: "SpawnRequest",
+        response: "SpawnResponse",
+        request: Request,
+        tier: str,
+    ) -> None:
+        headers = {"x-request-id": request_id_ctx.get(), "x-sat": response.sat}
+        body = {
+            "scenario_id": response.scenario_id,
+            "template": payload.track,
+            "request_id": response.request_id,
+            "tier": tier,
+        }
+        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+            try:
+                call = await _async_request_with_retries(
+                    client,
+                    "POST",
+                    f"{self._orchestrator_url}/v1/scenarios",
+                    json_body=body,
+                    headers=headers,
+                    breaker=_orchestrator_breaker,
+                )
+            except httpx.RequestError as exc:
+                logger.warning("orchestrator request failed: %s", exc)
+                raise HTTPException(
+                    status_code=502, detail="orchestrator unavailable"
+                ) from exc
+        if call.status_code >= 400:
+            raise HTTPException(status_code=502, detail="orchestrator error")
+
+
+class InProcessOrchestratorNotifier(OrchestratorNotifier):
+    def __init__(self, orchestrator_app: FastAPI) -> None:
+        self._transport = httpx.ASGITransport(app=orchestrator_app)
+
+    async def notify(
+        self,
+        payload: "SpawnRequest",
+        response: "SpawnResponse",
+        request: Request,
+        tier: str,
+    ) -> None:
+        headers = {"x-request-id": request_id_ctx.get(), "x-sat": response.sat}
+        body = {
+            "scenario_id": response.scenario_id,
+            "template": payload.track,
+            "request_id": response.request_id,
+            "tier": tier,
+        }
+        async with httpx.AsyncClient(
+            transport=self._transport, base_url="http://orchestrator"
+        ) as client:
+            call = await client.post("/v1/scenarios", json=body, headers=headers)
+        if call.status_code >= 400:
+            raise HTTPException(status_code=502, detail="orchestrator error")
+
+
+router = APIRouter()
 
 TRACKS = {"netplus", "ccna", "cissp"}
 TRACK_TEMPLATE = {
@@ -131,17 +203,20 @@ PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
 }
 
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
+OPA_URL = os.getenv("OPA_URL")
 REQUEST_CACHE: Dict[str, dict] = {}
 CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
 TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
-ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
+ENTITLEMENT_RECEIPT_HEADER = os.getenv(
+    "ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token"
+)
 _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
     _TOKEN_SECRET = uuid.uuid4().hex
     logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
 _sat_secret_warning_emitted = False
 _fallback_warning_emitted = False
-entitlement_resolver = EntitlementResolver()
+entitlement_resolver: EntitlementResolver | None = None
 
 
 def _forge_env() -> str:
@@ -167,14 +242,6 @@ def _enforce_startup_config() -> None:
             raise RuntimeError("ALLOW_FREE_DEFAULT is not allowed in staging/prod")
 
 
-@app.on_event("startup")
-def warn_deprecated_sat_secret() -> None:
-    _enforce_startup_config()
-    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
-        _warn_sat_secret_alias()
-
-
-@app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = (
         request.headers.get("x-request-id")
@@ -186,6 +253,14 @@ async def add_request_id(request: Request, call_next):
     request_id_ctx.reset(token)
     response.headers["x-request-id"] = request_id
     return response
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _enforce_startup_config()
+    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
+        _warn_sat_secret_alias()
+    yield
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -533,6 +608,51 @@ def _timeout_config() -> tuple[float, float]:
     return connect, read
 
 
+def _httpx_timeout() -> httpx.Timeout:
+    connect, read = _timeout_config()
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+async def _async_request_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> httpx.Response:
+    if breaker and breaker.is_open():
+        raise httpx.RequestError(f"{breaker.name} circuit breaker open")
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = await client.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+            )
+            if response.status_code >= 500:
+                raise httpx.RequestError(f"upstream {response.status_code}")
+            if breaker:
+                breaker.record_success()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            await asyncio.sleep(delay)
+    raise httpx.RequestError("request failed") from last_exc
+
+
 def _request_with_retries(
     method: str,
     url: str,
@@ -613,28 +733,36 @@ def record_billing(request_id: str, track: str) -> None:
 
 
 def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]:
-    header_name = os.getenv("REQUEST_ID_HEADER", "x-request-id")
+    header_name = request.app.state.config.request_id_header
     return payload.request_id or request.headers.get(header_name)
 
 
-def resolve_subject_identifier(payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]) -> str:
+def resolve_subject_identifier(
+    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+) -> str:
     subject = payload.subject.strip() if payload.subject else ""
+    client_header = request.app.state.config.client_id_header
     if sat_claims:
         if subject and sat_claims.subject != subject:
             raise HTTPException(status_code=403, detail="subject mismatch")
         subject = sat_claims.subject
     if not subject:
-        subject = request.headers.get(CLIENT_ID_HEADER, "").strip()
+        subject = request.headers.get(client_header, "").strip()
     if not subject:
         raise HTTPException(
             status_code=403,
-            detail=f"subject identifier required (provide subject or {CLIENT_ID_HEADER})",
+            detail=(
+                f"subject identifier required (provide subject or {client_header})"
+            ),
         )
     return subject
 
 
-def resolve_tenant_identifier(request: Request, sat_claims: Optional[SatClaims], subject: str) -> str:
-    tenant_id = request.headers.get(TENANT_ID_HEADER, "").strip()
+def resolve_tenant_identifier(
+    request: Request, sat_claims: Optional[SatClaims], subject: str
+) -> str:
+    tenant_header = request.app.state.config.tenant_id_header
+    tenant_id = request.headers.get(tenant_header, "").strip()
     if sat_claims:
         if tenant_id and sat_claims.tenant_id != tenant_id:
             raise HTTPException(status_code=403, detail="tenant mismatch")
@@ -654,7 +782,8 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
 
     subject = resolve_subject_identifier(payload, request, sat_claims)
     tenant_id = resolve_tenant_identifier(request, sat_claims, subject)
-    receipt_token = request.headers.get(ENTITLEMENT_RECEIPT_HEADER, "").strip() or None
+    receipt_header = request.app.state.config.entitlement_receipt_header
+    receipt_token = request.headers.get(receipt_header, "").strip() or None
     plan_override = request.headers.get("x-plan", "").strip()
     if plan_override:
         if os.getenv("DEV_ALLOW_XPLAN", "false").lower() != "true":
@@ -666,7 +795,10 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
             source="x-plan",
         )
     else:
-        entitlement = entitlement_resolver.resolve(subject=subject, tenant_id=tenant_id, receipt_token=receipt_token)
+        resolver = request.app.state.entitlement_resolver
+        entitlement = resolver.resolve(
+            subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+        )
 
     if entitlement.source == "receipt" and entitlement.receipt_exp is not None:
         append_billing_audit_event(
@@ -785,25 +917,13 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
     return response, entitlement
 
 
-def notify_orchestrator(payload: SpawnRequest, response: SpawnResponse, request: Request, tier: str) -> None:
-    orchestrator_url = os.getenv("ORCHESTRATOR_URL")
-    if not orchestrator_url:
+async def notify_orchestrator(
+    payload: SpawnRequest, response: SpawnResponse, request: Request, tier: str
+) -> None:
+    notifier = request.app.state.orchestrator_notifier
+    if notifier is None:
         return
-    headers = {"x-request-id": request_id_ctx.get(), "x-sat": response.sat}
-    body = {"scenario_id": response.scenario_id, "template": payload.track, "request_id": response.request_id, "tier": tier}
-    try:
-        call = _request_with_retries(
-            "POST",
-            f"{orchestrator_url}/v1/scenarios",
-            json_body=body,
-            headers=headers,
-            breaker=_orchestrator_breaker,
-        )
-    except requests.RequestException as exc:
-        logger.warning("orchestrator request failed: %s", exc)
-        raise HTTPException(status_code=502, detail="orchestrator unavailable") from exc
-    if call.status_code >= 400:
-        raise HTTPException(status_code=502, detail="orchestrator error")
+    await notifier.notify(payload, response, request, tier)
 
 
 def _read_only_required() -> bool:
@@ -852,7 +972,7 @@ def _check_egress_gateway() -> None:
 
 
 def _check_opa_ready() -> None:
-    opa_url = os.getenv("OPA_URL")
+    opa_url = OPA_URL
     if not opa_url:
         return
     try:
@@ -863,17 +983,17 @@ def _check_opa_ready() -> None:
         raise HTTPException(status_code=503, detail=f"opa unhealthy: {response.status_code}")
 
 
-@app.get("/health")
+@router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_spawn_service"}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "forge_spawn_service"}
 
 
-@app.get("/readyz")
+@router.get("/readyz")
 def readyz() -> dict:
     _check_read_only_fs()
     _check_egress_gateway()
@@ -881,23 +1001,23 @@ def readyz() -> dict:
     return {"status": "ready", "service": "forge_spawn_service"}
 
 
-@app.post("/v1/spawn", response_model=SpawnResponse)
-def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+@router.post("/v1/spawn", response_model=SpawnResponse)
+async def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
     response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
+    await notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 
-@app.post("/api/spawn", response_model=SpawnResponse)
-def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
+@router.post("/api/spawn", response_model=SpawnResponse)
+async def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
     response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
+    await notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 
-@app.get("/v1/access/{scenario_id}")
+@router.get("/v1/access/{scenario_id}")
 def access_scenario(scenario_id: str, request: Request) -> dict:
     token = request.query_params.get("token") or request.headers.get("x-access-token")
     if not token:
@@ -913,3 +1033,38 @@ def access_scenario(scenario_id: str, request: Request) -> dict:
         "track": payload.track,
         "expires_at": payload.expires_at,
     }
+
+
+def _build_orchestrator_notifier(
+    config: SpawnConfig,
+) -> OrchestratorNotifier | None:
+    if config.orchestrator_app is not None:
+        return InProcessOrchestratorNotifier(config.orchestrator_app)
+    if config.orchestrator_url:
+        return HttpOrchestratorNotifier(config.orchestrator_url)
+    return None
+
+
+def create_app(config: SpawnConfig) -> FastAPI:
+    global TEMPLATE_DIR, CLIENT_ID_HEADER, TENANT_ID_HEADER, ENTITLEMENT_RECEIPT_HEADER
+    global OPA_URL
+    global entitlement_resolver
+    TEMPLATE_DIR = config.template_dir
+    OPA_URL = config.opa_url
+    CLIENT_ID_HEADER = config.client_id_header
+    TENANT_ID_HEADER = config.tenant_id_header
+    ENTITLEMENT_RECEIPT_HEADER = config.entitlement_receipt_header
+
+    app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
+    app.state.config = config
+    entitlement_resolver = EntitlementResolver()
+    app.state.entitlement_resolver = entitlement_resolver
+    app.state.orchestrator_notifier = _build_orchestrator_notifier(config)
+
+    app.middleware("http")(add_request_id)
+    app.include_router(router)
+
+    return app
+
+
+app = create_app(SpawnConfig.from_env())

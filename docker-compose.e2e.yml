@@ -1,0 +1,99 @@
+version: "3.9"
+
+services:
+  spawn_service:
+    build: ./services/spawn_service
+    environment:
+      FORGE_ENV: dev
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      SAT_HMAC_SECRET: test-sat-secret
+      ET_HMAC_SECRET: test-et-secret
+      RECEIPT_HMAC_SECRET: test-receipt-secret
+      ALLOW_FREE_DEFAULT: "true"
+      FREE_DEFAULT_RETENTION_DAYS: "30"
+    depends_on:
+      - orchestrator
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  orchestrator:
+    build: ./services/orchestrator
+    environment:
+      FORGE_ENV: dev
+      SCOREBOARD_URL: http://scoreboard:8080
+      SCOREBOARD_INTERNAL_TOKEN: score-token
+      ORCHESTRATOR_INTERNAL_TOKEN: orch-token
+      OPERATOR_TOKEN: operator-token
+      SAT_HMAC_SECRET: test-sat-secret
+      POLICY_BACKEND: allow_all
+      CONTAINER_RUNTIME: stub
+      EVENT_BUS_BACKEND: memory
+      STORAGE_ROOT: /data
+    volumes:
+      - orchestrator_storage:/data
+    depends_on:
+      - scoreboard
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  scoreboard:
+    build: ./services/scoreboard
+    environment:
+      FORGE_ENV: dev
+      SCOREBOARD_INTERNAL_TOKEN: score-token
+      SCOREBOARD_EVENT_BUS: memory
+      STORAGE_ROOT: /data
+    volumes:
+      - scoreboard_storage:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/readyz')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  e2e_runner:
+    build:
+      context: .
+      dockerfile: e2e/Dockerfile
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+    environment:
+      SPAWN_URL: http://spawn_service:8080
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      SCOREBOARD_URL: http://scoreboard:8080
+      ORCHESTRATOR_INTERNAL_TOKEN: orch-token
+      OPERATOR_TOKEN: operator-token
+    depends_on:
+      - spawn_service
+      - orchestrator
+      - scoreboard
+    command: python scripts/e2e_runner.py
+
+volumes:
+  orchestrator_storage:
+  scoreboard_storage:

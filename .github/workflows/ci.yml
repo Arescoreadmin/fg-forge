@@ -79,3 +79,6 @@ jobs:
 
       - name: Unit tests (scripts)
         run: python -m unittest discover -s scripts/tests
+
+      - name: Contract golden path
+        run: python -m unittest services/orchestrator/tests/test_contract_golden_path.py

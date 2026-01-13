@@ -1,10 +1,9 @@
 import asyncio
 import base64
 import hashlib
-import importlib.util
+import importlib
 import json
 import os
-import sys
 import tempfile
 import unittest
 import uuid
@@ -12,37 +11,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from httpx import ASGITransport, AsyncClient
 
 
-def _load_module(module_path: Path, prefix: str):
-    module_name = f"{prefix}_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if spec.loader is None:
-        raise RuntimeError(f"Failed to load module {module_path}")
-    spec.loader.exec_module(module)
-    return module
+
+def _load_module(module_name: str):
+    module = importlib.import_module(module_name)
+    return importlib.reload(module)
 
 
 def load_spawn_module():
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / "services" / "spawn_service" / "app" / "main.py"
-    return _load_module(module_path, "spawn_main")
+    return _load_module("services.spawn_service.app.main")
 
 
 def load_orchestrator_module():
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
-    module_path = repo_root / "services" / "orchestrator" / "app" / "main.py"
-    return _load_module(module_path, "orchestrator_main")
+    return _load_module("services.orchestrator.app.main")
 
 
 def load_scoreboard_module():
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / "services" / "scoreboard" / "app" / "main.py"
-    return _load_module(module_path, "scoreboard_main")
+    return _load_module("services.scoreboard.app.main")
 
 
 class ScenarioCompletionIntegrationTests(unittest.TestCase):
@@ -56,6 +44,28 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
             spawn_module = load_spawn_module()
             orchestrator_module = load_orchestrator_module()
             scoreboard_module = load_scoreboard_module()
+
+            scoreboard_app = scoreboard_module.create_app(
+                scoreboard_module.ScoreboardConfig(
+                    storage_root=Path(tmpdir),
+                    nats_url="nats://memory",
+                    event_bus_backend="memory",
+                )
+            )
+            orchestrator_app = orchestrator_module.create_app(
+                orchestrator_module.OrchestratorConfig(
+                    template_dir=Path(os.environ["TEMPLATE_DIR"]),
+                    opa_url="http://unused",
+                    nats_url="nats://memory",
+                    scoreboard_url="http://scoreboard",
+                    scoreboard_app=scoreboard_app,
+                    storage_root=Path(tmpdir),
+                    policy_backend="allow_all",
+                    container_backend="stub",
+                    event_bus_backend="memory",
+                    storage_backend="fs",
+                )
+            )
 
             scenario_id = "scn-e2e"
             issued_at = int(datetime.now(timezone.utc).timestamp())
@@ -73,8 +83,8 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
             sat = spawn_module.generate_sat(claims)
             orchestrator_module.verify_sat(sat)
 
-            orchestrator_module.scenarios.clear()
-            orchestrator_module.scenarios[scenario_id] = (
+            orchestrator_app.state.scenarios.clear()
+            orchestrator_app.state.scenarios[scenario_id] = (
                 orchestrator_module.ScenarioState(
                     scenario_id=scenario_id,
                     request_id="req-1",
@@ -87,15 +97,11 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
                 )
             )
 
-            def scoreboard_client():
-                transport = ASGITransport(app=scoreboard_module.app)
-                return AsyncClient(transport=transport, base_url="http://scoreboard")
-
-            orchestrator_module._scoreboard_client = scoreboard_client
-
             asyncio.run(
                 orchestrator_module.complete_scenario(
-                    scenario_id, completion_reason="finished"
+                    scenario_id,
+                    completion_reason="finished",
+                    app=orchestrator_app,
                 )
             )
 
