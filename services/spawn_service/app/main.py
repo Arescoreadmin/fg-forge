@@ -19,6 +19,7 @@ import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 # -------------------------------------------------------------------
 # Import entitlements in a way that survives BOTH:
@@ -77,8 +78,21 @@ def configure_logging() -> None:
 
 configure_logging()
 
-app = FastAPI(title="FrostGate Forge Spawn Service")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    yield
+    # shutdown
+
+app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
 import traceback
+
+logger = logging.getLogger("forge_spawn_service")
+
+_warned_sat_secret_alias = False
+
 
 @app.middleware("http")
 async def dump_exceptions(request: Request, call_next):
@@ -88,7 +102,16 @@ async def dump_exceptions(request: Request, call_next):
         logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
         raise
 
-logger = logging.getLogger("forge_spawn_service")
+
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
+
+
+_sat_secret_warning_emitted = False
+_fallback_warning_emitted = False
+
+# Ensure this symbol exists deterministically for request handlers/tests.
+entitlement_resolver = EntitlementResolver()
 
 TRACKS = {"netplus", "ccna", "cissp"}
 TRACK_TEMPLATE = {
@@ -135,17 +158,22 @@ TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
 ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
 _TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
 if not _TOKEN_SECRET:
-    _TOKEN_SECRET = uuid.uuid4().hex
-    logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
-_sat_secret_warning_emitted = False
-_fallback_warning_emitted = False
-entitlement_resolver = EntitlementResolver()
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    if forge_env in {"dev", "development"}:
+        _TOKEN_SECRET = uuid.uuid4().hex
+        logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
+    else:
+        raise RuntimeError("ACCESS_TOKEN_SECRET not configured")
 
 
-@app.on_event("startup")
-def warn_deprecated_sat_secret() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
-        _warn_sat_secret_alias()
+        _warn_sat_secret_alias_once()
+    yield
+    # --- shutdown ---
+    return
 
 
 @app.middleware("http")
@@ -170,6 +198,19 @@ def _b64url_decode(data: str) -> bytes:
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
 
+_warned_sat_secret_alias = False
+
+
+def _warn_sat_secret_alias() -> None:
+    # Warn only once per process to avoid log spam in high-traffic paths.
+    global _warned_sat_secret_alias
+    if _warned_sat_secret_alias:
+        return
+    _warned_sat_secret_alias = True
+    logging.getLogger("forge_spawn_service").warning(
+        "SAT_SECRET is deprecated; use SAT_HMAC_SECRET instead"
+    )
+
 
 def _get_sat_secret() -> str:
     sat_secret = os.getenv("SAT_HMAC_SECRET")
@@ -182,11 +223,12 @@ def _get_sat_secret() -> str:
     raise HTTPException(status_code=500, detail="SAT secret not configured")
 
 
-def _warn_sat_secret_alias() -> None:
-    global _sat_secret_warning_emitted
-    if not _sat_secret_warning_emitted:
-        logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
-        _sat_secret_warning_emitted = True
+def _warn_sat_secret_alias_once() -> None:
+    global _warned_sat_secret_alias
+    if _warned_sat_secret_alias:
+        return
+    _warned_sat_secret_alias = True
+    logger.warning("SAT_SECRET is deprecated; use SAT_HMAC_SECRET instead")
 
 
 def _sat_issued_at() -> int:
@@ -330,8 +372,12 @@ class SpawnRequest(BaseModel):
     requested_limits: Optional[dict[str, int]] = Field(
         None, description="Requested resource limits"
     )
-    scenario_id: Optional[str] = Field(None, description="Optional pre-allocated scenario id")
-    request_id: Optional[str] = Field(None, description="Client-supplied idempotency key")
+    scenario_id: Optional[str] = Field(
+        None, description="Optional pre-allocated scenario id"
+    )
+    request_id: Optional[str] = Field(
+        None, description="Client-supplied idempotency key"
+    )
 
 
 class SpawnResponse(BaseModel):
@@ -393,7 +439,9 @@ class SpawnLimiter:
                 self._redis_client = redis.from_url(
                     self._redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")),
+                    socket_connect_timeout=float(
+                        os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")
+                    ),
                     socket_timeout=float(os.getenv("REDIS_TIMEOUT_SECONDS", "1.0")),
                 )
             except Exception as exc:
@@ -441,7 +489,9 @@ class SpawnLimiter:
         for key in expired:
             entries.pop(key, None)
 
-    def check_concurrent(self, subject: str, scenario_id: str, expires_at: datetime, limit: int) -> None:
+    def check_concurrent(
+        self, subject: str, scenario_id: str, expires_at: datetime, limit: int
+    ) -> None:
         if limit <= 0:
             return
         expires_ts = expires_at.timestamp()
@@ -454,7 +504,9 @@ class SpawnLimiter:
                 existing = client.zscore(key, scenario_id)
                 active_count = client.zcard(key)
                 if existing is None and active_count >= limit:
-                    raise HTTPException(status_code=409, detail="concurrent scenario quota exceeded")
+                    raise HTTPException(
+                        status_code=409, detail="concurrent scenario quota exceeded"
+                    )
                 client.zadd(key, {scenario_id: expires_ts})
                 ttl = max(int(expires_ts - now), 1)
                 client.expire(key, ttl)
@@ -470,7 +522,9 @@ class SpawnLimiter:
             self._purge_active(subject, now)
             entries = self._active_cache.setdefault(subject, {})
             if scenario_id not in entries and len(entries) >= limit:
-                raise HTTPException(status_code=409, detail="concurrent scenario quota exceeded")
+                raise HTTPException(
+                    status_code=409, detail="concurrent scenario quota exceeded"
+                )
             entries[scenario_id] = expires_ts
 
 
@@ -526,7 +580,9 @@ def _request_with_retries(
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            response = requests.request(method, url, json=json_body, headers=headers, timeout=timeout)
+            response = requests.request(
+                method, url, json=json_body, headers=headers, timeout=timeout
+            )
             if response.status_code >= 500:
                 raise requests.RequestException(f"upstream {response.status_code}")
             if breaker:
@@ -543,9 +599,15 @@ def _request_with_retries(
     raise requests.RequestException("request failed") from last_exc
 
 
-_opa_breaker = CircuitBreaker("opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10")))
-_orchestrator_breaker = CircuitBreaker("orchestrator", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10")))
-_egress_breaker = CircuitBreaker("egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10")))
+_opa_breaker = CircuitBreaker(
+    "opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_orchestrator_breaker = CircuitBreaker(
+    "orchestrator", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
+_egress_breaker = CircuitBreaker(
+    "egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+)
 
 
 def load_template(track: str) -> dict:
@@ -560,7 +622,9 @@ def load_template(track: str) -> dict:
 def opa_allows(template: dict) -> None:
     opa_url = os.getenv("OPA_URL")
     if not opa_url:
-        return
+        if _forge_env() in {"dev", "development"}:
+            return
+        raise HTTPException(status_code=503, detail="OPA not configured")
 
     try:
         response = _request_with_retries(
@@ -591,7 +655,9 @@ def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]
     return payload.request_id or request.headers.get(header_name)
 
 
-def resolve_subject_identifier(payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]) -> str:
+def resolve_subject_identifier(
+    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+) -> str:
     subject = payload.subject.strip() if payload.subject else ""
     if sat_claims:
         if subject and sat_claims.subject != subject:
@@ -607,7 +673,9 @@ def resolve_subject_identifier(payload: SpawnRequest, request: Request, sat_clai
     return subject
 
 
-def resolve_tenant_identifier(request: Request, sat_claims: Optional[SatClaims], subject: str) -> str:
+def resolve_tenant_identifier(
+    request: Request, sat_claims: Optional[SatClaims], subject: str
+) -> str:
     tenant_id = request.headers.get(TENANT_ID_HEADER, "").strip()
     if sat_claims:
         if tenant_id and sat_claims.tenant_id != tenant_id:
@@ -618,7 +686,9 @@ def resolve_tenant_identifier(request: Request, sat_claims: Optional[SatClaims],
     return tenant_id
 
 
-def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]) -> Tuple[SpawnResponse, EntitlementDecision]:
+def build_spawn_response(
+    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+) -> Tuple[SpawnResponse, EntitlementDecision]:
     request_id = resolve_request_id(payload, request)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id required")
@@ -640,7 +710,9 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
             source="x-plan",
         )
     else:
-        entitlement = entitlement_resolver.resolve(subject=subject, tenant_id=tenant_id, receipt_token=receipt_token)
+        entitlement = entitlement_resolver.resolve(
+            subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+        )
 
     et_token = mint_entitlement_token(
         subject=subject,
@@ -733,7 +805,9 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
     expires_at_dt = datetime.fromisoformat(expires_at)
     if expires_at_dt.tzinfo is None:
         expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
-    spawn_limiter.check_concurrent(subject, scenario_id, expires_at_dt, entitlements.max_concurrent_scenarios)
+    spawn_limiter.check_concurrent(
+        subject, scenario_id, expires_at_dt, entitlements.max_concurrent_scenarios
+    )
 
     REQUEST_CACHE[request_id] = {
         "request_id": response.request_id,
@@ -751,12 +825,19 @@ def build_spawn_response(payload: SpawnRequest, request: Request, sat_claims: Op
     return response, entitlement
 
 
-def notify_orchestrator(payload: SpawnRequest, response: SpawnResponse, request: Request, tier: str) -> None:
+def notify_orchestrator(
+    payload: SpawnRequest, response: SpawnResponse, request: Request, tier: str
+) -> None:
     orchestrator_url = os.getenv("ORCHESTRATOR_URL")
     if not orchestrator_url:
         return
     headers = {"x-request-id": request_id_ctx.get(), "x-sat": response.sat}
-    body = {"scenario_id": response.scenario_id, "template": payload.track, "request_id": response.request_id, "tier": tier}
+    body = {
+        "scenario_id": response.scenario_id,
+        "template": payload.track,
+        "request_id": response.request_id,
+        "tier": tier,
+    }
     try:
         call = _request_with_retries(
             "POST",
@@ -804,15 +885,23 @@ def _check_egress_gateway() -> None:
         forge_env = os.getenv("FORGE_ENV", "dev").lower()
         expected = "true" if forge_env == "dev" else "false"
     try:
-        response = _request_with_retries("GET", f"{egress_url}/readyz", breaker=_egress_breaker)
+        response = _request_with_retries(
+            "GET", f"{egress_url}/readyz", breaker=_egress_breaker
+        )
     except requests.RequestException as exc:
-        raise HTTPException(status_code=503, detail=f"egress gateway unavailable: {exc}") from exc
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unavailable: {exc}"
+        ) from exc
     if response.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"egress gateway unhealthy: {response.status_code}")
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=503, detail="egress gateway invalid response") from exc
+        raise HTTPException(
+            status_code=503, detail="egress gateway invalid response"
+        ) from exc
     if str(payload.get("dry_run", "")).lower() != expected.lower():
         raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
@@ -820,7 +909,9 @@ def _check_egress_gateway() -> None:
 def _check_opa_ready() -> None:
     opa_url = os.getenv("OPA_URL")
     if not opa_url:
-        return
+        if _forge_env() in {"dev", "development"}:
+            return
+        raise HTTPException(status_code=503, detail="opa not configured")
     try:
         response = _request_with_retries("GET", f"{opa_url}/health", breaker=_opa_breaker)
     except requests.RequestException as exc:
