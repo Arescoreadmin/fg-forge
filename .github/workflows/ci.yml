@@ -48,8 +48,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if rg -n --hidden --no-ignore-vcs "opa test.*--v1|--v1" .github/workflows policies; then
-          echo "ERROR: '--v1' flag detected in workflows/policies. OPA does not support it."
+          if rg -n --hidden --no-ignore-vcs '^\s*docker\b.*\bopa\b.*\btest\b.*--v1\b' .github/workflows; then
+          echo "ERROR: '--v1' flag detected in a docker opa test command."
            exit 1
           fi
 
