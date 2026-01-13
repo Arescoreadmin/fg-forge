@@ -15,9 +15,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install \
             -r services/spawn_service/requirements.txt \
@@ -30,24 +32,28 @@ jobs:
 
       - name: Secret scan
         run: |
+          set -euo pipefail
           if rg -n "BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}" .; then
             echo "Potential secret material detected."
             exit 1
           fi
 
-      - name: Install OPA (v1.x)
+      - name: OPA policy tests (Rego v1)
         run: |
-          set -e
-          curl -L -o opa https://openpolicyagent.org/downloads/v1.0.0/opa_linux_amd64
-          chmod +x opa
-          sudo mv opa /usr/local/bin/opa
+          set -euo pipefail
+
+          # Pin by digest for reproducibility
+          OPA_IMAGE="openpolicyagent/opa@sha256:c0609fecc0924743f8648dc4a035d2f57ca163dc723ed1d13f3197ba5bd122b3"
+          docker pull "$OPA_IMAGE"
+
+          opa() { docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace "$OPA_IMAGE" "$@"; }
+
           opa version
 
-      - name: OPA policy tests
-        run: |
-          set -e
-          opa version
-          opa fmt -w policies/
+          # Check formatting without mutating the repo
+          opa fmt --fail policies/
+
+          # Rego v1 is default in OPA 1.x; do NOT pass --v0-compatible
           opa test -v policies/
 
       - name: Unit tests (spawn_service)
