@@ -30,9 +30,10 @@ try:
     from .entitlements import (
         EntitlementDecision,
         EntitlementResolver,
+        append_billing_audit_event,
         mint_entitlement_token,
         normalize_tier,
-        verify_entitlement_token,
+        verify_et,
     )
 except ImportError:
     import sys
@@ -46,9 +47,10 @@ except ImportError:
     from app.entitlements import (  # type: ignore
         EntitlementDecision,
         EntitlementResolver,
+        append_billing_audit_event,
         mint_entitlement_token,
         normalize_tier,
-        verify_entitlement_token,
+        verify_et,
     )
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
@@ -166,9 +168,32 @@ if not _TOKEN_SECRET:
         raise RuntimeError("ACCESS_TOKEN_SECRET not configured")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # --- startup ---
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
+
+
+def _enforce_startup_config() -> None:
+    env = _forge_env()
+    if env not in {"dev", "development"}:
+        required = [
+            "SAT_HMAC_SECRET",
+            "ET_HMAC_SECRET",
+            "RECEIPT_HMAC_SECRET",
+            "OPERATOR_TOKEN",
+        ]
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
+    if env in {"staging", "prod", "production"}:
+        if os.getenv("DEV_ALLOW_XPLAN", "false").lower() == "true":
+            raise RuntimeError("DEV_ALLOW_XPLAN is not allowed in staging/prod")
+        if os.getenv("ALLOW_FREE_DEFAULT", "false").lower() == "true":
+            raise RuntimeError("ALLOW_FREE_DEFAULT is not allowed in staging/prod")
+
+
+@app.on_event("startup")
+def warn_deprecated_sat_secret() -> None:
+    _enforce_startup_config()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias_once()
     yield
@@ -714,21 +739,29 @@ def build_spawn_response(
             subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
         )
 
+    if entitlement.source == "receipt" and entitlement.receipt_exp is not None:
+        append_billing_audit_event(
+            tenant_id=tenant_id,
+            subject=subject,
+            plan=entitlement.tier,
+            receipt_exp=entitlement.receipt_exp,
+        )
+
     et_token = mint_entitlement_token(
         subject=subject,
         tenant_id=tenant_id,
         plan=entitlement.tier,
         retention_days=entitlement.retention_days,
     )
-    et_claims = verify_entitlement_token(et_token)
-    tier = normalize_tier(et_claims.plan)
+    et_claims = verify_et(et_token)
+    tier = normalize_tier(et_claims["plan"])
     entitlements = resolve_entitlements(tier)
     if payload.tier and normalize_tier(payload.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and normalize_tier(sat_claims.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and sat_claims.retention_days is not None:
-        if sat_claims.retention_days != et_claims.retention_days:
+        if sat_claims.retention_days != et_claims["retention_days"]:
             raise HTTPException(status_code=403, detail="retention mismatch")
     if payload.track not in entitlements.allowed_tracks:
         raise HTTPException(status_code=403, detail="track not allowed for tier")
@@ -737,11 +770,11 @@ def build_spawn_response(
     if request_id in REQUEST_CACHE:
         cached = REQUEST_CACHE[request_id]
         cached_tier = cached.get("tier", tier)
-        cached_retention = cached.get("retention_days", et_claims.retention_days)
+        cached_retention = cached.get("retention_days", et_claims["retention_days"])
         cached_tenant = cached.get("tenant_id", tenant_id)
         if cached_tier != tier or cached_tenant != tenant_id:
             raise HTTPException(status_code=403, detail="entitlement mismatch")
-        if cached_retention != et_claims.retention_days:
+        if cached_retention != et_claims["retention_days"]:
             raise HTTPException(status_code=403, detail="entitlement mismatch")
         issued_at = _sat_issued_at()
         sat_token = generate_sat(
@@ -751,10 +784,10 @@ def build_spawn_response(
                 iat=issued_at,
                 track=cached["track"],
                 template_id=cached["template_id"],
-                subject=subject,
-                tenant_id=cached_tenant,
+                subject=et_claims["subject"],
+                tenant_id=et_claims["tenant_id"],
                 tier=cached_tier,
-                retention_days=et_claims.retention_days,
+                retention_days=et_claims["retention_days"],
                 requested_limits=payload.requested_limits,
                 scenario_id=cached["scenario_id"],
             )
@@ -784,10 +817,10 @@ def build_spawn_response(
             iat=issued_at,
             track=payload.track,
             template_id=payload.template_id or payload.track,
-            subject=subject,
-            tenant_id=tenant_id,
+            subject=et_claims["subject"],
+            tenant_id=et_claims["tenant_id"],
             tier=tier,
-            retention_days=et_claims.retention_days,
+            retention_days=et_claims["retention_days"],
             requested_limits=payload.requested_limits,
             scenario_id=scenario_id,
         )
@@ -818,8 +851,8 @@ def build_spawn_response(
         "track": payload.track,
         "template_id": payload.template_id or payload.track,
         "tier": tier,
-        "retention_days": et_claims.retention_days,
-        "tenant_id": tenant_id,
+        "retention_days": et_claims["retention_days"],
+        "tenant_id": et_claims["tenant_id"],
     }
 
     return response, entitlement

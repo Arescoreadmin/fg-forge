@@ -105,21 +105,57 @@ def cfg_http_max_retries() -> int:
     return int(os.getenv("HTTP_MAX_RETRIES", "2"))
 
 
-def cfg_http_retry_base_delay() -> float:
-    return float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
 
 
-def cfg_http_retry_jitter() -> float:
-    return float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+def _enforce_startup_config() -> None:
+    env = _forge_env()
+    if env not in {"dev", "development"}:
+        required = [
+            "SAT_HMAC_SECRET",
+            "ET_HMAC_SECRET",
+            "RECEIPT_HMAC_SECRET",
+            "OPERATOR_TOKEN",
+        ]
+        missing = [name for name in required if not os.getenv(name)]
+        if missing:
+            raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
 
 
-def cfg_circuit_breaker_cooldown() -> float:
-    return float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+def _policy_dir() -> Path:
+    return Path(os.getenv("OPA_POLICY_DIR", "/policies"))
 
 
-# -----------------------------
-# Models
-# -----------------------------
+def _compute_policy_hash() -> tuple[str, int]:
+    policy_root = _policy_dir()
+    files = [
+        path
+        for path in policy_root.rglob("*.rego")
+        if path.is_file()
+    ]
+    files.sort(key=lambda path: path.relative_to(policy_root).as_posix())
+    hasher = hashlib.sha256()
+    for path in files:
+        rel = path.relative_to(policy_root).as_posix()
+        hasher.update(rel.encode("utf-8"))
+        hasher.update(b"\n")
+        hasher.update(path.read_bytes())
+        hasher.update(b"\n")
+    return hasher.hexdigest(), len(files)
+
+
+def _enforce_policy_hash() -> None:
+    digest, count = _compute_policy_hash()
+    logger.info("OPA policy hash=%s files=%s", digest, count)
+    expected = os.getenv("OPA_POLICY_HASH")
+    if expected:
+        if count == 0:
+            raise RuntimeError("OPA policy hash enforcement failed: no policies found")
+        if digest != expected:
+            raise RuntimeError("OPA policy hash enforcement failed: hash mismatch")
+
+
 class ScenarioStatus(str, Enum):
     PENDING = "pending"
     CREATING = "creating"
@@ -1053,11 +1089,10 @@ async def nats_subscriber() -> None:
 # FastAPI app
 # -----------------------------
 @asynccontextmanager
-async def lifespan(app_: FastAPI):
-    global scenarios
-
-    app_.state.scenarios = scenarios
-
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    _enforce_startup_config()
+    _enforce_policy_hash()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias()
 
