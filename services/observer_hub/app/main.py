@@ -155,6 +155,7 @@ async def forward_to_loki(event: TelemetryEvent) -> bool:
     # Format labels for Loki
     _label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
 
+
     payload = {
         "streams": [
             {

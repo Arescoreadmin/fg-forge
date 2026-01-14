@@ -1,4 +1,5 @@
 from __future__ import annotations
+import traceback
 
 import base64
 import contextvars
@@ -20,8 +21,6 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
-import traceback
-
 # -------------------------------------------------------------------
 # Import entitlements in a way that survives BOTH:
 # 1) normal package import: services.spawn_service.app.main
