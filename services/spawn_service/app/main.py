@@ -20,6 +20,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+import traceback
 
 # -------------------------------------------------------------------
 # Import entitlements in a way that survives BOTH:
@@ -80,7 +81,6 @@ def configure_logging() -> None:
 
 configure_logging()
 
-from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -89,7 +89,6 @@ async def lifespan(app: FastAPI):
     # shutdown
 
 app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
-import traceback
 
 logger = logging.getLogger("forge_spawn_service")
 
