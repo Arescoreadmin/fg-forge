@@ -30,7 +30,9 @@ import docker
 import httpx
 import nats
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+
+internal_router = APIRouter()
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -1204,7 +1206,13 @@ async def list_scenarios() -> list[ScenarioState]:
     return list(store.values())
 
 
-@app.post("/internal/scenario/{scenario_id}/complete")
+app.include_router(internal_router)
+
+@internal_router.post("/internal/scenarios/{scenario_id}/complete")
+@internal_router.post("/internal/scenario/{scenario_id}/complete")
+# If internal_router is mounted with prefix="/internal", these cover the non-doubled paths:
+@internal_router.post("/scenarios/{scenario_id}/complete")
+@internal_router.post("/scenario/{scenario_id}/complete")
 async def complete_scenario_endpoint(
     scenario_id: str,
     payload: ScenarioCompletionRequest,
@@ -1213,3 +1221,6 @@ async def complete_scenario_endpoint(
     _require_internal_auth(request)
     _require_operator_auth(request)
     return await complete_scenario(scenario_id, payload.completion_reason, payload.completion_timestamp)
+
+# Ensure internal routes are mounted on the module-level app after internal endpoints are declared.
+app.include_router(internal_router)
