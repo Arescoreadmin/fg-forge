@@ -32,7 +32,8 @@ import nats
 import yaml
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 
-internal_router = APIRouter()
+internal_router = APIRouter(prefix="/internal")
+
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -1205,8 +1206,6 @@ async def list_scenarios() -> list[ScenarioState]:
     store: dict[str, ScenarioState] = app.state.scenarios
     return list(store.values())
 
-
-app.include_router(internal_router)
 
 @internal_router.post("/internal/scenarios/{scenario_id}/complete")
 @internal_router.post("/internal/scenario/{scenario_id}/complete")
