@@ -31,12 +31,10 @@ import httpx
 import nats
 import yaml
 from fastapi import APIRouter, FastAPI, HTTPException, Request
-
-internal_router = APIRouter(prefix="/internal")
-
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
+internal_router = APIRouter(prefix="/internal")
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
 
@@ -1207,11 +1205,9 @@ async def list_scenarios() -> list[ScenarioState]:
     return list(store.values())
 
 
-@internal_router.post("/internal/scenarios/{scenario_id}/complete")
-@internal_router.post("/internal/scenario/{scenario_id}/complete")
-# If internal_router is mounted with prefix="/internal", these cover the non-doubled paths:
 @internal_router.post("/scenarios/{scenario_id}/complete")
 @internal_router.post("/scenario/{scenario_id}/complete")
+# If internal_router is mounted with prefix="/internal", these cover the non-doubled paths:
 async def complete_scenario_endpoint(
     scenario_id: str,
     payload: ScenarioCompletionRequest,
