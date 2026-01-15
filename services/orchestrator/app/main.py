@@ -34,13 +34,18 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
+# -----------------------------------------------------------------------------
+# Routers (declare first; mount inside create_app())
+# -----------------------------------------------------------------------------
+router = APIRouter()
 internal_router = APIRouter(prefix="/internal")
+
+# Request correlation id (used by logger + middleware)
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
-
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Logging
-# -----------------------------
+# -----------------------------------------------------------------------------
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -66,10 +71,9 @@ def configure_logging() -> None:
 configure_logging()
 logger = logging.getLogger("forge_orchestrator")
 
-
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Configuration (NO import-time freezing)
-# -----------------------------
+# -----------------------------------------------------------------------------
 NETWORK_PREFIX = "forge_scn_"
 _sat_secret_warning_emitted = False
 
@@ -118,9 +122,9 @@ def cfg_circuit_breaker_cooldown() -> float:
     return float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Models
-# -----------------------------
+# -----------------------------------------------------------------------------
 class ScenarioStatus(str, Enum):
     PENDING = "pending"
     CREATING = "creating"
@@ -181,19 +185,18 @@ class SatClaims(BaseModel):
     scenario_id: Optional[str] = None
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Replay protection (redis optional)
-# -----------------------------
+# -----------------------------------------------------------------------------
 class ReplayProtector:
     def __init__(self) -> None:
-        self._redis_url = os.getenv("REDIS_URL")
         self._redis_client: Any | None = None
         self._cache: OrderedDict[str, int] = OrderedDict()
         self._max_size = int(os.getenv("SAT_REPLAY_CACHE_SIZE", "10000"))
         self._lock = asyncio.Lock()
 
     async def _get_redis(self) -> Any | None:
-        # Note: REDIS_URL may be overridden in tests, so re-read env if client not created.
+        # REDIS_URL may be overridden in tests, so re-read env if client not created.
         if not os.getenv("REDIS_URL"):
             return None
         if self._redis_client is None:
@@ -236,16 +239,14 @@ class ReplayProtector:
 
 replay_protector = ReplayProtector()
 
-
-# -----------------------------
-# State
-# -----------------------------
+# -----------------------------------------------------------------------------
+# State (in-memory; consider redis/db for multi-replica prod)
+# -----------------------------------------------------------------------------
 scenarios: dict[str, ScenarioState] = {}
 
-
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Clients
-# -----------------------------
+# -----------------------------------------------------------------------------
 docker_client: docker.DockerClient | None = None
 nc: nats.NATS | None = None
 js: Any = None
@@ -330,9 +331,7 @@ def get_docker_client() -> docker.DockerClient:
 
 
 def _import_from_path(import_path: str) -> Any:
-    """
-    Import "module.sub:attr" and return attr.
-    """
+    """Import "module.sub:attr" and return attr."""
     if ":" not in import_path:
         raise ValueError("import path must be like 'pkg.mod:attr'")
     mod_name, attr_name = import_path.split(":", 1)
@@ -344,10 +343,7 @@ def _import_from_path(import_path: str) -> Any:
 
 
 def _scoreboard_client() -> httpx.AsyncClient:
-    """
-    In UNIT_TESTS=1, run scoreboard in-process via ASGITransport so tests don't depend
-    on docker networks/hosts. Otherwise use SCOREBOARD_URL.
-    """
+    """In UNIT_TESTS=1, run scoreboard in-process via ASGITransport; otherwise use SCOREBOARD_URL."""
     if cfg_unit_tests():
         try:
             from httpx import ASGITransport  # type: ignore
@@ -360,7 +356,6 @@ def _scoreboard_client() -> httpx.AsyncClient:
         except Exception as exc:
             raise RuntimeError(f"Failed to import SCOREBOARD_ASGI_IMPORT={import_path}: {exc}") from exc
 
-        # Base URL is required even for ASGITransport, and tests expect 'http://scoreboard/...'
         return httpx.AsyncClient(
             transport=ASGITransport(app=asgi_app),
             base_url="http://scoreboard",
@@ -370,15 +365,11 @@ def _scoreboard_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=cfg_scoreboard_url(), timeout=_httpx_timeout())
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Template
-# -----------------------------
+# -----------------------------------------------------------------------------
 def load_template(track: str) -> dict:
-    """Load scenario template from filesystem.
-
-    In unit tests we allow a minimal fallback template so contract tests
-    don't depend on external /templates mounts.
-    """
+    """Load scenario template from filesystem."""
     template_dir = cfg_template_dir()
     candidates: list[Path] = []
     name = track
@@ -398,24 +389,15 @@ def load_template(track: str) -> dict:
         return {
             "id": track,
             "track": track,
-            "assets": {
-                "containers": [
-                    {
-                        "name": "trainer",
-                        "image": "alpine:3.19",
-                        "read_only": True,
-                        "environment": {},
-                    }
-                ]
-            },
+            "assets": {"containers": [{"name": "trainer", "image": "alpine:3.19", "read_only": True, "environment": {}}]},
         }
 
     raise HTTPException(status_code=404, detail=f"Template not found: {track}")
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # SAT utilities
-# -----------------------------
+# -----------------------------------------------------------------------------
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
@@ -518,7 +500,7 @@ async def enforce_sat(
 
 
 async def _call_enforce_sat(
-    app: Any,
+    app_obj: Any,
     token: str | None,
     scenario_id: str | None,
     track: str | None,
@@ -531,20 +513,17 @@ async def _call_enforce_sat(
 
     kwargs: dict[str, Any] = {}
     if "app" in names:
-        kwargs["app"] = app
+        kwargs["app"] = app_obj
     if "token" in names:
         kwargs["token"] = token
-
     if "scenario_id" in names:
         kwargs["scenario_id"] = scenario_id
     if "track" in names:
         kwargs["track"] = track
-
     if "template_id" in names:
         kwargs["template_id"] = template_id
     elif "template" in names:
         kwargs["template"] = template_id
-
     if "tier" in names:
         kwargs["tier"] = tier
 
@@ -553,13 +532,13 @@ async def _call_enforce_sat(
     except TypeError:
         arity = len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
         if arity >= 6:
-            return await enforce_sat(app, token, scenario_id, track, template_id, tier)  # type: ignore[misc]
+            return await enforce_sat(app_obj, token, scenario_id, track, template_id, tier)  # type: ignore[misc]
         return await enforce_sat(token, scenario_id, track, template_id, tier)  # type: ignore[misc]
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Internal auth
-# -----------------------------
+# -----------------------------------------------------------------------------
 def _require_internal_auth(request: Request) -> None:
     expected = os.getenv("ORCHESTRATOR_INTERNAL_TOKEN")
     if not expected:
@@ -580,9 +559,9 @@ def _require_operator_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="operator auth required")
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # OPA + scoreboard
-# -----------------------------
+# -----------------------------------------------------------------------------
 def _normalize_plan(tier: str | None) -> str | None:
     if not tier:
         return None
@@ -599,11 +578,7 @@ def _build_opa_input(template: dict, claims: SatClaims) -> dict:
 
 
 async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
-    """Query OPA for policy decision.
-
-    Unit tests should not depend on a live OPA container. When UNIT_TESTS=1,
-    we allow by default and keep the rest of the pipeline exercised.
-    """
+    """Query OPA for policy decision."""
     if cfg_unit_tests():
         return True, None
 
@@ -703,11 +678,8 @@ async def _trigger_scoreboard(
     correlation_id: str | None,
 ) -> None:
     token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
-
-    # Unit tests: allow deterministic fallback, but prefer explicit env.
     if not token and cfg_unit_tests():
         token = "test-scoreboard"
-
     if not token:
         raise RuntimeError("SCOREBOARD_INTERNAL_TOKEN not configured")
 
@@ -738,9 +710,9 @@ async def _trigger_scoreboard(
             raise RuntimeError(f"scoreboard error {response.status_code}: {response.text}")
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Audit chain
-# -----------------------------
+# -----------------------------------------------------------------------------
 def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -792,9 +764,9 @@ def append_audit_event(
         handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Docker orchestration
-# -----------------------------
+# -----------------------------------------------------------------------------
 def create_scenario_network(scenario_id: str) -> str:
     client = get_docker_client()
     network_name = f"{NETWORK_PREFIX}{scenario_id}"
@@ -884,9 +856,9 @@ def cleanup_scenario(scenario_id: str) -> None:
             logger.warning("Failed to remove network %s: %s", network.name, e)
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # Scenario completion
-# -----------------------------
+# -----------------------------------------------------------------------------
 async def complete_scenario(
     scenario_id: str,
     completion_reason: str,
@@ -937,9 +909,9 @@ async def complete_scenario(
     return state
 
 
-# -----------------------------
+# -----------------------------------------------------------------------------
 # NATS spawn consumer
-# -----------------------------
+# -----------------------------------------------------------------------------
 async def process_spawn_request(msg: Any) -> None:
     """Process incoming spawn request from NATS."""
     try:
@@ -957,9 +929,13 @@ async def process_spawn_request(msg: Any) -> None:
             await msg.ack()
             return
 
+        # NOTE: process_spawn_request runs outside request context, so request_id_ctx may be "-"
+        request_id_ctx.set(correlation_id)
+
         try:
             template_id = data.get("template_id") or track
-            claims = await _call_enforce_sat(app, sat, scenario_id, track, template_id, tier)
+            # app object isn't required for our enforce_sat signature, but keep adapter anyway.
+            claims = await _call_enforce_sat(None, sat, scenario_id, track, template_id, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
             await msg.ack()
@@ -1012,7 +988,9 @@ async def process_spawn_request(msg: Any) -> None:
         if js:
             await js.publish(
                 "scenario.created",
-                json.dumps({"scenario_id": scenario_id, "track": track, "network_id": network_id, "containers": container_ids}).encode("utf-8"),
+                json.dumps(
+                    {"scenario_id": scenario_id, "track": track, "network_id": network_id, "containers": container_ids}
+                ).encode("utf-8"),
             )
 
         await msg.ack()
@@ -1039,7 +1017,6 @@ async def nats_subscriber() -> None:
             pass
 
         consumer_config = ConsumerConfig(durable_name="orchestrator", deliver_policy=DeliverPolicy.ALL, ack_wait=30)
-
         await js.subscribe("spawn.request", cb=process_spawn_request, config=consumer_config)
         logger.info("Subscribed to spawn.request")
 
@@ -1050,9 +1027,9 @@ async def nats_subscriber() -> None:
         logger.error("NATS subscriber error: %s", e)
 
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
+# -----------------------------------------------------------------------------
+# FastAPI lifecycle + factory (ONE app, created after routes exist)
+# -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     global scenarios
@@ -1064,37 +1041,50 @@ async def lifespan(app_: FastAPI):
 
     task = asyncio.create_task(nats_subscriber())
     logger.info("Orchestrator started")
-    yield
-    task.cancel()
-    if nc:
-        await nc.close()
-    logger.info("Orchestrator stopped")
+    try:
+        yield
+    finally:
+        task.cancel()
+        if nc:
+            await nc.close()
+        logger.info("Orchestrator stopped")
 
 
-app = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
+def create_app() -> FastAPI:
+    app_ = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
+
+    @app_.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or str(uuid.uuid4())
+        token = request_id_ctx.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_ctx.reset(token)
+        response.headers["x-request-id"] = rid
+        return response
+
+    # Mount routers (this fixes your 404/401 mess)
+    app_.include_router(router)
+    app_.include_router(internal_router)
+
+    return app_
 
 
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or str(uuid.uuid4())
-    token = request_id_ctx.set(rid)
-    response = await call_next(request)
-    request_id_ctx.reset(token)
-    response.headers["x-request-id"] = rid
-    return response
-
-
-@app.get("/health")
+# -----------------------------------------------------------------------------
+# Public routes
+# -----------------------------------------------------------------------------
+@router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_orchestrator"}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "forge_orchestrator"}
 
 
-@app.get("/readyz")
+@router.get("/readyz")
 async def readyz() -> dict:
     _check_read_only_fs()
     await _check_egress_gateway()
@@ -1112,15 +1102,15 @@ async def readyz() -> dict:
     return {"status": "ready", "service": "forge_orchestrator"}
 
 
-@app.post("/v1/scenarios", response_model=CreateScenarioResponse)
+@router.post("/v1/scenarios", response_model=CreateScenarioResponse)
 async def create_scenario(request: CreateScenarioRequest, http_request: Request) -> CreateScenarioResponse:
     """Create a new scenario (direct API, bypasses NATS)."""
     scenario_id = request.scenario_id
     track = request.template
 
     token = http_request.headers.get("x-sat") or _parse_bearer_token(http_request.headers.get("authorization", ""))
-
     template_id = getattr(request, "template_id", None) or track
+
     claims = await _call_enforce_sat(http_request.app, token, scenario_id, track, template_id, request.tier)
 
     store: dict[str, ScenarioState] = http_request.app.state.scenarios
@@ -1164,7 +1154,7 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
     except Exception as e:
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Network creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Network creation failed: {e}") from e
 
     try:
         container_ids = launch_scenario_containers(scenario_id, network_id, template)
@@ -1175,22 +1165,22 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         cleanup_scenario(scenario_id)
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Container launch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Container launch failed: {e}") from e
 
     return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=network_id)
 
 
-@app.get("/v1/scenarios/{scenario_id}")
-async def get_scenario(scenario_id: str) -> ScenarioState:
-    store: dict[str, ScenarioState] = app.state.scenarios
+@router.get("/v1/scenarios/{scenario_id}")
+async def get_scenario(scenario_id: str, request: Request) -> ScenarioState:
+    store: dict[str, ScenarioState] = request.app.state.scenarios
     if scenario_id not in store:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return store[scenario_id]
 
 
-@app.delete("/v1/scenarios/{scenario_id}")
-async def delete_scenario(scenario_id: str) -> dict:
-    store: dict[str, ScenarioState] = app.state.scenarios
+@router.delete("/v1/scenarios/{scenario_id}")
+async def delete_scenario(scenario_id: str, request: Request) -> dict:
+    store: dict[str, ScenarioState] = request.app.state.scenarios
     if scenario_id not in store:
         raise HTTPException(status_code=404, detail="Scenario not found")
     cleanup_scenario(scenario_id)
@@ -1199,15 +1189,17 @@ async def delete_scenario(scenario_id: str) -> dict:
     return {"status": "deleted", "scenario_id": scenario_id}
 
 
-@app.get("/v1/scenarios")
-async def list_scenarios() -> list[ScenarioState]:
-    store: dict[str, ScenarioState] = app.state.scenarios
+@router.get("/v1/scenarios")
+async def list_scenarios(request: Request) -> list[ScenarioState]:
+    store: dict[str, ScenarioState] = request.app.state.scenarios
     return list(store.values())
 
 
-@internal_router.post("/scenarios/{scenario_id}/complete")
+# -----------------------------------------------------------------------------
+# Internal routes (keep both legacy and plural endpoints)
+# -----------------------------------------------------------------------------
 @internal_router.post("/scenario/{scenario_id}/complete")
-# If internal_router is mounted with prefix="/internal", these cover the non-doubled paths:
+@internal_router.post("/scenarios/{scenario_id}/complete")
 async def complete_scenario_endpoint(
     scenario_id: str,
     payload: ScenarioCompletionRequest,
@@ -1217,5 +1209,8 @@ async def complete_scenario_endpoint(
     _require_operator_auth(request)
     return await complete_scenario(scenario_id, payload.completion_reason, payload.completion_timestamp)
 
-# Ensure internal routes are mounted on the module-level app after internal endpoints are declared.
-app.include_router(internal_router)
+
+# -----------------------------------------------------------------------------
+# Module-level ASGI app (used by uvicorn + tests)
+# -----------------------------------------------------------------------------
+app = create_app()
