@@ -54,7 +54,7 @@ def convert_line(line: str) -> str:
 
 def convert_file(path: pathlib.Path) -> bool:
     original = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    converted = [convert_line(l) for l in original]
+    converted = [convert_line(line) for line in original]
     if converted != original:
         path.write_text("".join(converted), encoding="utf-8")
         return True

@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import tarfile
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -24,9 +23,8 @@ from enum import Enum
 from typing import Any
 
 import nats
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minio import Minio
 from nats.js.api import ConsumerConfig, DeliverPolicy
@@ -643,8 +641,6 @@ async def download_bundle(bundle_id: str) -> StreamingResponse:
     """Download an audit bundle."""
     if bundle_id not in audit_bundles:
         raise HTTPException(status_code=404, detail="Bundle not found")
-
-    bundle = audit_bundles[bundle_id]
     client = get_minio_client()
 
     # Get bundle from MinIO

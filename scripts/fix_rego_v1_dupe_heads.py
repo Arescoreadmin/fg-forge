@@ -1,3 +1,4 @@
+# noqa: F821
 from __future__ import annotations
 
 import pathlib
@@ -73,4 +74,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-PY

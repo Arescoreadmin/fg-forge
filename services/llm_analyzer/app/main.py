@@ -22,7 +22,6 @@ from typing import Any
 
 import httpx
 import nats
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy

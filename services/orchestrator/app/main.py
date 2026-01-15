@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
-import hmac
 import hashlib
+import hmac
+import inspect
+import importlib
 import json
 import logging
 import os
@@ -33,10 +35,18 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
-request_id_ctx = contextvars.ContextVar("request_id", default="-")
+# -----------------------------------------------------------------------------
+# Routers (declare first; mount inside create_app())
+# -----------------------------------------------------------------------------
 router = APIRouter()
+internal_router = APIRouter(prefix="/internal")
 
+# Request correlation id (used by logger + middleware)
+request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -61,418 +71,61 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("forge_orchestrator")
+
+# -----------------------------------------------------------------------------
+# Configuration (NO import-time freezing)
+# -----------------------------------------------------------------------------
+NETWORK_PREFIX = "forge_scn_"
 _sat_secret_warning_emitted = False
 
-NETWORK_PREFIX = "forge_scn_"
-
-
-@dataclass(frozen=True)
-class OrchestratorConfig:
-    template_dir: Path
-    opa_url: str
-    nats_url: str
-    scoreboard_url: str
-    scoreboard_app: FastAPI | None
-    storage_root: Path
-    policy_backend: str
-    container_backend: str
-    event_bus_backend: str
-    storage_backend: str
-
-    @classmethod
-    def from_env(cls) -> "OrchestratorConfig":
-        return cls(
-            template_dir=Path(os.getenv("TEMPLATE_DIR", "/templates")),
-            opa_url=os.getenv("OPA_URL", "http://forge_opa:8181"),
-            nats_url=os.getenv("NATS_URL", "nats://forge_nats:4222"),
-            scoreboard_url=os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080"),
-            scoreboard_app=None,
-            storage_root=Path(os.getenv("STORAGE_ROOT", "storage")),
-            policy_backend=os.getenv("POLICY_BACKEND", "opa"),
-            container_backend=os.getenv("CONTAINER_RUNTIME", "docker"),
-            event_bus_backend=os.getenv("EVENT_BUS_BACKEND", "nats"),
-            storage_backend=os.getenv("STORAGE_BACKEND", "fs"),
-        )
-
-
-class PolicyEvaluator:
-    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
-        raise NotImplementedError
-
-    async def ready(self) -> None:
-        return None
-
-
-class OpaPolicyEvaluator(PolicyEvaluator):
-    def __init__(self, opa_url: str) -> None:
-        self._opa_url = opa_url.rstrip("/")
-
-    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
-        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
-            try:
-                response = await _request_with_retries(
-                    client,
-                    "POST",
-                    f"{self._opa_url}/v1/data/frostgate/forge/training/allow",
-                    json_body={"input": input_payload},
-                    breaker=_opa_breaker,
-                )
-                if response.status_code >= 400:
-                    return False, f"OPA error: {response.status_code}"
-
-                result = response.json()
-                allowed = result.get("result", False)
-                if not allowed:
-                    return False, "Policy denied"
-                return True, None
-            except httpx.RequestError as e:
-                logger.warning("OPA request failed: %s", e)
-                return False, f"OPA unavailable: {e}"
-
-    async def ready(self) -> None:
-        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
-            try:
-                response = await _request_with_retries(
-                    client,
-                    "GET",
-                    f"{self._opa_url}/health",
-                    breaker=_opa_breaker,
-                )
-            except httpx.RequestError as exc:
-                raise HTTPException(
-                    status_code=503, detail=f"opa unavailable: {exc}"
-                ) from exc
-        if response.status_code >= 400:
-            raise HTTPException(
-                status_code=503, detail=f"opa unhealthy: {response.status_code}"
-            )
-
-
-class AllowAllPolicyEvaluator(PolicyEvaluator):
-    async def allow(self, input_payload: dict) -> tuple[bool, str | None]:
-        return True, None
-
-
-class ContainerRuntime:
-    def create_network(self, scenario_id: str) -> str:
-        raise NotImplementedError
-
-    def launch_containers(
-        self, scenario_id: str, network_id: str, template: dict
-    ) -> list[str]:
-        raise NotImplementedError
-
-    def cleanup(self, scenario_id: str) -> None:
-        raise NotImplementedError
-
-
-class DockerContainerRuntime(ContainerRuntime):
-    def __init__(self) -> None:
-        self._client: docker.DockerClient | None = None
-
-    def _get_client(self) -> docker.DockerClient:
-        if self._client is None:
-            self._client = docker.from_env()
-        return self._client
-
-    def create_network(self, scenario_id: str) -> str:
-        client = self._get_client()
-        network_name = f"{NETWORK_PREFIX}{scenario_id}"
-
-        network = client.networks.create(
-            name=network_name,
-            driver="bridge",
-            internal=True,
-            labels={
-                "forge.scenario_id": scenario_id,
-                "forge.created_at": datetime.now(timezone.utc).isoformat(),
-                "forge.managed": "true",
-            },
-        )
-        logger.info("Created network %s for scenario %s", network_name, scenario_id)
-        return network.id
-
-    def launch_containers(
-        self, scenario_id: str, network_id: str, template: dict
-    ) -> list[str]:
-        client = self._get_client()
-        container_ids = []
-
-        assets = template.get("assets", {})
-        containers_spec = assets.get("containers", [])
-
-        for container_spec in containers_spec:
-            name = container_spec.get("name", f"container-{uuid.uuid4().hex[:8]}")
-            image = container_spec.get("image", "alpine:3.19")
-            read_only = container_spec.get("read_only", True)
-            environment = container_spec.get("environment", {})
-
-            container_name = f"forge_{scenario_id}_{name}"
-
-            try:
-                container = client.containers.run(
-                    image=image,
-                    name=container_name,
-                    detach=True,
-                    read_only=read_only,
-                    environment=environment,
-                    network=network_id,
-                    labels={
-                        "forge.scenario_id": scenario_id,
-                        "forge.container_name": name,
-                        "forge.managed": "true",
-                    },
-                    cap_drop=["ALL"],
-                    security_opt=["no-new-privileges:true"],
-                    mem_limit="512m",
-                    cpu_quota=50000,
-                    command="sleep infinity" if "alpine" in image else None,
-                )
-                container_ids.append(container.id)
-            except docker.errors.ImageNotFound:
-                logger.warning("Image %s not found, pulling...", image)
-                client.images.pull(image)
-                container = client.containers.run(
-                    image=image,
-                    name=container_name,
-                    detach=True,
-                    read_only=read_only,
-                    environment=environment,
-                    network=network_id,
-                    labels={
-                        "forge.scenario_id": scenario_id,
-                        "forge.container_name": name,
-                        "forge.managed": "true",
-                    },
-                    cap_drop=["ALL"],
-                    security_opt=["no-new-privileges:true"],
-                    mem_limit="512m",
-                    cpu_quota=50000,
-                    command="sleep infinity" if "alpine" in image else None,
-                )
-                container_ids.append(container.id)
-            except docker.errors.APIError as e:
-                logger.error("Failed to launch container %s: %s", name, e)
-                raise
-
-        return container_ids
-
-    def cleanup(self, scenario_id: str) -> None:
-        client = self._get_client()
-        containers = client.containers.list(
-            all=True, filters={"label": f"forge.scenario_id={scenario_id}"}
-        )
-        for container in containers:
-            try:
-                container.stop(timeout=5)
-                container.remove(force=True)
-                logger.info("Removed container %s", container.name)
-            except docker.errors.APIError as e:
-                logger.warning("Failed to remove container %s: %s", container.name, e)
-
-        networks = client.networks.list(
-            filters={"label": f"forge.scenario_id={scenario_id}"}
-        )
-        for network in networks:
-            try:
-                network.remove()
-                logger.info("Removed network %s", network.name)
-            except docker.errors.APIError as e:
-                logger.warning("Failed to remove network %s: %s", network.name, e)
-
-
-class StubContainerRuntime(ContainerRuntime):
-    def create_network(self, scenario_id: str) -> str:
-        return f"stub-network-{scenario_id}"
-
-    def launch_containers(
-        self, scenario_id: str, network_id: str, template: dict
-    ) -> list[str]:
-        return [f"stub-container-{scenario_id}"]
-
-    def cleanup(self, scenario_id: str) -> None:
-        return None
-
-
-class Storage:
-    def audit_path(self, scenario_id: str) -> Path:
-        raise NotImplementedError
-
-
-class FileSystemStorage(Storage):
-    def __init__(self, root: Path) -> None:
-        self._root = root
-
-    def audit_path(self, scenario_id: str) -> Path:
-        return self._root / "scenarios" / scenario_id / "results" / "audit.jsonl"
-
-
-class EventBus:
-    async def start(self, app: FastAPI) -> None:
-        return None
-
-    async def stop(self) -> None:
-        return None
-
-    async def publish(self, subject: str, payload: dict) -> None:
-        return None
-
-
-class MemoryEventBus(EventBus):
-    async def publish(self, subject: str, payload: dict) -> None:
-        logger.debug("MemoryEventBus publish %s", subject)
-
-
-class NatsEventBus(EventBus):
-    def __init__(self, nats_url: str) -> None:
-        self._nats_url = nats_url
-        self._task: asyncio.Task | None = None
-        self._nc: nats.NATS | None = None
-        self._js: Any = None
-
-    async def publish(self, subject: str, payload: dict) -> None:
-        if self._js is None:
-            return
-        await self._js.publish(subject, json.dumps(payload).encode())
-
-    async def start(self, app: FastAPI) -> None:
-        self._task = asyncio.create_task(self._subscriber(app))
-
-    async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
-        if self._nc:
-            await self._nc.close()
-
-    async def _subscriber(self, app: FastAPI) -> None:
-        try:
-            self._nc = await nats.connect(self._nats_url)
-            self._js = self._nc.jetstream()
-
-            try:
-                await self._js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
-            except Exception:
-                pass
-
-            consumer_config = ConsumerConfig(
-                durable_name="orchestrator",
-                deliver_policy=DeliverPolicy.ALL,
-                ack_wait=30,
-            )
-
-            await self._js.subscribe(
-                "spawn.request",
-                cb=lambda msg: process_spawn_request(app, msg),
-                config=consumer_config,
-            )
-            logger.info("Subscribed to spawn.request")
-
-            while True:
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error("NATS subscriber error: %s", e)
-
-
-class ScoreboardClient:
-    async def get_ready(self) -> httpx.Response:
-        raise NotImplementedError
-
-    async def post_score(
-        self, scenario_id: str, payload: dict, headers: dict
-    ) -> httpx.Response:
-        raise NotImplementedError
-
-
-class HttpScoreboardClient(ScoreboardClient):
-    def __init__(
-        self, base_url: str, transport: httpx.BaseTransport | None = None
-    ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._transport = transport
-
-    async def get_ready(self) -> httpx.Response:
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=_httpx_timeout(),
-            transport=self._transport,
-        ) as client:
-            return await _request_with_retries(
-                client, "GET", "/readyz", breaker=_scoreboard_breaker
-            )
-
-    async def post_score(
-        self, scenario_id: str, payload: dict, headers: dict
-    ) -> httpx.Response:
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=_httpx_timeout(),
-            transport=self._transport,
-        ) as client:
-            return await _request_with_retries(
-                client,
-                "POST",
-                f"/internal/scenario/{scenario_id}/score",
-                json_body=payload,
-                headers=headers,
-                breaker=_scoreboard_breaker,
-            )
-
-
-"""Runtime dependencies are stored on app.state."""
-
-
-def _forge_env() -> str:
-    return os.getenv("FORGE_ENV", "dev").lower()
-
-
-def _enforce_startup_config() -> None:
-    env = _forge_env()
-    if env not in {"dev", "development"}:
-        required = [
-            "SAT_HMAC_SECRET",
-            "ET_HMAC_SECRET",
-            "RECEIPT_HMAC_SECRET",
-            "OPERATOR_TOKEN",
-        ]
-        missing = [name for name in required if not os.getenv(name)]
-        if missing:
-            raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
-
-
-def _policy_dir() -> Path:
-    return Path(os.getenv("OPA_POLICY_DIR", "/policies"))
-
-
-def _compute_policy_hash() -> tuple[str, int]:
-    policy_root = _policy_dir()
-    files = [
-        path
-        for path in policy_root.rglob("*.rego")
-        if path.is_file()
-    ]
-    files.sort(key=lambda path: path.relative_to(policy_root).as_posix())
-    hasher = hashlib.sha256()
-    for path in files:
-        rel = path.relative_to(policy_root).as_posix()
-        hasher.update(rel.encode("utf-8"))
-        hasher.update(b"\n")
-        hasher.update(path.read_bytes())
-        hasher.update(b"\n")
-    return hasher.hexdigest(), len(files)
-
-
-def _enforce_policy_hash() -> None:
-    digest, count = _compute_policy_hash()
-    logger.info("OPA policy hash=%s files=%s", digest, count)
-    expected = os.getenv("OPA_POLICY_HASH")
-    if expected:
-        if count == 0:
-            raise RuntimeError("OPA policy hash enforcement failed: no policies found")
-        if digest != expected:
-            raise RuntimeError("OPA policy hash enforcement failed: hash mismatch")
 
+def cfg_unit_tests() -> bool:
+    return os.getenv("UNIT_TESTS") == "1"
 
+
+def cfg_template_dir() -> Path:
+    return Path(os.getenv("TEMPLATE_DIR", "/templates"))
+
+
+def cfg_opa_url() -> str:
+    return os.getenv("OPA_URL", "http://forge_opa:8181")
+
+
+def cfg_nats_url() -> str:
+    return os.getenv("NATS_URL", "nats://forge_nats:4222")
+
+
+def cfg_scoreboard_url() -> str:
+    return os.getenv("SCOREBOARD_URL", "http://forge_scoreboard:8080")
+
+
+def cfg_storage_root() -> Path:
+    return Path(os.getenv("STORAGE_ROOT", "storage"))
+
+
+def cfg_scoreboard_asgi_import() -> str:
+    return os.getenv("SCOREBOARD_ASGI_IMPORT", "services.scoreboard.app.main:app")
+
+
+def cfg_http_max_retries() -> int:
+    return int(os.getenv("HTTP_MAX_RETRIES", "2"))
+
+
+def cfg_http_retry_base_delay() -> float:
+    return float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+
+
+def cfg_http_retry_jitter() -> float:
+    return float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+
+def cfg_circuit_breaker_cooldown() -> float:
+    return float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 class ScenarioStatus(str, Enum):
     PENDING = "pending"
     CREATING = "creating"
@@ -533,21 +186,24 @@ class SatClaims(BaseModel):
     scenario_id: Optional[str] = None
 
 
+# -----------------------------------------------------------------------------
+# Replay protection (redis optional)
+# -----------------------------------------------------------------------------
 class ReplayProtector:
     def __init__(self) -> None:
-        self._redis_url = os.getenv("REDIS_URL")
         self._redis_client: Any | None = None
         self._cache: OrderedDict[str, int] = OrderedDict()
         self._max_size = int(os.getenv("SAT_REPLAY_CACHE_SIZE", "10000"))
         self._lock = asyncio.Lock()
 
     async def _get_redis(self) -> Any | None:
-        if not self._redis_url:
+        # REDIS_URL may be overridden in tests, so re-read env if client not created.
+        if not os.getenv("REDIS_URL"):
             return None
         if self._redis_client is None:
             import redis.asyncio as redis
 
-            self._redis_client = redis.from_url(self._redis_url, decode_responses=True)
+            self._redis_client = redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
         return self._redis_client
 
     def _purge_expired(self, now: int) -> None:
@@ -582,8 +238,19 @@ class ReplayProtector:
             return True
 
 
-"""Runtime state stored on app.state."""
+replay_protector = ReplayProtector()
 
+# -----------------------------------------------------------------------------
+# State (in-memory; consider redis/db for multi-replica prod)
+# -----------------------------------------------------------------------------
+scenarios: dict[str, ScenarioState] = {}
+
+# -----------------------------------------------------------------------------
+# Clients
+# -----------------------------------------------------------------------------
+docker_client: docker.DockerClient | None = None
+nc: nats.NATS | None = None
+js: Any = None
 
 
 class CircuitBreaker:
@@ -627,19 +294,15 @@ async def _request_with_retries(
 ) -> httpx.Response:
     if breaker and breaker.is_open():
         raise httpx.RequestError(f"{breaker.name} circuit breaker open")
-    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
-    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
-    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+    max_attempts = cfg_http_max_retries() + 1
+    base_delay = cfg_http_retry_base_delay()
+    jitter = cfg_http_retry_jitter()
     last_exc: Exception | None = None
 
     for attempt in range(max_attempts):
         try:
-            response = await client.request(
-                method,
-                url,
-                json=json_body,
-                headers=headers,
-            )
+            response = await client.request(method, url, json=json_body, headers=headers)
             if response.status_code >= 500:
                 raise httpx.RequestError(f"upstream {response.status_code}")
             if breaker:
@@ -651,33 +314,86 @@ async def _request_with_retries(
                 breaker.record_failure()
             if attempt >= max_attempts - 1:
                 break
-            delay = base_delay + random.uniform(0, jitter)
-            await _sleep(delay)
+            await _sleep(base_delay + random.uniform(0, jitter))
+
     raise httpx.RequestError("request failed") from last_exc
 
 
-_opa_breaker = CircuitBreaker(
-    "opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
-)
-_scoreboard_breaker = CircuitBreaker(
-    "scoreboard", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
-)
-_egress_breaker = CircuitBreaker(
-    "egress_gateway", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
-)
+_opa_breaker = CircuitBreaker("opa", cfg_circuit_breaker_cooldown())
+_scoreboard_breaker = CircuitBreaker("scoreboard", cfg_circuit_breaker_cooldown())
+_egress_breaker = CircuitBreaker("egress_gateway", cfg_circuit_breaker_cooldown())
 
 
 
 
-def load_template(track: str, template_dir: Path) -> dict:
+def _import_from_path(import_path: str) -> Any:
+    """Import "module.sub:attr" and return attr."""
+    if ":" not in import_path:
+        raise ValueError("import path must be like 'pkg.mod:attr'")
+    mod_name, attr_name = import_path.split(":", 1)
+    mod = importlib.import_module(mod_name)
+    try:
+        return getattr(mod, attr_name)
+    except AttributeError as exc:
+        raise ImportError(f"Attribute '{attr_name}' not found in '{mod_name}'") from exc
+
+
+def _scoreboard_client() -> httpx.AsyncClient:
+    """In UNIT_TESTS=1, run scoreboard in-process via ASGITransport; otherwise use SCOREBOARD_URL."""
+    if cfg_unit_tests():
+        try:
+            from httpx import ASGITransport  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("httpx.ASGITransport unavailable; upgrade httpx") from exc
+
+        import_path = cfg_scoreboard_asgi_import()
+        try:
+            asgi_app = _import_from_path(import_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to import SCOREBOARD_ASGI_IMPORT={import_path}: {exc}") from exc
+
+        return httpx.AsyncClient(
+            transport=ASGITransport(app=asgi_app),
+            base_url="http://scoreboard",
+            timeout=_httpx_timeout(),
+        )
+
+    return httpx.AsyncClient(base_url=cfg_scoreboard_url(), timeout=_httpx_timeout())
+
+
+# -----------------------------------------------------------------------------
+# Template
+# -----------------------------------------------------------------------------
+def load_template(track: str) -> dict:
     """Load scenario template from filesystem."""
-    template_path = template_dir / f"{track}.yaml"
-    if not template_path.exists():
-        raise HTTPException(status_code=404, detail=f"Template not found: {track}")
-    with template_path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    template_dir = cfg_template_dir()
+    candidates: list[Path] = []
+    name = track
+
+    if name.endswith((".yaml", ".yml")):
+        candidates.append(template_dir / name)
+    else:
+        candidates.append(template_dir / f"{name}.yaml")
+        candidates.append(template_dir / f"{name}.yml")
+
+    for p in candidates:
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+
+    if cfg_unit_tests():
+        return {
+            "id": track,
+            "track": track,
+            "assets": {"containers": [{"name": "trainer", "image": "alpine:3.19", "read_only": True, "environment": {}}]},
+        }
+
+    raise HTTPException(status_code=404, detail=f"Template not found: {track}")
 
 
+# -----------------------------------------------------------------------------
+# SAT utilities
+# -----------------------------------------------------------------------------
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
@@ -685,6 +401,13 @@ def _b64url_encode(data: bytes) -> str:
 def _b64url_decode(data: str) -> bytes:
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
+
+
+def _warn_sat_secret_alias() -> None:
+    global _sat_secret_warning_emitted
+    if not _sat_secret_warning_emitted:
+        logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
+        _sat_secret_warning_emitted = True
 
 
 def _get_sat_secret() -> str:
@@ -698,13 +421,6 @@ def _get_sat_secret() -> str:
     raise HTTPException(status_code=500, detail="SAT secret not configured")
 
 
-def _warn_sat_secret_alias() -> None:
-    global _sat_secret_warning_emitted
-    if not _sat_secret_warning_emitted:
-        logger.warning("SAT_SECRET is deprecated; set SAT_HMAC_SECRET instead")
-        _sat_secret_warning_emitted = True
-
-
 def _parse_bearer_token(value: str) -> Optional[str]:
     if not value:
         return None
@@ -712,81 +428,6 @@ def _parse_bearer_token(value: str) -> Optional[str]:
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None
-
-
-def _require_internal_auth(request: Request) -> None:
-    expected = os.getenv("ORCHESTRATOR_INTERNAL_TOKEN")
-    if not expected:
-        logger.error("ORCHESTRATOR_INTERNAL_TOKEN not configured")
-        raise HTTPException(status_code=500, detail="internal auth not configured")
-    token = request.headers.get("x-internal-token", "")
-    if not token or not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="internal auth required")
-
-
-def _require_operator_auth(request: Request) -> None:
-    expected = os.getenv("OPERATOR_TOKEN")
-    if not expected:
-        logger.error("OPERATOR_TOKEN not configured")
-        raise HTTPException(status_code=500, detail="operator auth not configured")
-    token = request.headers.get("x-operator-token", "")
-    if not token or not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="operator auth required")
-
-
-def _get_scoreboard_client(app: FastAPI) -> ScoreboardClient:
-    return app.state.scoreboard_client
-
-
-def _normalize_plan(tier: str | None) -> str | None:
-    if not tier:
-        return None
-    return tier.upper()
-
-
-def _build_opa_input(template: dict, claims: SatClaims) -> dict:
-    payload = dict(template)
-    payload["plan"] = _normalize_plan(claims.tier)
-    payload["retention_days"] = claims.retention_days
-    payload["subject"] = claims.subject
-    payload["tenant_id"] = claims.tenant_id
-    return payload
-
-
-async def _trigger_scoreboard(
-    scenario_id: str,
-    track: str,
-    completion_reason: str,
-    completed_at: datetime,
-    subject: str | None,
-    tenant_id: str | None,
-    tier: str | None,
-    retention_days: int | None,
-    correlation_id: str | None,
-    app: FastAPI,
-) -> None:
-    token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
-    if not token:
-        raise RuntimeError("SCOREBOARD_INTERNAL_TOKEN not configured")
-    payload = {
-        "scenario_id": scenario_id,
-        "track": track,
-        "completion_reason": completion_reason,
-        "completed_at": completed_at.isoformat(),
-        "subject": subject,
-        "tenant_id": tenant_id,
-        "plan": tier,
-        "retention_days": retention_days,
-    }
-    headers = {"x-internal-token": token}
-    if correlation_id:
-        headers["x-request-id"] = correlation_id
-    client = _get_scoreboard_client(app)
-    response = await client.post_score(scenario_id, payload, headers)
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"scoreboard error {response.status_code}: {response.text}"
-        )
 
 
 def verify_sat(token: str) -> SatClaims:
@@ -804,9 +445,7 @@ def verify_sat(token: str) -> SatClaims:
         raise HTTPException(status_code=401, detail="invalid sat")
 
     signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    expected_signature = hmac.new(
-        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
-    ).digest()
+    expected_signature = hmac.new(_get_sat_secret().encode("utf-8"), signing_input, "sha256").digest()
     expected_encoded = _b64url_encode(expected_signature)
     if not hmac.compare_digest(expected_encoded, signature_encoded):
         raise HTTPException(status_code=401, detail="invalid sat")
@@ -833,12 +472,14 @@ async def enforce_sat(
     template_id: str | None,
     tier: str | None,
 ) -> SatClaims:
+    """Validate SAT, enforce constraints, prevent replay."""
     if not token:
         raise HTTPException(status_code=401, detail="sat required")
 
     claims = verify_sat(token)
     if not claims.subject or not claims.tenant_id:
         raise HTTPException(status_code=401, detail="sat missing subject or tenant")
+
     if scenario_id and claims.scenario_id and claims.scenario_id != scenario_id:
         raise HTTPException(status_code=403, detail="sat scenario mismatch")
     if track and claims.track != track:
@@ -857,15 +498,113 @@ async def enforce_sat(
     return claims
 
 
-async def check_opa_policy(
-    app: FastAPI, input_payload: dict
-) -> tuple[bool, str | None]:
-    """Query policy evaluator for decision."""
-    return await app.state.policy_evaluator.allow(input_payload)
+async def _call_enforce_sat(
+    app_obj: Any,
+    token: str | None,
+    scenario_id: str | None,
+    track: str | None,
+    template_id: str | None,
+    tier: str | None,
+) -> SatClaims:
+    sig = inspect.signature(enforce_sat)
+    params = list(sig.parameters.values())
+    names = {p.name for p in params}
+
+    kwargs: dict[str, Any] = {}
+    if "app" in names:
+        kwargs["app"] = app_obj
+    if "token" in names:
+        kwargs["token"] = token
+    if "scenario_id" in names:
+        kwargs["scenario_id"] = scenario_id
+    if "track" in names:
+        kwargs["track"] = track
+    if "template_id" in names:
+        kwargs["template_id"] = template_id
+    elif "template" in names:
+        kwargs["template"] = template_id
+    if "tier" in names:
+        kwargs["tier"] = tier
+
+    try:
+        return await enforce_sat(**kwargs)  # type: ignore[misc]
+    except TypeError:
+        arity = len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
+        if arity >= 6:
+            return await enforce_sat(app_obj, token, scenario_id, track, template_id, tier)  # type: ignore[misc]
+        return await enforce_sat(token, scenario_id, track, template_id, tier)  # type: ignore[misc]
 
 
-async def _check_opa_ready(app: FastAPI) -> None:
-    await app.state.policy_evaluator.ready()
+# -----------------------------------------------------------------------------
+# Internal auth
+# -----------------------------------------------------------------------------
+def _require_internal_auth(request: Request) -> None:
+    expected = os.getenv("ORCHESTRATOR_INTERNAL_TOKEN")
+    if not expected:
+        logger.error("ORCHESTRATOR_INTERNAL_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="internal auth not configured")
+    token = request.headers.get("x-internal-token", "")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="internal auth required")
+
+
+def _require_operator_auth(request: Request) -> None:
+    expected = os.getenv("OPERATOR_TOKEN")
+    if not expected:
+        logger.error("OPERATOR_TOKEN not configured")
+        raise HTTPException(status_code=500, detail="operator auth not configured")
+    token = request.headers.get("x-operator-token", "")
+    if not token or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="operator auth required")
+
+
+# -----------------------------------------------------------------------------
+# OPA + scoreboard
+# -----------------------------------------------------------------------------
+def _normalize_plan(tier: str | None) -> str | None:
+    if not tier:
+        return None
+    return tier.upper()
+
+
+def _build_opa_input(template: dict, claims: SatClaims) -> dict:
+    payload = dict(template)
+    payload["plan"] = _normalize_plan(claims.tier)
+    payload["retention_days"] = claims.retention_days
+    payload["subject"] = claims.subject
+    payload["tenant_id"] = claims.tenant_id
+    return payload
+
+
+async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
+    """Query OPA for policy decision."""
+    if cfg_unit_tests():
+        return True, None
+
+    opa_url = cfg_opa_url()
+    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+        try:
+            response = await _request_with_retries(
+                client,
+                "POST",
+                f"{opa_url}/v1/data/frostgate/forge/training/allow",
+                json_body={"input": input_payload},
+                breaker=_opa_breaker,
+            )
+            if response.status_code >= 400:
+                return False, f"OPA error: {response.status_code}"
+
+
+
+async def _check_opa_ready() -> None:
+    opa_url = cfg_opa_url()
+    async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
+        try:
+            response = await _request_with_retries(client, "GET", f"{opa_url}/health", breaker=_opa_breaker)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=503, detail=f"opa unavailable: {exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=503, detail=f"opa unhealthy: {response.status_code}")
 
 
 def _read_only_required() -> bool:
@@ -899,29 +638,72 @@ async def _check_egress_gateway() -> None:
     if expected is None:
         forge_env = os.getenv("FORGE_ENV", "dev").lower()
         expected = "true" if forge_env == "dev" else "false"
+
     async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
-            response = await _request_with_retries(
-                client, "GET", f"{egress_url}/readyz", breaker=_egress_breaker
-            )
+            response = await _request_with_retries(client, "GET", f"{egress_url}/readyz", breaker=_egress_breaker)
         except httpx.RequestError as exc:
-            raise HTTPException(
-                status_code=503, detail=f"egress gateway unavailable: {exc}"
-            ) from exc
+            raise HTTPException(status_code=503, detail=f"egress gateway unavailable: {exc}") from exc
+
     if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
-        )
+        raise HTTPException(status_code=503, detail=f"egress gateway unhealthy: {response.status_code}")
+
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(
-            status_code=503, detail="egress gateway invalid response"
-        ) from exc
+        raise HTTPException(status_code=503, detail="egress gateway invalid response") from exc
+
     if str(payload.get("dry_run", "")).lower() != expected.lower():
         raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
 
+async def _trigger_scoreboard(
+    scenario_id: str,
+    track: str,
+    completion_reason: str,
+    completed_at: datetime,
+    subject: str | None,
+    tenant_id: str | None,
+    tier: str | None,
+    retention_days: int | None,
+    correlation_id: str | None,
+) -> None:
+    token = os.getenv("SCOREBOARD_INTERNAL_TOKEN")
+    if not token and cfg_unit_tests():
+        token = "test-scoreboard"
+    if not token:
+        raise RuntimeError("SCOREBOARD_INTERNAL_TOKEN not configured")
+
+    payload = {
+        "scenario_id": scenario_id,
+        "track": track,
+        "completion_reason": completion_reason,
+        "completed_at": completed_at.isoformat(),
+        "subject": subject,
+        "tenant_id": tenant_id,
+        "plan": tier,
+        "retention_days": retention_days,
+    }
+    headers = {"x-internal-token": token}
+    if correlation_id:
+        headers["x-request-id"] = correlation_id
+
+    async with _scoreboard_client() as client:
+        response = await _request_with_retries(
+            client,
+            "POST",
+            f"/internal/scenario/{scenario_id}/score",
+            json_body=payload,
+            headers=headers,
+            breaker=_scoreboard_breaker,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"scoreboard error {response.status_code}: {response.text}")
+
+
+# -----------------------------------------------------------------------------
+# Audit chain
+# -----------------------------------------------------------------------------
 def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -932,8 +714,8 @@ def _audit_payload(entry: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _audit_path(app: FastAPI, scenario_id: str) -> Path:
-    return app.state.storage.audit_path(scenario_id)
+def _audit_path(scenario_id: str) -> Path:
+    return cfg_storage_root() / "scenarios" / scenario_id / "results" / "audit.jsonl"
 
 
 def append_audit_event(
@@ -946,6 +728,7 @@ def append_audit_event(
 ) -> None:
     audit_path = _audit_path(app, scenario_id)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
+
     prev_hash = "0" * 64
     if audit_path.exists():
         last_line = ""
@@ -957,6 +740,7 @@ def append_audit_event(
                 prev_hash = json.loads(last_line).get("entry_hash", prev_hash)
             except json.JSONDecodeError:
                 prev_hash = "0" * 64
+
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "scenario_id": scenario_id,
@@ -967,38 +751,115 @@ def append_audit_event(
         "prev_hash": prev_hash,
     }
     entry["entry_hash"] = _hash_bytes(_audit_payload(entry))
+
     with audit_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
 
 
-def create_scenario_network(app: FastAPI, scenario_id: str) -> str:
-    """Create isolated network for scenario."""
-    return app.state.container_runtime.create_network(scenario_id)
-
-
-def launch_scenario_containers(
-    app: FastAPI, scenario_id: str, network_id: str, template: dict
-) -> list[str]:
-    """Launch containers defined in scenario template."""
-    return app.state.container_runtime.launch_containers(
-        scenario_id, network_id, template
+# -----------------------------------------------------------------------------
+# Docker orchestration
+# -----------------------------------------------------------------------------
+def create_scenario_network(scenario_id: str) -> str:
+    client = get_docker_client()
+    network_name = f"{NETWORK_PREFIX}{scenario_id}"
+    network = client.networks.create(
+        name=network_name,
+        driver="bridge",
+        internal=True,
+        labels={
+            "forge.scenario_id": scenario_id,
+            "forge.created_at": datetime.now(timezone.utc).isoformat(),
+            "forge.managed": "true",
+        },
     )
+    logger.info("Created network %s for scenario %s", network_name, scenario_id)
+    return network.id
 
 
-def cleanup_scenario(app: FastAPI, scenario_id: str) -> None:
-    """Remove all resources associated with a scenario."""
-    app.state.container_runtime.cleanup(scenario_id)
+def launch_scenario_containers(scenario_id: str, network_id: str, template: dict) -> list[str]:
+    client = get_docker_client()
+    container_ids: list[str] = []
+
+    assets = template.get("assets", {})
+    containers_spec = assets.get("containers", [])
+
+    for container_spec in containers_spec:
+        name = container_spec.get("name", f"container-{uuid.uuid4().hex[:8]}")
+        image = container_spec.get("image", "alpine:3.19")
+        read_only = container_spec.get("read_only", True)
+        environment = container_spec.get("environment", {})
+
+        container_name = f"forge_{scenario_id}_{name}"
+
+        def _run() -> docker.models.containers.Container:
+            return client.containers.run(
+                image=image,
+                name=container_name,
+                detach=True,
+                read_only=read_only,
+                environment=environment,
+                network=network_id,
+                labels={
+                    "forge.scenario_id": scenario_id,
+                    "forge.container_name": name,
+                    "forge.managed": "true",
+                },
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                mem_limit="512m",
+                cpu_quota=50000,
+                command="sleep infinity" if "alpine" in image else None,
+            )
+
+        try:
+            container = _run()
+            container_ids.append(container.id)
+            logger.info("Launched container %s (%s) for scenario %s", container_name, image, scenario_id)
+        except docker.errors.ImageNotFound:
+            logger.warning("Image %s not found, pulling...", image)
+            client.images.pull(image)
+            container = _run()
+            container_ids.append(container.id)
+        except docker.errors.APIError as e:
+            logger.error("Failed to launch container %s: %s", name, e)
+            raise
+
+    return container_ids
 
 
+def cleanup_scenario(scenario_id: str) -> None:
+    client = get_docker_client()
+
+    containers = client.containers.list(all=True, filters={"label": f"forge.scenario_id={scenario_id}"})
+    for container in containers:
+        try:
+            container.stop(timeout=5)
+            container.remove(force=True)
+            logger.info("Removed container %s", container.name)
+        except docker.errors.APIError as e:
+            logger.warning("Failed to remove container %s: %s", container.name, e)
+
+    networks = client.networks.list(filters={"label": f"forge.scenario_id={scenario_id}"})
+    for network in networks:
+        try:
+            network.remove()
+            logger.info("Removed network %s", network.name)
+        except docker.errors.APIError as e:
+            logger.warning("Failed to remove network %s: %s", network.name, e)
+
+
+# -----------------------------------------------------------------------------
+# Scenario completion
+# -----------------------------------------------------------------------------
 async def complete_scenario(
     scenario_id: str,
     completion_reason: str,
-    app: FastAPI,
     completion_timestamp: datetime | None = None,
 ) -> ScenarioState:
     scenarios = app.state.scenarios
     if scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
+
     state = scenarios[scenario_id]
     completed_at = completion_timestamp or datetime.now(timezone.utc)
     state.completed_at = completed_at
@@ -1019,11 +880,7 @@ async def complete_scenario(
             event_type="scenario.complete",
             actor="operator",
             correlation_id=request_id_ctx.get(),
-            details={
-                "reason": completion_reason,
-                "subject": state.subject,
-                "tenant_id": state.tenant_id,
-            },
+            details={"reason": completion_reason, "subject": state.subject, "tenant_id": state.tenant_id},
         )
         await _trigger_scoreboard(
             scenario_id,
@@ -1041,61 +898,58 @@ async def complete_scenario(
     except Exception as exc:
         state.status = ScenarioStatus.COMPLETED_WITH_ERRORS
         state.error = str(exc)
-        logger.error(
-            "Scenario %s scoring failed: %s",
-            scenario_id,
-            exc,
-        )
+        logger.error("Scenario %s scoring failed: %s", scenario_id, exc)
         raise HTTPException(status_code=502, detail=f"scoring failed: {exc}") from exc
 
     return state
 
 
-async def process_spawn_request(app: FastAPI, msg: Any) -> None:
+# -----------------------------------------------------------------------------
+# NATS spawn consumer
+# -----------------------------------------------------------------------------
+async def process_spawn_request(msg: Any) -> None:
     """Process incoming spawn request from NATS."""
     try:
-        import json
+        data = json.loads(msg.data.decode("utf-8"))
 
-        data = json.loads(msg.data.decode())
         scenario_id = data.get("scenario_id")
         track = data.get("track")
         request_id = data.get("request_id")
         tier = data.get("tier")
         sat = data.get("sat")
+        correlation_id = data.get("correlation_id") or request_id or "-"
 
         if not scenario_id or not track or not tier:
             logger.warning("Spawn request missing scenario_id, track, or tier")
             await msg.ack()
             return
 
+        # NOTE: process_spawn_request runs outside request context, so request_id_ctx may be "-"
+        request_id_ctx.set(correlation_id)
+
         try:
-            claims = await enforce_sat(app, sat, scenario_id, track, track, tier)
+            template_id = data.get("template_id") or track
+            # app object isn't required for our enforce_sat signature, but keep adapter anyway.
+            claims = await _call_enforce_sat(None, sat, scenario_id, track, template_id, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
             await msg.ack()
             return
-        correlation_id = data.get("correlation_id") or request_id or "-"
+        except Exception as exc:
+            logger.exception("Error processing spawn request: %s", exc)
+            await msg.ack()
+            return
 
-        logger.info(
-            "Processing spawn request: scenario_id=%s track=%s request_id=%s",
-            scenario_id,
-            track,
-            request_id,
-        )
+        logger.info("Processing spawn request: scenario_id=%s track=%s request_id=%s", scenario_id, track, request_id)
 
-        # Load and validate template
-        template = load_template(track, app.state.config.template_dir)
+        template = load_template(track)
 
-        # Check OPA policy
-        allowed, reason = await check_opa_policy(
-            app, _build_opa_input(template, claims)
-        )
+        allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
         if not allowed:
             logger.warning("Scenario %s denied by policy: %s", scenario_id, reason)
             await msg.ack()
             return
 
-        # Create scenario state
         state = ScenarioState(
             scenario_id=scenario_id,
             request_id=request_id,
@@ -1108,6 +962,7 @@ async def process_spawn_request(app: FastAPI, msg: Any) -> None:
         )
         scenarios = app.state.scenarios
         scenarios[scenario_id] = state
+
         append_audit_event(
             app,
             scenario_id=scenario_id,
@@ -1117,75 +972,105 @@ async def process_spawn_request(app: FastAPI, msg: Any) -> None:
             details={"track": track, "tenant_id": claims.tenant_id},
         )
 
-        runtime = app.state.container_runtime
-        event_bus = app.state.event_bus
-
-        # Create network
-        network_id = create_scenario_network(app, scenario_id)
+        network_id = create_scenario_network(scenario_id)
         state.network_id = network_id
 
-        # Launch containers
-        container_ids = launch_scenario_containers(
-            app, scenario_id, network_id, template
-        )
+        container_ids = launch_scenario_containers(scenario_id, network_id, template)
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
         state.updated_at = datetime.now(timezone.utc)
 
-        logger.info(
-            "Scenario %s is now running with %d containers",
-            scenario_id,
-            len(container_ids),
-        )
+        logger.info("Scenario %s is now running with %d containers", scenario_id, len(container_ids))
 
-        # Publish scenario.created event
-        if event_bus:
-            await event_bus.publish(
+        if js:
+            await js.publish(
                 "scenario.created",
-                {
-                    "scenario_id": scenario_id,
-                    "track": track,
-                    "network_id": network_id,
-                    "containers": container_ids,
-                },
+                json.dumps(
+                    {"scenario_id": scenario_id, "track": track, "network_id": network_id, "containers": container_ids}
+                ).encode("utf-8"),
             )
 
         await msg.ack()
 
     except Exception as e:
         logger.exception("Error processing spawn request: %s", e)
-        if msg:
+        try:
             await msg.nak()
+        except Exception:
+            pass
 
 
+async def nats_subscriber() -> None:
+    """Subscribe to NATS spawn requests."""
+    global nc, js
+
+    try:
+        nc = await nats.connect(cfg_nats_url())
+        js = nc.jetstream()
+
+        try:
+            await js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
+        except Exception:
+            pass
+
+        consumer_config = ConsumerConfig(durable_name="orchestrator", deliver_policy=DeliverPolicy.ALL, ack_wait=30)
+        await js.subscribe("spawn.request", cb=process_spawn_request, config=consumer_config)
+        logger.info("Subscribed to spawn.request")
+
+        while True:
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.error("NATS subscriber error: %s", e)
+
+
+# -----------------------------------------------------------------------------
+# FastAPI lifecycle + factory (ONE app, created after routes exist)
+# -----------------------------------------------------------------------------
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    _enforce_startup_config()
-    _enforce_policy_hash()
+async def lifespan(app_: FastAPI):
+    global scenarios
+
+    app_.state.scenarios = scenarios
+
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias()
-    event_bus = app.state.event_bus
-    await event_bus.start(app)
+
+    task = asyncio.create_task(nats_subscriber())
     logger.info("Orchestrator started")
-    yield
-    await event_bus.stop()
-    logger.info("Orchestrator stopped")
+    try:
+        yield
+    finally:
+        task.cancel()
+        if nc:
+            await nc.close()
+        logger.info("Orchestrator stopped")
 
 
-async def add_request_id(request: Request, call_next):
-    request_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-correlation-id")
-        or str(uuid.uuid4())
-    )
-    token = request_id_ctx.set(request_id)
-    response = await call_next(request)
-    request_id_ctx.reset(token)
-    response.headers["x-request-id"] = request_id
-    return response
+def create_app() -> FastAPI:
+    app_ = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
+
+    @app_.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or str(uuid.uuid4())
+        token = request_id_ctx.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_ctx.reset(token)
+        response.headers["x-request-id"] = rid
+        return response
+
+    # Mount routers (this fixes your 404/401 mess)
+    app_.include_router(router)
+    app_.include_router(internal_router)
+
+    return app_
 
 
+# -----------------------------------------------------------------------------
+# Public routes
+# -----------------------------------------------------------------------------
 @router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_orchestrator"}
@@ -1197,52 +1082,40 @@ def healthz() -> dict:
 
 
 @router.get("/readyz")
-async def readyz(request: Request) -> dict:
+async def readyz() -> dict:
     _check_read_only_fs()
     await _check_egress_gateway()
-    await _check_opa_ready(request.app)
+    await _check_opa_ready()
+
     try:
-        client = _get_scoreboard_client(request.app)
-        response = await client.get_ready()
+        async with _scoreboard_client() as client:
+            response = await _request_with_retries(client, "GET", "/readyz", breaker=_scoreboard_breaker)
     except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=503, detail=f"scoreboard unavailable: {exc}"
-        ) from exc
+        raise HTTPException(status_code=503, detail=f"scoreboard unavailable: {exc}") from exc
+
     if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503,
-            detail=f"scoreboard unhealthy: {response.status_code}",
-        )
+        raise HTTPException(status_code=503, detail=f"scoreboard unhealthy: {response.status_code}")
+
     return {"status": "ready", "service": "forge_orchestrator"}
 
 
 @router.post("/v1/scenarios", response_model=CreateScenarioResponse)
-async def create_scenario(
-    request: CreateScenarioRequest, http_request: Request
-) -> CreateScenarioResponse:
+async def create_scenario(request: CreateScenarioRequest, http_request: Request) -> CreateScenarioResponse:
     """Create a new scenario (direct API, bypasses NATS)."""
     scenario_id = request.scenario_id
     track = request.template
-    token = http_request.headers.get("x-sat")
-    if not token:
-        token = _parse_bearer_token(http_request.headers.get("authorization", ""))
-    claims = await enforce_sat(
-        http_request.app, token, scenario_id, track, track, request.tier
-    )
 
-    # Check if already exists
-    scenarios = http_request.app.state.scenarios
-    if scenario_id in scenarios:
-        state = scenarios[scenario_id]
-        return CreateScenarioResponse(
-            scenario_id=scenario_id,
-            status=state.status,
-            network_id=state.network_id,
-        )
+    token = http_request.headers.get("x-sat") or _parse_bearer_token(http_request.headers.get("authorization", ""))
+    template_id = getattr(request, "template_id", None) or track
 
-    scenarios = app.state.scenarios
+    claims = await _call_enforce_sat(http_request.app, token, scenario_id, track, template_id, request.tier)
 
-    # Create scenario state
+    store: dict[str, ScenarioState] = http_request.app.state.scenarios
+
+    if scenario_id in store:
+        state = store[scenario_id]
+        return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=state.network_id)
+
     state = ScenarioState(
         scenario_id=scenario_id,
         request_id=request.request_id,
@@ -1253,7 +1126,9 @@ async def create_scenario(
         retention_days=claims.retention_days,
         status=ScenarioStatus.CREATING,
     )
+    store[scenario_id] = state
     scenarios[scenario_id] = state
+
     append_audit_event(
         http_request.app,
         scenario_id=scenario_id,
@@ -1263,28 +1138,22 @@ async def create_scenario(
         details={"track": track, "tenant_id": claims.tenant_id},
     )
 
-    # Load and validate template
-    template = load_template(track, http_request.app.state.config.template_dir)
+    template = load_template(track)
 
-    # Check OPA policy
-    allowed, reason = await check_opa_policy(
-        http_request.app, _build_opa_input(template, claims)
-    )
+    allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
     if not allowed:
         state.status = ScenarioStatus.FAILED
         state.error = reason
         raise HTTPException(status_code=403, detail=reason)
 
-    # Create network
     try:
         network_id = create_scenario_network(http_request.app, scenario_id)
         state.network_id = network_id
     except Exception as e:
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Network creation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Network creation failed: {e}") from e
 
-    # Launch containers
     try:
         container_ids = launch_scenario_containers(
             http_request.app, scenario_id, network_id, template
@@ -1296,45 +1165,41 @@ async def create_scenario(
         cleanup_scenario(http_request.app, scenario_id)
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Container launch failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Container launch failed: {e}") from e
 
-    return CreateScenarioResponse(
-        scenario_id=scenario_id,
-        status=state.status,
-        network_id=network_id,
-    )
+    return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=network_id)
 
 
 @router.get("/v1/scenarios/{scenario_id}")
 async def get_scenario(scenario_id: str, request: Request) -> ScenarioState:
-    """Get scenario status."""
-    scenarios = request.app.state.scenarios
-    if scenario_id not in scenarios:
+    store: dict[str, ScenarioState] = request.app.state.scenarios
+    if scenario_id not in store:
         raise HTTPException(status_code=404, detail="Scenario not found")
-    return scenarios[scenario_id]
+    return store[scenario_id]
 
 
 @router.delete("/v1/scenarios/{scenario_id}")
 async def delete_scenario(scenario_id: str, request: Request) -> dict:
-    """Delete a scenario and cleanup resources."""
-    scenarios = request.app.state.scenarios
-    if scenario_id not in scenarios:
+    store: dict[str, ScenarioState] = request.app.state.scenarios
+    if scenario_id not in store:
         raise HTTPException(status_code=404, detail="Scenario not found")
-
-    cleanup_scenario(request.app, scenario_id)
-    del scenarios[scenario_id]
-
+    cleanup_scenario(scenario_id)
+    del store[scenario_id]
+    scenarios.pop(scenario_id, None)
     return {"status": "deleted", "scenario_id": scenario_id}
 
 
 @router.get("/v1/scenarios")
 async def list_scenarios(request: Request) -> list[ScenarioState]:
-    """List all scenarios."""
-    scenarios = request.app.state.scenarios
-    return list(scenarios.values())
+    store: dict[str, ScenarioState] = request.app.state.scenarios
+    return list(store.values())
 
 
-@router.post("/internal/scenario/{scenario_id}/complete")
+# -----------------------------------------------------------------------------
+# Internal routes (keep both legacy and plural endpoints)
+# -----------------------------------------------------------------------------
+@internal_router.post("/scenario/{scenario_id}/complete")
+@internal_router.post("/scenarios/{scenario_id}/complete")
 async def complete_scenario_endpoint(
     scenario_id: str,
     payload: ScenarioCompletionRequest,
@@ -1342,63 +1207,10 @@ async def complete_scenario_endpoint(
 ) -> ScenarioState:
     _require_internal_auth(request)
     _require_operator_auth(request)
-    return await complete_scenario(
-        scenario_id,
-        payload.completion_reason,
-        request.app,
-        payload.completion_timestamp,
-    )
+    return await complete_scenario(scenario_id, payload.completion_reason, payload.completion_timestamp)
 
 
-def _build_policy_evaluator(config: OrchestratorConfig) -> PolicyEvaluator:
-    if config.policy_backend == "allow_all":
-        return AllowAllPolicyEvaluator()
-    return OpaPolicyEvaluator(config.opa_url)
-
-
-def _build_container_runtime(config: OrchestratorConfig) -> ContainerRuntime:
-    if config.container_backend == "stub":
-        return StubContainerRuntime()
-    return DockerContainerRuntime()
-
-
-def _build_storage(config: OrchestratorConfig) -> Storage:
-    return FileSystemStorage(config.storage_root)
-
-
-def _build_event_bus(config: OrchestratorConfig) -> EventBus:
-    if config.event_bus_backend == "memory":
-        return MemoryEventBus()
-    return NatsEventBus(config.nats_url)
-
-
-def _build_scoreboard_client(config: OrchestratorConfig) -> ScoreboardClient:
-    if config.scoreboard_app is not None:
-        transport = httpx.ASGITransport(app=config.scoreboard_app)
-        return HttpScoreboardClient("http://scoreboard", transport=transport)
-    return HttpScoreboardClient(config.scoreboard_url)
-
-
-def create_app(config: OrchestratorConfig) -> FastAPI:
-    policy_evaluator = _build_policy_evaluator(config)
-    container_runtime = _build_container_runtime(config)
-    storage = _build_storage(config)
-    event_bus = _build_event_bus(config)
-    scoreboard_client = _build_scoreboard_client(config)
-
-    app = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
-    app.state.config = config
-    app.state.policy_evaluator = policy_evaluator
-    app.state.container_runtime = container_runtime
-    app.state.storage = storage
-    app.state.event_bus = event_bus
-    app.state.scoreboard_client = scoreboard_client
-    app.state.scenarios = {}
-    app.state.replay_protector = ReplayProtector()
-
-    app.middleware("http")(add_request_id)
-    app.include_router(router)
-    return app
-
-
-app = create_app(OrchestratorConfig.from_env())
+# -----------------------------------------------------------------------------
+# Module-level ASGI app (used by uvicorn + tests)
+# -----------------------------------------------------------------------------
+app = create_app()
