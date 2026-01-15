@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import traceback
 
 import base64
@@ -18,13 +19,14 @@ from typing import Dict, Optional, Tuple
 
 import requests
 import yaml
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
-from contextlib import asynccontextmanager
+
 # -------------------------------------------------------------------
 # Import entitlements in a way that survives BOTH:
 # 1) normal package import: services.spawn_service.app.main
-# 2) dumb test loader: spec_from_file_location(main.py) (no package context)
+# 2) test loader: spec_from_file_location(main.py) (no package context)
 # -------------------------------------------------------------------
 try:
     from .entitlements import (
@@ -38,8 +40,6 @@ try:
 except ImportError:
     import sys
 
-    # Make "app.*" importable when this file is loaded as a standalone module.
-    # __file__ = .../services/spawn_service/app/main.py
     spawn_service_root = Path(__file__).resolve().parent.parent  # .../services/spawn_service
     if str(spawn_service_root) not in sys.path:
         sys.path.insert(0, str(spawn_service_root))
@@ -54,6 +54,14 @@ except ImportError:
     )
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
+logger = logging.getLogger("forge_spawn_service")
+
+_warned_sat_secret_alias = False
+_fallback_warning_emitted = False
+
+# ACCESS TOKEN SECRET: keep dev fallback stable per process, warn once
+_warned_access_token_secret = False
+_dev_access_token_secret: str | None = None
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -81,34 +89,45 @@ def configure_logging() -> None:
 configure_logging()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    yield
-    # shutdown
-
-app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
-
-logger = logging.getLogger("forge_spawn_service")
-
-_warned_sat_secret_alias = False
-
-
-@app.middleware("http")
-async def dump_exceptions(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
-        raise
-
-
 def _forge_env() -> str:
     return os.getenv("FORGE_ENV", "dev").lower()
 
 
-_sat_secret_warning_emitted = False
-_fallback_warning_emitted = False
+def _get_access_token_secret() -> str:
+    """
+    Return token secret if configured.
+    - In dev/development: generate an ephemeral secret if missing (stable per-process).
+    - In non-dev: return empty string (callers enforce).
+    """
+    global _warned_access_token_secret, _dev_access_token_secret
+
+    secret = os.getenv("ACCESS_TOKEN_SECRET", "").strip()
+    if secret:
+        return secret
+
+    if _forge_env() in {"dev", "development"}:
+        # Tests expect this path to be allowed.
+        if _dev_access_token_secret is None:
+            _dev_access_token_secret = uuid.uuid4().hex
+        if not _warned_access_token_secret:
+            logger.warning("ACCESS_TOKEN_SECRET not set; using ephemeral dev secret")
+            _warned_access_token_secret = True
+        return _dev_access_token_secret
+
+    # non-dev: fail closed at enforcement points, not at import-time
+    return ""
+
+
+def _require_access_token_secret() -> str:
+    secret = _get_access_token_secret()
+    if secret:
+        return secret
+    raise HTTPException(status_code=500, detail="ACCESS_TOKEN_SECRET not configured")
+
+
+# One module-level secret used by signing/verification paths.
+# In non-dev it can be "", but those codepaths should not be reachable without enforcement.
+_TOKEN_SECRET = _get_access_token_secret()
 
 # Ensure this symbol exists deterministically for request handlers/tests.
 entitlement_resolver = EntitlementResolver()
@@ -119,6 +138,13 @@ TRACK_TEMPLATE = {
     "ccna": "ccna.yaml",
     "cissp": "cissp.yaml",
 }
+
+ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
+CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
+TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
+
+TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
+REQUEST_CACHE: Dict[str, dict] = {}
 
 
 @dataclass(frozen=True)
@@ -151,29 +177,26 @@ PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
     ),
 }
 
-TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
-REQUEST_CACHE: Dict[str, dict] = {}
-CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
-TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
-ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
-_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
-if not _TOKEN_SECRET:
-    forge_env = os.getenv("FORGE_ENV", "dev").lower()
-    if forge_env in {"dev", "development"}:
-        _TOKEN_SECRET = uuid.uuid4().hex
-        logger.warning("ACCESS_TOKEN_SECRET not set; generated ephemeral secret")
-    else:
-        raise RuntimeError("ACCESS_TOKEN_SECRET not configured")
 
-
-def _forge_env() -> str:
-    return os.getenv("FORGE_ENV", "dev").lower()
+def _warn_sat_secret_alias_once() -> None:
+    global _warned_sat_secret_alias
+    if _warned_sat_secret_alias:
+        return
+    _warned_sat_secret_alias = True
+    logger.warning("SAT_SECRET is deprecated; use SAT_HMAC_SECRET instead")
 
 
 def _enforce_startup_config() -> None:
+    """
+    Guardrails:
+    - non-dev must have secrets
+    - staging/prod must not enable dev escape hatches
+    """
     env = _forge_env()
+
     if env not in {"dev", "development"}:
         required = [
+            "ACCESS_TOKEN_SECRET",
             "SAT_HMAC_SECRET",
             "ET_HMAC_SECRET",
             "RECEIPT_HMAC_SECRET",
@@ -182,6 +205,7 @@ def _enforce_startup_config() -> None:
         missing = [name for name in required if not os.getenv(name)]
         if missing:
             raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
+
     if env in {"staging", "prod", "production"}:
         if os.getenv("DEV_ALLOW_XPLAN", "false").lower() == "true":
             raise RuntimeError("DEV_ALLOW_XPLAN is not allowed in staging/prod")
@@ -189,14 +213,26 @@ def _enforce_startup_config() -> None:
             raise RuntimeError("ALLOW_FREE_DEFAULT is not allowed in staging/prod")
 
 
-@app.on_event("startup")
-def warn_deprecated_sat_secret() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
     _enforce_startup_config()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias_once()
     yield
-    # --- shutdown ---
-    return
+    # shutdown
+
+
+app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def dump_exceptions(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
+        raise
 
 
 @app.middleware("http")
@@ -221,18 +257,9 @@ def _b64url_decode(data: str) -> bytes:
     padding = "=" * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
 
-_warned_sat_secret_alias = False
-
 
 def _warn_sat_secret_alias() -> None:
-    # Warn only once per process to avoid log spam in high-traffic paths.
-    global _warned_sat_secret_alias
-    if _warned_sat_secret_alias:
-        return
-    _warned_sat_secret_alias = True
-    logging.getLogger("forge_spawn_service").warning(
-        "SAT_SECRET is deprecated; use SAT_HMAC_SECRET instead"
-    )
+    _warn_sat_secret_alias_once()
 
 
 def _get_sat_secret() -> str:
@@ -246,14 +273,6 @@ def _get_sat_secret() -> str:
     raise HTTPException(status_code=500, detail="SAT secret not configured")
 
 
-def _warn_sat_secret_alias_once() -> None:
-    global _warned_sat_secret_alias
-    if _warned_sat_secret_alias:
-        return
-    _warned_sat_secret_alias = True
-    logger.warning("SAT_SECRET is deprecated; use SAT_HMAC_SECRET instead")
-
-
 def _sat_issued_at() -> int:
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -261,130 +280,6 @@ def _sat_issued_at() -> int:
 def _sat_expiration(issued_at: int) -> int:
     ttl_seconds = int(os.getenv("SAT_TTL_SECONDS", "300"))
     return issued_at + ttl_seconds
-
-
-def generate_access_token(payload: AccessTokenPayload) -> str:
-    payload_json = payload.model_dump_json()
-    payload_encoded = _b64url_encode(payload_json.encode("utf-8"))
-    signature = hmac.new(
-        _TOKEN_SECRET.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
-    ).digest()
-    signature_encoded = _b64url_encode(signature)
-    return f"{payload_encoded}.{signature_encoded}"
-
-
-def verify_access_token(token: str) -> AccessTokenPayload:
-    try:
-        payload_encoded, signature_encoded = token.split(".", 1)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail="invalid token") from exc
-
-    expected_signature = hmac.new(
-        _TOKEN_SECRET.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
-    ).digest()
-    expected_encoded = _b64url_encode(expected_signature)
-    if not hmac.compare_digest(expected_encoded, signature_encoded):
-        raise HTTPException(status_code=401, detail="invalid token")
-
-    try:
-        payload = AccessTokenPayload.model_validate(
-            json.loads(_b64url_decode(payload_encoded))
-        )
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="invalid token") from exc
-
-    expires_at = datetime.fromisoformat(payload.expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="token expired")
-
-    return payload
-
-
-def generate_sat(payload: SatClaims) -> str:
-    header = {"alg": "HS256", "typ": "SAT"}
-    header_encoded = _b64url_encode(json.dumps(header).encode("utf-8"))
-    payload_encoded = _b64url_encode(payload.model_dump_json().encode("utf-8"))
-    try:
-        header = json.loads(_b64url_decode(header_encoded))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=401, detail="invalid spawn authorization"
-        ) from exc
-
-    if header.get("alg") != "HS256" or header.get("typ") != "SAT":
-        raise HTTPException(status_code=401, detail="invalid spawn authorization")
-
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    signature = hmac.new(
-        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
-    ).digest()
-    signature_encoded = _b64url_encode(signature)
-    return f"{header_encoded}.{payload_encoded}.{signature_encoded}"
-
-
-def verify_sat(token: str) -> SatClaims:
-    try:
-        header_encoded, payload_encoded, signature_encoded = token.split(".", 2)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=401, detail="invalid spawn authorization"
-        ) from exc
-
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    expected_signature = hmac.new(
-        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
-    ).digest()
-    expected_encoded = _b64url_encode(expected_signature)
-    if not hmac.compare_digest(expected_encoded, signature_encoded):
-        raise HTTPException(status_code=401, detail="invalid spawn authorization")
-
-    try:
-        payload = SatClaims.model_validate(json.loads(_b64url_decode(payload_encoded)))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=401, detail="invalid spawn authorization"
-        ) from exc
-
-    now = int(datetime.now(timezone.utc).timestamp())
-    if payload.iat > payload.exp:
-        raise HTTPException(status_code=401, detail="invalid spawn authorization")
-    if payload.exp < now:
-        raise HTTPException(status_code=401, detail="spawn authorization expired")
-
-    return payload
-
-
-def parse_bearer_token(value: str) -> Optional[str]:
-    if not value:
-        return None
-    parts = value.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    return None
-
-
-def resolve_entitlements(tier: str) -> PlanEntitlements:
-    normalized = normalize_tier(tier)
-    entitlements = PLAN_ENTITLEMENTS.get(normalized)
-    if not entitlements:
-        raise HTTPException(status_code=403, detail="unknown tier")
-    return entitlements
-
-
-def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
-    sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
-    token = request.headers.get("x-sat")
-    if not token:
-        token = parse_bearer_token(request.headers.get("authorization", ""))
-
-    if not token:
-        if sat_required:
-            raise HTTPException(status_code=401, detail="spawn authorization required")
-        return None
-
-    return verify_sat(token)
 
 
 class SpawnRequest(BaseModel):
@@ -433,6 +328,127 @@ class SatClaims(BaseModel):
     scenario_id: Optional[str] = None
 
 
+def generate_access_token(payload: AccessTokenPayload) -> str:
+    secret = _require_access_token_secret()
+    payload_json = payload.model_dump_json()
+    payload_encoded = _b64url_encode(payload_json.encode("utf-8"))
+    signature = hmac.new(
+        secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+    ).digest()
+    signature_encoded = _b64url_encode(signature)
+    return f"{payload_encoded}.{signature_encoded}"
+
+
+def verify_access_token(token: str) -> AccessTokenPayload:
+    secret = _require_access_token_secret()
+    try:
+        payload_encoded, signature_encoded = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+
+    expected_signature = hmac.new(
+        secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid token")
+
+    try:
+        payload = AccessTokenPayload.model_validate(
+            json.loads(_b64url_decode(payload_encoded))
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+
+    expires_at = datetime.fromisoformat(payload.expires_at)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="token expired")
+
+    return payload
+
+
+def generate_sat(payload: SatClaims) -> str:
+    header = {"alg": "HS256", "typ": "SAT"}
+    header_encoded = _b64url_encode(json.dumps(header).encode("utf-8"))
+    payload_encoded = _b64url_encode(payload.model_dump_json().encode("utf-8"))
+
+    try:
+        parsed = json.loads(_b64url_decode(header_encoded))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    if parsed.get("alg") != "HS256" or parsed.get("typ") != "SAT":
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+
+    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    signature = hmac.new(
+        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
+    ).digest()
+    signature_encoded = _b64url_encode(signature)
+    return f"{header_encoded}.{payload_encoded}.{signature_encoded}"
+
+
+def verify_sat(token: str) -> SatClaims:
+    try:
+        header_encoded, payload_encoded, signature_encoded = token.split(".", 2)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    expected_signature = hmac.new(
+        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
+    ).digest()
+    expected_encoded = _b64url_encode(expected_signature)
+    if not hmac.compare_digest(expected_encoded, signature_encoded):
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+
+    try:
+        payload = SatClaims.model_validate(json.loads(_b64url_decode(payload_encoded)))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if payload.iat > payload.exp:
+        raise HTTPException(status_code=401, detail="invalid spawn authorization")
+    if payload.exp < now:
+        raise HTTPException(status_code=401, detail="spawn authorization expired")
+
+    return payload
+
+
+def parse_bearer_token(value: str) -> Optional[str]:
+    if not value:
+        return None
+    parts = value.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
+def resolve_entitlements(tier: str) -> PlanEntitlements:
+    normalized = normalize_tier(tier)
+    entitlements = PLAN_ENTITLEMENTS.get(normalized)
+    if not entitlements:
+        raise HTTPException(status_code=403, detail="unknown tier")
+    return entitlements
+
+
+def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
+    sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
+    token = request.headers.get("x-sat")
+    if not token:
+        token = parse_bearer_token(request.headers.get("authorization", ""))
+
+    if not token:
+        if sat_required:
+            raise HTTPException(status_code=401, detail="spawn authorization required")
+        return None
+
+    return verify_sat(token)
+
+
 class RateLimitState:
     def __init__(self, count: int, reset_at: float) -> None:
         self.count = count
@@ -452,7 +468,9 @@ class SpawnLimiter:
         global _fallback_warning_emitted
         if not self._redis_url:
             if not _fallback_warning_emitted:
-                logger.warning("REDIS_URL not set; using in-memory rate limits (dev only)")
+                logger.warning(
+                    "REDIS_URL not set; using in-memory rate limits (dev only)"
+                )
                 _fallback_warning_emitted = True
             return None
         if self._redis_client is None:
@@ -574,6 +592,7 @@ class CircuitBreaker:
         return self._name
 
 
+# Keep this as a module-level function (tests patch it).
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
@@ -594,6 +613,7 @@ def _request_with_retries(
 ) -> requests.Response:
     if breaker and breaker.is_open():
         raise HTTPException(status_code=503, detail=f"{breaker.name} circuit breaker open")
+
     connect_timeout, read_timeout = _timeout_config()
     timeout = (connect_timeout, read_timeout)
     max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
@@ -619,12 +639,11 @@ def _request_with_retries(
                 break
             delay = base_delay + random.uniform(0, jitter)
             _sleep(delay)
+
     raise requests.RequestException("request failed") from last_exc
 
 
-_opa_breaker = CircuitBreaker(
-    "opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
-)
+_opa_breaker = CircuitBreaker("opa", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10")))
 _orchestrator_breaker = CircuitBreaker(
     "orchestrator", float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
 )
@@ -722,6 +741,7 @@ def build_spawn_response(
     subject = resolve_subject_identifier(payload, request, sat_claims)
     tenant_id = resolve_tenant_identifier(request, sat_claims, subject)
     receipt_token = request.headers.get(ENTITLEMENT_RECEIPT_HEADER, "").strip() or None
+
     plan_override = request.headers.get("x-plan", "").strip()
     if plan_override:
         if os.getenv("DEV_ALLOW_XPLAN", "false").lower() != "true":
@@ -752,8 +772,10 @@ def build_spawn_response(
         retention_days=entitlement.retention_days,
     )
     et_claims = verify_et(et_token)
+
     tier = normalize_tier(et_claims["plan"])
     entitlements = resolve_entitlements(tier)
+
     if payload.tier and normalize_tier(payload.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and normalize_tier(sat_claims.tier) != tier:
@@ -761,8 +783,10 @@ def build_spawn_response(
     if sat_claims and sat_claims.retention_days is not None:
         if sat_claims.retention_days != et_claims["retention_days"]:
             raise HTTPException(status_code=403, detail="retention mismatch")
+
     if payload.track not in entitlements.allowed_tracks:
         raise HTTPException(status_code=403, detail="track not allowed for tier")
+
     spawn_limiter.check_rate_limit(subject, entitlements.max_spawns_per_minute)
 
     if request_id in REQUEST_CACHE:
@@ -774,6 +798,7 @@ def build_spawn_response(
             raise HTTPException(status_code=403, detail="entitlement mismatch")
         if cached_retention != et_claims["retention_days"]:
             raise HTTPException(status_code=403, detail="entitlement mismatch")
+
         issued_at = _sat_issued_at()
         sat_token = generate_sat(
             SatClaims(
@@ -799,6 +824,7 @@ def build_spawn_response(
     scenario_id = payload.scenario_id or f"scn-{uuid.uuid4().hex[:12]}"
     expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
     base_url = os.getenv("SPAWN_BASE_URL", "http://localhost:8082")
+
     token_payload = AccessTokenPayload(
         scenario_id=scenario_id,
         request_id=request_id,
@@ -807,6 +833,7 @@ def build_spawn_response(
     )
     access_token = generate_access_token(token_payload)
     access_url = f"{base_url}/v1/access/{scenario_id}?token={access_token}"
+
     issued_at = _sat_issued_at()
     sat_token = generate_sat(
         SatClaims(
@@ -836,6 +863,7 @@ def build_spawn_response(
     expires_at_dt = datetime.fromisoformat(expires_at)
     if expires_at_dt.tzinfo is None:
         expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
+
     spawn_limiter.check_concurrent(
         subject, scenario_id, expires_at_dt, entitlements.max_concurrent_scenarios
     )
@@ -887,8 +915,8 @@ def notify_orchestrator(
 def _read_only_required() -> bool:
     if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
         return True
-    forge_env = os.getenv("FORGE_ENV", "dev").lower()
-    return forge_env in {"staging", "prod", "production"}
+    env = _forge_env()
+    return env in {"staging", "prod", "production"}
 
 
 def _check_read_only_fs() -> None:
@@ -913,26 +941,17 @@ def _check_egress_gateway() -> None:
         return
     expected = os.getenv("EGRESS_DRY_RUN_EXPECTED")
     if expected is None:
-        forge_env = os.getenv("FORGE_ENV", "dev").lower()
-        expected = "true" if forge_env == "dev" else "false"
+        expected = "true" if _forge_env() == "dev" else "false"
     try:
-        response = _request_with_retries(
-            "GET", f"{egress_url}/readyz", breaker=_egress_breaker
-        )
+        response = _request_with_retries("GET", f"{egress_url}/readyz", breaker=_egress_breaker)
     except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=503, detail=f"egress gateway unavailable: {exc}"
-        ) from exc
+        raise HTTPException(status_code=503, detail=f"egress gateway unavailable: {exc}") from exc
     if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
-        )
+        raise HTTPException(status_code=503, detail=f"egress gateway unhealthy: {response.status_code}")
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(
-            status_code=503, detail="egress gateway invalid response"
-        ) from exc
+        raise HTTPException(status_code=503, detail="egress gateway invalid response") from exc
     if str(payload.get("dry_run", "")).lower() != expected.lower():
         raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
