@@ -56,7 +56,7 @@ services:
   forge_egress_gateway: { ports: [] }
   forge_llm_analyzer: { ports: [] }
 
-  # staging-only MinIO gate (probe shares MinIO network namespace, so 127.0.0.1:9000 is MinIO)
+  # staging-only MinIO readiness gate (shares MinIO network namespace)
   forge_minio_probe:
     image: curlimages/curl:8.5.0
     command: ["sh", "-lc", "sleep infinity"]
