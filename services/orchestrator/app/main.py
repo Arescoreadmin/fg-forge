@@ -34,6 +34,11 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
+
+def cfg_orch_backend() -> str:
+    return os.getenv("ORCH_BACKEND", "docker").lower()
+
+
 # -----------------------------------------------------------------------------
 # Routers (declare first; mount inside create_app())
 # -----------------------------------------------------------------------------
@@ -42,6 +47,7 @@ internal_router = APIRouter(prefix="/internal")
 
 # Request correlation id (used by logger + middleware)
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -70,6 +76,7 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("forge_orchestrator")
+
 
 # -----------------------------------------------------------------------------
 # Configuration (NO import-time freezing)
@@ -196,7 +203,6 @@ class ReplayProtector:
         self._lock = asyncio.Lock()
 
     async def _get_redis(self) -> Any | None:
-        # REDIS_URL may be overridden in tests, so re-read env if client not created.
         if not os.getenv("REDIS_URL"):
             return None
         if self._redis_client is None:
@@ -592,6 +598,7 @@ async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
                 json_body={"input": input_payload},
                 breaker=_opa_breaker,
             )
+
             if response.status_code >= 400:
                 return False, f"OPA error: {response.status_code}"
 
@@ -599,10 +606,16 @@ async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
             allowed = result.get("result", False)
             if not allowed:
                 return False, "Policy denied"
+
             return True, None
+
         except httpx.RequestError as e:
             logger.warning("OPA request failed: %s", e)
             return False, f"OPA unavailable: {e}"
+
+        except Exception:
+            logger.exception("orchestrator: unhandled error in OPA policy check")
+            raise
 
 
 async def _check_opa_ready() -> None:
@@ -929,12 +942,10 @@ async def process_spawn_request(msg: Any) -> None:
             await msg.ack()
             return
 
-        # NOTE: process_spawn_request runs outside request context, so request_id_ctx may be "-"
         request_id_ctx.set(correlation_id)
 
         try:
             template_id = data.get("template_id") or track
-            # app object isn't required for our enforce_sat signature, but keep adapter anyway.
             claims = await _call_enforce_sat(None, sat, scenario_id, track, template_id, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
@@ -1032,8 +1043,6 @@ async def nats_subscriber() -> None:
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
-    global scenarios
-
     app_.state.scenarios = scenarios
 
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
@@ -1064,10 +1073,8 @@ def create_app() -> FastAPI:
         response.headers["x-request-id"] = rid
         return response
 
-    # Mount routers (this fixes your 404/401 mess)
     app_.include_router(router)
     app_.include_router(internal_router)
-
     return app_
 
 
@@ -1115,10 +1122,12 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
 
     store: dict[str, ScenarioState] = http_request.app.state.scenarios
 
+    # Idempotency: if scenario already exists, return current state
     if scenario_id in store:
         state = store[scenario_id]
         return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=state.network_id)
 
+    # Create state once
     state = ScenarioState(
         scenario_id=scenario_id,
         request_id=request.request_id,
@@ -1137,17 +1146,70 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         event_type="scenario.create",
         actor=claims.subject,
         correlation_id=request_id_ctx.get(),
-        details={"track": track, "tenant_id": claims.tenant_id},
+        details={"track": track, "tenant_id": claims.tenant_id, "backend": cfg_orch_backend()},
     )
 
+    # Load template + OPA gate before launching anything
     template = load_template(track)
-
     allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
     if not allowed:
         state.status = ScenarioStatus.FAILED
         state.error = reason
         raise HTTPException(status_code=403, detail=reason)
 
+    # --- K8s backend (no docker.sock) ---
+    if cfg_orch_backend() == "k8s":
+        try:
+            # Optional components; only imported when backend is k8s.
+            from .k8s_adapter import K8sAdapter  # type: ignore
+            from .scenario_manifests import learner_pod_yaml  # type: ignore
+        except Exception as exc:
+            state.status = ScenarioStatus.FAILED
+            state.error = f"k8s backend not available: {exc}"
+            raise HTTPException(status_code=500, detail=state.error) from exc
+
+        k8s = K8sAdapter()
+        ns = scenario_id if scenario_id.startswith("scn-") else f"scn-{scenario_id}"
+
+        try:
+            k8s.create_namespace(ns, labels={"forge.scenario": "true", "scenario_id": scenario_id})
+
+            repo_root = Path(__file__).resolve().parents[3]
+            deny_path = repo_root / "infra" / "k8s" / "base" / "deny-all-networkpolicy.yaml"
+            k8s.apply_yaml(ns, deny_path.read_text(encoding="utf-8"))
+
+            k8s.apply_yaml(ns, learner_pod_yaml(scenario_id))
+            k8s.wait_pods_ready(ns, label_selector=f"scenario_id={scenario_id}", timeout_seconds=120)
+
+            state.network_id = f"k8s:{ns}"
+            state.status = ScenarioStatus.RUNNING
+            state.updated_at = datetime.now(timezone.utc)
+
+            append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.k8s.started",
+                actor=claims.subject,
+                correlation_id=request_id_ctx.get(),
+                details={"namespace": ns},
+            )
+
+            return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=state.network_id)
+
+        except Exception as e:
+            state.status = ScenarioStatus.FAILED
+            state.error = str(e)
+
+            append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.k8s.failed",
+                actor=claims.subject,
+                correlation_id=request_id_ctx.get(),
+                details={"namespace": ns, "error": str(e)},
+            )
+
+            raise HTTPException(status_code=500, detail=f"K8s scenario launch failed: {e}") from e
+
+    # --- Docker backend ---
     try:
         network_id = create_scenario_network(scenario_id)
         state.network_id = network_id
