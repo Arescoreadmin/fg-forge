@@ -1,0 +1,353 @@
+# compose.yml (optimized dev)
+# - No version key (compose v2 ignores it)
+# - Infra ports hidden by default (use profile infra-expose to publish)
+# - Safe anchors (string mounts, not list mounts)
+# - Fixed MinIO endpoint + console address
+
+x-service-defaults: &service_defaults
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+# IMPORTANT: anchor as a STRING, not a list (prevents nested-list volume errors)
+x-templates-mount: &templates_mount ./templates:/templates:ro
+
+services:
+  forge_spawn_service:
+    <<: *service_defaults
+    build:
+      context: ./services/spawn_service
+    image: forge_spawn_service:local
+    container_name: forge_spawn_service
+    environment:
+      FORGE_ENV: dev
+      BILLING_MODE: stub
+      SPAWN_BASE_URL: http://localhost:8082
+      REQUEST_ID_HEADER: x-request-id
+      TEMPLATE_DIR: /templates
+      OPA_URL: http://forge_opa:8181
+      NATS_URL: nats://forge_nats:4222
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
+    ports:
+      - "8082:8080"
+    volumes:
+      - *templates_mount
+    depends_on:
+      - forge_opa
+      - forge_nats
+
+  forge_orchestrator:
+    <<: *service_defaults
+    build:
+      context: ./services/orchestrator
+    image: forge_orchestrator:local
+    container_name: forge_orchestrator
+    environment:
+      FORGE_ENV: dev
+      TEMPLATE_DIR: /templates
+      OPA_URL: http://forge_opa:8181
+      NATS_URL: nats://forge_nats:4222
+      LOG_LEVEL: INFO
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
+    ports:
+      - "8083:8080"
+    volumes:
+      - *templates_mount
+    depends_on:
+      - forge_opa
+      - forge_nats
+
+  forge_worker_agent:
+    <<: *service_defaults
+    build:
+      context: ./services/worker_agent
+    image: forge_worker_agent:local
+    container_name: forge_worker_agent
+    environment:
+      FORGE_ENV: dev
+      TEMPLATE_DIR: /templates
+      NATS_URL: nats://forge_nats:4222
+      MINIO_ENDPOINT: forge_minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      MINIO_BUCKET: forge-evidence
+      LOG_LEVEL: INFO
+    ports:
+      - "8084:8080"
+    volumes:
+      - *templates_mount
+    depends_on:
+      - forge_nats
+      - forge_minio
+
+  forge_scoreboard:
+    <<: *service_defaults
+    build:
+      context: ./services/scoreboard
+    image: forge_scoreboard:local
+    container_name: forge_scoreboard
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      MINIO_ENDPOINT: forge_minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      MINIO_BUCKET: forge-evidence
+      LOG_LEVEL: INFO
+    ports:
+      - "8086:8080"
+    depends_on:
+      - forge_nats
+      - forge_minio
+
+  forge_observer_hub:
+    <<: *service_defaults
+    build:
+      context: ./services/observer_hub
+    image: forge_observer_hub:local
+    container_name: forge_observer_hub
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      LOKI_URL: http://forge_loki:3100
+      LOG_LEVEL: INFO
+    ports:
+      - "8085:8080"
+    depends_on:
+      - forge_nats
+      - forge_loki
+
+  forge_playbook_runner:
+    <<: *service_defaults
+    build:
+      context: ./services/playbook_runner
+    image: forge_playbook_runner:local
+    container_name: forge_playbook_runner
+    environment:
+      FORGE_ENV: dev
+      TEMPLATE_DIR: /templates
+      PLAYBOOK_DIR: /playbooks
+      LOG_LEVEL: INFO
+    ports:
+      - "8087:8080"
+    volumes:
+      - *templates_mount
+      - ./playbooks:/playbooks:ro
+
+  forge_metrics_tuner:
+    <<: *service_defaults
+    build:
+      context: ./services/metrics_tuner
+    image: forge_metrics_tuner:local
+    container_name: forge_metrics_tuner
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      REDIS_URL: redis://forge_redis:6379
+      DEFAULT_QUOTA_SCENARIOS: "10"
+      DEFAULT_QUOTA_WINDOW_HOURS: "24"
+      ABUSE_THRESHOLD_RATE: "5.0"
+      LOG_LEVEL: INFO
+    ports:
+      - "8088:8088"
+    depends_on:
+      - forge_nats
+      - forge_redis
+
+  forge_egress_gateway:
+    <<: *service_defaults
+    build:
+      context: ./services/egress_gateway
+    image: forge_egress_gateway:local
+    container_name: forge_egress_gateway
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      DRY_RUN: "true"
+      LOG_LEVEL: INFO
+    ports:
+      - "8089:8089"
+    depends_on:
+      - forge_nats
+
+  forge_llm_analyzer:
+    <<: *service_defaults
+    build:
+      context: ./services/llm_analyzer
+    image: forge_llm_analyzer:local
+    container_name: forge_llm_analyzer
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      OPA_URL: http://forge_opa:8181
+      REDIS_URL: redis://forge_redis:6379
+      CANARY_TIMEOUT_SECONDS: "30"
+      LOG_LEVEL: INFO
+    ports:
+      - "8090:8090"
+    depends_on:
+      - forge_nats
+      - forge_opa
+      - forge_redis
+
+  forge_overlay_sanitizer:
+    <<: *service_defaults
+    build:
+      context: ./services/overlay_sanitizer
+    image: forge_overlay_sanitizer:local
+    container_name: forge_overlay_sanitizer
+    environment:
+      FORGE_ENV: dev
+      NATS_URL: nats://forge_nats:4222
+      MINIO_ENDPOINT: forge_minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      MINIO_BUCKET: forge-evidence
+      SANITIZED_BUCKET: forge-sanitized
+      LOG_LEVEL: INFO
+    ports:
+      - "8091:8091"
+    depends_on:
+      - forge_nats
+      - forge_minio
+
+  # --- Infra (always runs, but NOT published unless profile infra-expose) ---
+
+  forge_opa:
+    <<: *service_defaults
+    image: openpolicyagent/opa:latest
+    container_name: forge_opa
+    command: ["run", "--server", "/policies"]
+    volumes:
+      - ./policies:/policies:ro
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_redis:
+    <<: *service_defaults
+    image: redis:7.2-alpine
+    container_name: forge_redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - ./storage/redis:/data
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_nats:
+    <<: *service_defaults
+    image: nats:2.10
+    container_name: forge_nats
+    command: ["-js", "-m", "8222"]
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_minio:
+    <<: *service_defaults
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: forge_minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-forgeadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
+    volumes:
+      - ./storage/minio:/data
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_loki:
+    <<: *service_defaults
+    image: grafana/loki:2.9.4
+    container_name: forge_loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_prometheus:
+    <<: *service_defaults
+    image: prom/prometheus:v2.49.1
+    container_name: forge_prometheus
+    volumes:
+      - ./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  forge_grafana:
+    <<: *service_defaults
+    image: grafana/grafana:10.3.1
+    container_name: forge_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-forgeadmin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-forgeadmin}
+    volumes:
+      - ./telemetry/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: []
+    profiles: ["infra", "infra-expose"]
+
+  # Host-published “overlay” services (only when infra-expose profile is used)
+  forge_opa_expose:
+    image: openpolicyagent/opa:latest
+    profiles: ["infra-expose"]
+    depends_on: ["forge_opa"]
+    network_mode: "service:forge_opa"
+    ports:
+      - "8181:8181"
+
+  forge_redis_expose:
+    image: redis:7.2-alpine
+    profiles: ["infra-expose"]
+    depends_on: ["forge_redis"]
+    network_mode: "service:forge_redis"
+    ports:
+      - "6379:6379"
+
+  forge_nats_expose:
+    image: nats:2.10
+    profiles: ["infra-expose"]
+    depends_on: ["forge_nats"]
+    network_mode: "service:forge_nats"
+    ports:
+      - "14222:4222"
+      - "18222:8222"
+
+  forge_minio_expose:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    profiles: ["infra-expose"]
+    depends_on: ["forge_minio"]
+    network_mode: "service:forge_minio"
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+
+  forge_loki_expose:
+    image: grafana/loki:2.9.4
+    profiles: ["infra-expose"]
+    depends_on: ["forge_loki"]
+    network_mode: "service:forge_loki"
+    ports:
+      - "3100:3100"
+
+  forge_prometheus_expose:
+    image: prom/prometheus:v2.49.1
+    profiles: ["infra-expose"]
+    depends_on: ["forge_prometheus"]
+    network_mode: "service:forge_prometheus"
+    ports:
+      - "9090:9090"
+
+  forge_grafana_expose:
+    image: grafana/grafana:10.3.1
+    profiles: ["infra-expose"]
+    depends_on: ["forge_grafana"]
+    network_mode: "service:forge_grafana"
+    ports:
+      - "3000:3000"
+
+networks:
+  default:
+    name: forge_platform
+    driver: bridge

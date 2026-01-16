@@ -1,11 +1,11 @@
-# compose.yml (dev base)
+# compose.yml (optimized dev base)
 # - No version key (compose v2 ignores it)
-# - Safe anchors (string mounts, not nested lists)
-# - Infra is writable; apps are read-only
-# - Healthchecks avoid assuming wget/curl in minimal images
-# - Designed to layer with compose.expose.yml + compose.staging.yml
+# - Infra runs by default (so depends_on is always valid)
+# - Infra ports are NOT published here (publish only via compose.expose.yml)
+# - Anchors are safe (string mounts, not nested lists)
+# - Fixes: duplicate keys, bad indentation, invalid YAML, storage perms, restart loops
 
-x-app-defaults: &app_defaults
+x-service-defaults: &service_defaults
   read_only: true
   tmpfs:
     - /tmp
@@ -17,24 +17,16 @@ x-app-defaults: &app_defaults
   networks:
     - default
 
-x-infra-defaults: &infra_defaults
-  read_only: false
-  security_opt:
-    - no-new-privileges:true
-  restart: unless-stopped
-  networks:
-    - default
-
 # IMPORTANT: anchor as a STRING (prevents nested-list volume errors)
 x-templates-mount: &templates_mount ./templates:/templates:ro
 
 services:
   # ----------------------------
-  # App services (dev publishes ports)
+  # App services (ports published for dev convenience)
   # ----------------------------
 
   forge_spawn_service:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/spawn_service
     image: forge_spawn_service:local
@@ -48,10 +40,10 @@ services:
       OPA_URL: http://forge_opa:8181
       NATS_URL: nats://forge_nats:4222
       SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
-    volumes:
-      - *templates_mount
     ports:
       - "8082:8080"
+    volumes:
+      - *templates_mount
     depends_on:
       forge_opa:
         condition: service_healthy
@@ -59,7 +51,7 @@ services:
         condition: service_healthy
 
   forge_orchestrator:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/orchestrator
     image: forge_orchestrator:local
@@ -72,18 +64,14 @@ services:
       SCOREBOARD_URL: http://forge_scoreboard:8080
       LOG_LEVEL: INFO
       SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
+      # ensure your internal endpoints work in dev (override in prod)
       ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:-dev-internal}
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:-dev-operator}
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:-dev-scoreboard}
-    networks:
-      default:
-        aliases:
-          - orchestrator
-          - orch
-    volumes:
-      - *templates_mount
     ports:
       - "8083:8080"
+    volumes:
+      - *templates_mount
     depends_on:
       forge_opa:
         condition: service_healthy
@@ -93,7 +81,7 @@ services:
         condition: service_healthy
 
   forge_worker_agent:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/worker_agent
     image: forge_worker_agent:local
@@ -107,29 +95,22 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
       MINIO_BUCKET: forge-evidence
       LOG_LEVEL: INFO
-    volumes:
-      - *templates_mount
     ports:
       - "8084:8080"
+    volumes:
+      - *templates_mount
     depends_on:
       forge_nats:
         condition: service_healthy
       forge_minio:
-        condition: service_started
-      forge_minio_probe:
         condition: service_healthy
 
   forge_scoreboard:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/scoreboard
     image: forge_scoreboard:local
     container_name: forge_scoreboard
-
-    # dev: avoid the “volume owned by root, app runs as uid 1000” pain
-    # staging/prod should NOT run as root; fix perms via initContainer/chown job instead.
-    user: "0:0"
-
     environment:
       FORGE_ENV: dev
       NATS_URL: nats://forge_nats:4222
@@ -139,43 +120,26 @@ services:
       MINIO_BUCKET: forge-evidence
       LOG_LEVEL: INFO
       STORAGE_ROOT: /app/storage
+      # if scoreboard needs an internal token, keep it consistent with orchestrator
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:-dev-scoreboard}
-
+    # read_only inherited; make storage writable via volume
     volumes:
       - forge_scoreboard_storage:/app/storage
-
-    networks:
-      default:
-        aliases:
-          - scoreboard
-
     ports:
       - "8086:8080"
-
     depends_on:
       forge_nats:
         condition: service_healthy
       forge_minio:
-        condition: service_started
-      forge_minio_probe:
         condition: service_healthy
-
-    # No wget/curl assumptions. Python is definitely present in your app image.
     healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2).read(); sys.exit(0)"
-        ]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 10
-      start_period: 10s
 
   forge_observer_hub:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/observer_hub
     image: forge_observer_hub:local
@@ -194,7 +158,7 @@ services:
         condition: service_healthy
 
   forge_playbook_runner:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/playbook_runner
     image: forge_playbook_runner:local
@@ -204,14 +168,14 @@ services:
       TEMPLATE_DIR: /templates
       PLAYBOOK_DIR: /playbooks
       LOG_LEVEL: INFO
+    ports:
+      - "8087:8080"
     volumes:
       - *templates_mount
       - ./playbooks:/playbooks:ro
-    ports:
-      - "8087:8080"
 
   forge_metrics_tuner:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/metrics_tuner
     image: forge_metrics_tuner:local
@@ -233,7 +197,7 @@ services:
         condition: service_healthy
 
   forge_egress_gateway:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/egress_gateway
     image: forge_egress_gateway:local
@@ -250,7 +214,7 @@ services:
         condition: service_healthy
 
   forge_llm_analyzer:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/llm_analyzer
     image: forge_llm_analyzer:local
@@ -273,7 +237,7 @@ services:
         condition: service_healthy
 
   forge_overlay_sanitizer:
-    <<: *app_defaults
+    <<: *service_defaults
     build:
       context: ./services/overlay_sanitizer
     image: forge_overlay_sanitizer:local
@@ -293,124 +257,85 @@ services:
       forge_nats:
         condition: service_healthy
       forge_minio:
-        condition: service_started
-      forge_minio_probe:
         condition: service_healthy
 
   # ----------------------------
-  # Infra services
+  # Infra (always runs; no published ports here)
   # ----------------------------
 
   forge_opa:
-    <<: *infra_defaults
+    <<: *service_defaults
     image: openpolicyagent/opa:1.12.3
     container_name: forge_opa
     command: ["run", "--server", "--addr", "0.0.0.0:8181", "/policies"]
     volumes:
       - ./policies:/policies:ro
     healthcheck:
-      # OPA image has /opa. Use that instead of curl/wget.
-      test: ["CMD", "/opa", "version"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8181/health >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 10
-      start_period: 5s
 
   forge_redis:
-    <<: *infra_defaults
+    # Redis must write to /data, so keep rootfs read-only but mount /data
+    <<: *service_defaults
     image: redis:7.2.4-alpine
     container_name: forge_redis
-    command:
-      [
-        "redis-server",
-        "--appendonly",
-        "yes",
-        "--maxmemory",
-        "256mb",
-        "--maxmemory-policy",
-        "allkeys-lru"
-      ]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - forge_redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 10
-      start_period: 5s
 
   forge_nats:
-    <<: *infra_defaults
-    image: nats:2.10-alpine
+    <<: *service_defaults
+    image: nats:2.10
     container_name: forge_nats
-    # JetStream enabled; store in /data. Avoid “unhealthy” flaps by giving it a start_period.
-    command: ["-js", "-sd", "/data", "-m", "8222"]
-    volumes:
-      - forge_nats_data:/data
+    command: ["-js", "-m", "8222"]
     healthcheck:
-      # Pragmatic dev choice: hits monitoring endpoint.
-      # If the image ever drops wget, add a probe sidecar like MinIO.
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/varz >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 10
-      start_period: 15s
 
   forge_minio:
-    <<: *infra_defaults
+    # MinIO needs write access to /data; bind mounts often break due to UID/GID mismatches.
+    # Use a named volume to stop permission wars.
+    <<: *service_defaults
     image: minio/minio:RELEASE.2024-01-16T16-07-38Z
     container_name: forge_minio
-    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      # In dev base we still allow defaults, but staging/prod should override via env-file.
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-forgeadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
-
-      # Optional hardening (dev-safe; staging/prod recommended behind reverse proxy)
-      MINIO_BROWSER: "off"
-      MINIO_PROMETHEUS_AUTH_TYPE: "public"
     volumes:
-      - forge_minio_data:/data
-    stop_grace_period: 30s
-    init: true
+      - ./storage/minio:/data
     healthcheck:
-      test: ["NONE"]
-
-  # Known-good health probe for MinIO (curl is guaranteed here)
-  forge_minio_probe:
-    image: curlimages/curl:8.5.0
-    container_name: forge_minio_probe
-    command: ["sh", "-lc", "sleep infinity"]
-    depends_on:
-      forge_minio:
-        condition: service_started
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://forge_minio:9000/minio/health/live >/dev/null || exit 1"]
-      interval: 5s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/minio/health/live >/dev/null 2>&1 || exit 1"]
+      interval: 10s
       timeout: 3s
-      retries: 60
-      start_period: 30s
-
-
-
+      retries: 10
 
   forge_loki:
-    <<: *infra_defaults
+    # Loki needs write access; mount /loki
+    <<: *service_defaults
     image: grafana/loki:2.9.4
     container_name: forge_loki
     command: ["-config.file=/etc/loki/local-config.yaml"]
     volumes:
       - forge_loki_data:/loki
-    # Don’t pretend we can reliably probe without knowing installed tools.
     healthcheck:
-      test: ["CMD", "true"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready >/dev/null 2>&1 || exit 1"]
       interval: 10s
-      timeout: 2s
-      retries: 3
+      timeout: 3s
+      retries: 10
 
   forge_prometheus:
-    <<: *infra_defaults
+    # Prometheus writes TSDB to /prometheus; mount it or it will eventually complain.
+    <<: *service_defaults
     image: prom/prometheus:v2.49.1
     container_name: forge_prometheus
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
@@ -419,7 +344,8 @@ services:
       - forge_prometheus_data:/prometheus
 
   forge_grafana:
-    <<: *infra_defaults
+    # Grafana writes sqlite + plugins; mount /var/lib/grafana.
+    <<: *service_defaults
     image: grafana/grafana:10.3.1
     container_name: forge_grafana
     environment:
@@ -436,7 +362,6 @@ volumes:
   forge_loki_data:
   forge_prometheus_data:
   forge_grafana_data:
-  forge_nats_data:
 
 networks:
   default:
