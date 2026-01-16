@@ -1,3 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${ENV_FILE:-.env.staging}"
+BASE="compose.yml"
+STAGING="compose.staging.yml"
+EXPOSE="compose.expose.yml"
+
+dc() {
+  docker compose --env-file "$ENV_FILE" -f "$BASE" -f "$STAGING" -f "$EXPOSE" "$@"
+}
+
+need_file() {
+  [[ -f "$1" ]] || { echo "Missing required file: $1" >&2; exit 1; }
+}
+
+cleanup_fix_container() {
+  docker ps -a --format '{{.Names}}' | grep -E 'forge_scoreboard_storage_fix' | xargs -r docker rm -f >/dev/null 2>&1 || true
+}
+
+echo "[1/8] Preflight checks"
+need_file "$ENV_FILE"
+need_file "$BASE"
+need_file "$EXPOSE"
+
+echo "[2/8] Writing ${STAGING}"
+cat > "$STAGING" <<'YAML'
 # compose.staging.yml
 # Staging overrides:
 # - Disable published app ports (compose.expose.yml controls exposure)
@@ -74,3 +101,34 @@ services:
 
 volumes:
   forge_scoreboard_storage: {}
+YAML
+
+echo "[3/8] Validating merged compose config"
+dc config >/dev/null
+
+echo "[4/8] Booting core deps (redis/nats/opa/minio)"
+dc up -d --remove-orphans forge_redis forge_nats forge_opa forge_minio
+
+echo "[5/8] Starting MinIO probe"
+dc up -d --force-recreate forge_minio_probe
+
+echo "[6/8] Fixing scoreboard storage perms (one-shot)"
+cleanup_fix_container
+dc up -d forge_scoreboard_storage_fix
+
+echo "[7/8] Starting scoreboard + orchestrator"
+dc up -d --force-recreate forge_scoreboard
+dc up -d forge_orchestrator
+
+echo "[8/8] Ready checks + status"
+echo
+echo "---- STATUS ----"
+dc ps forge_minio forge_minio_probe forge_scoreboard forge_orchestrator || true
+echo
+echo "---- READY CHECKS ----"
+curl -fsS http://localhost:8086/readyz && echo "  # scoreboard ready"
+curl -fsS http://localhost:8083/readyz && echo "  # orchestrator ready"
+echo
+
+cleanup_fix_container
+echo "Staging stack is up."
