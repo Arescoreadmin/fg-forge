@@ -1,9 +1,7 @@
 import asyncio
-import importlib.util
+import importlib
 import os
-import sys
 import unittest
-import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -14,28 +12,38 @@ from httpx import ASGITransport, AsyncClient
 def load_orchestrator_module():
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
-    module_path = repo_root / "services" / "orchestrator" / "app" / "main.py"
-    module_name = f"orchestrator_main_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if spec.loader is None:
-        raise RuntimeError("Failed to load orchestrator module")
-    spec.loader.exec_module(module)
-    return module
+    module = importlib.import_module("services.orchestrator.app.main")
+    return importlib.reload(module)
 
 
 class OrchestratorReadyzTests(unittest.TestCase):
     def test_readyz_fails_when_opa_unreachable(self):
         module = load_orchestrator_module()
+        config = module.OrchestratorConfig(
+            template_dir=Path(os.environ["TEMPLATE_DIR"]),
+            opa_url="http://unused",
+            nats_url="nats://memory",
+            scoreboard_url="http://scoreboard",
+            scoreboard_app=None,
+            storage_root=Path("storage"),
+            policy_backend="allow_all",
+            container_backend="stub",
+            event_bus_backend="memory",
+            storage_backend="fs",
+        )
+        app = module.create_app(config)
 
-        async def failing_opa():
-            raise module.HTTPException(status_code=503, detail="opa unavailable")
+        class FailingPolicy(module.PolicyEvaluator):
+            async def allow(self, input_payload: dict):
+                return False, "policy unavailable"
 
-        module._check_opa_ready = failing_opa
+            async def ready(self):
+                raise module.HTTPException(status_code=503, detail="opa unavailable")
+
+        app.state.policy_evaluator = FailingPolicy()
 
         async def run():
-            transport = ASGITransport(app=module.app)
+            transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://orch") as client:
                 response = await client.get("/readyz")
             return response
@@ -45,11 +53,19 @@ class OrchestratorReadyzTests(unittest.TestCase):
 
     def test_readyz_fails_when_scoreboard_unhealthy(self):
         module = load_orchestrator_module()
-
-        async def ok_opa():
-            return None
-
-        module._check_opa_ready = ok_opa
+        config = module.OrchestratorConfig(
+            template_dir=Path(os.environ["TEMPLATE_DIR"]),
+            opa_url="http://unused",
+            nats_url="nats://memory",
+            scoreboard_url="http://scoreboard",
+            scoreboard_app=None,
+            storage_root=Path("storage"),
+            policy_backend="allow_all",
+            container_backend="stub",
+            event_bus_backend="memory",
+            storage_backend="fs",
+        )
+        app = module.create_app(config)
 
         unhealthy_app = FastAPI()
 
@@ -58,14 +74,21 @@ class OrchestratorReadyzTests(unittest.TestCase):
 
         unhealthy_app.add_api_route("/readyz", _unhealthy_readyz, methods=["GET"])
 
-        def scoreboard_client():
-            transport = ASGITransport(app=unhealthy_app)
-            return AsyncClient(transport=transport, base_url="http://scoreboard")
+        class UnhealthyScoreboardClient(module.ScoreboardClient):
+            async def get_ready(self) -> httpx.Response:
+                transport = ASGITransport(app=unhealthy_app)
+                async with AsyncClient(
+                    transport=transport, base_url="http://scoreboard"
+                ) as client:
+                    return await client.get("/readyz")
 
-        module._scoreboard_client = scoreboard_client
+            async def post_score(self, scenario_id: str, payload: dict, headers: dict):
+                raise RuntimeError("not used")
+
+        app.state.scoreboard_client = UnhealthyScoreboardClient()
 
         async def run():
-            transport = ASGITransport(app=module.app)
+            transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://orch") as client:
                 response = await client.get("/readyz")
             return response

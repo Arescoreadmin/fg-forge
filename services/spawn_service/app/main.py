@@ -14,9 +14,11 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import httpx
 import requests
 import yaml
 from contextlib import asynccontextmanager
@@ -247,6 +249,14 @@ async def add_request_id(request: Request, call_next):
     request_id_ctx.reset(token)
     response.headers["x-request-id"] = request_id
     return response
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _enforce_startup_config()
+    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
+        _warn_sat_secret_alias()
+    yield
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -603,6 +613,51 @@ def _timeout_config() -> tuple[float, float]:
     return connect, read
 
 
+def _httpx_timeout() -> httpx.Timeout:
+    connect, read = _timeout_config()
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+async def _async_request_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> httpx.Response:
+    if breaker and breaker.is_open():
+        raise httpx.RequestError(f"{breaker.name} circuit breaker open")
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = await client.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+            )
+            if response.status_code >= 500:
+                raise httpx.RequestError(f"upstream {response.status_code}")
+            if breaker:
+                breaker.record_success()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            await asyncio.sleep(delay)
+    raise httpx.RequestError("request failed") from last_exc
+
+
 def _request_with_retries(
     method: str,
     url: str,
@@ -693,7 +748,7 @@ def record_billing(request_id: str, track: str) -> None:
 
 
 def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]:
-    header_name = os.getenv("REQUEST_ID_HEADER", "x-request-id")
+    header_name = request.app.state.config.request_id_header
     return payload.request_id or request.headers.get(header_name)
 
 
@@ -701,16 +756,19 @@ def resolve_subject_identifier(
     payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
 ) -> str:
     subject = payload.subject.strip() if payload.subject else ""
+    client_header = request.app.state.config.client_id_header
     if sat_claims:
         if subject and sat_claims.subject != subject:
             raise HTTPException(status_code=403, detail="subject mismatch")
         subject = sat_claims.subject
     if not subject:
-        subject = request.headers.get(CLIENT_ID_HEADER, "").strip()
+        subject = request.headers.get(client_header, "").strip()
     if not subject:
         raise HTTPException(
             status_code=403,
-            detail=f"subject identifier required (provide subject or {CLIENT_ID_HEADER})",
+            detail=(
+                f"subject identifier required (provide subject or {client_header})"
+            ),
         )
     return subject
 
@@ -957,7 +1015,7 @@ def _check_egress_gateway() -> None:
 
 
 def _check_opa_ready() -> None:
-    opa_url = os.getenv("OPA_URL")
+    opa_url = OPA_URL
     if not opa_url:
         if _forge_env() in {"dev", "development"}:
             return
@@ -970,17 +1028,17 @@ def _check_opa_ready() -> None:
         raise HTTPException(status_code=503, detail=f"opa unhealthy: {response.status_code}")
 
 
-@app.get("/health")
+@router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_spawn_service"}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "forge_spawn_service"}
 
 
-@app.get("/readyz")
+@router.get("/readyz")
 def readyz() -> dict:
     _check_read_only_fs()
     _check_egress_gateway()
@@ -988,23 +1046,23 @@ def readyz() -> dict:
     return {"status": "ready", "service": "forge_spawn_service"}
 
 
-@app.post("/v1/spawn", response_model=SpawnResponse)
-def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+@router.post("/v1/spawn", response_model=SpawnResponse)
+async def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
     response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
+    await notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 
-@app.post("/api/spawn", response_model=SpawnResponse)
-def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
+@router.post("/api/spawn", response_model=SpawnResponse)
+async def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
     sat_claims = enforce_spawn_authorization(request)
     response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
+    await notify_orchestrator(payload, response, request, entitlement.tier)
     return response
 
 
-@app.get("/v1/access/{scenario_id}")
+@router.get("/v1/access/{scenario_id}")
 def access_scenario(scenario_id: str, request: Request) -> dict:
     token = request.query_params.get("token") or request.headers.get("x-access-token")
     if not token:
@@ -1020,3 +1078,38 @@ def access_scenario(scenario_id: str, request: Request) -> dict:
         "track": payload.track,
         "expires_at": payload.expires_at,
     }
+
+
+def _build_orchestrator_notifier(
+    config: SpawnConfig,
+) -> OrchestratorNotifier | None:
+    if config.orchestrator_app is not None:
+        return InProcessOrchestratorNotifier(config.orchestrator_app)
+    if config.orchestrator_url:
+        return HttpOrchestratorNotifier(config.orchestrator_url)
+    return None
+
+
+def create_app(config: SpawnConfig) -> FastAPI:
+    global TEMPLATE_DIR, CLIENT_ID_HEADER, TENANT_ID_HEADER, ENTITLEMENT_RECEIPT_HEADER
+    global OPA_URL
+    global entitlement_resolver
+    TEMPLATE_DIR = config.template_dir
+    OPA_URL = config.opa_url
+    CLIENT_ID_HEADER = config.client_id_header
+    TENANT_ID_HEADER = config.tenant_id_header
+    ENTITLEMENT_RECEIPT_HEADER = config.entitlement_receipt_header
+
+    app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
+    app.state.config = config
+    entitlement_resolver = EntitlementResolver()
+    app.state.entitlement_resolver = entitlement_resolver
+    app.state.orchestrator_notifier = _build_orchestrator_notifier(config)
+
+    app.middleware("http")(add_request_id)
+    app.include_router(router)
+
+    return app
+
+
+app = create_app(SpawnConfig.from_env())

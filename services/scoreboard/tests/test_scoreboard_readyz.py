@@ -1,10 +1,8 @@
 import asyncio
-import importlib.util
+import importlib
 import os
-import sys
 import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -16,19 +14,13 @@ from httpx import ASGITransport, AsyncClient
 def load_scoreboard_module(storage_root: Path, signing_key_path: str | None):
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["STORAGE_ROOT"] = str(storage_root)
+    os.environ["SCOREBOARD_EVENT_BUS"] = "memory"
     if signing_key_path is None:
         os.environ.pop("SIGNING_KEY_PATH", None)
     else:
         os.environ["SIGNING_KEY_PATH"] = signing_key_path
-    module_path = repo_root / "services" / "scoreboard" / "app" / "main.py"
-    module_name = f"scoreboard_main_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if spec.loader is None:
-        raise RuntimeError("Failed to load scoreboard module")
-    spec.loader.exec_module(module)
-    return module
+    module = importlib.import_module("services.scoreboard.app.main")
+    return importlib.reload(module)
 
 
 def run_readyz(module):

@@ -21,6 +21,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -323,11 +324,6 @@ _scoreboard_breaker = CircuitBreaker("scoreboard", cfg_circuit_breaker_cooldown(
 _egress_breaker = CircuitBreaker("egress_gateway", cfg_circuit_breaker_cooldown())
 
 
-def get_docker_client() -> docker.DockerClient:
-    global docker_client
-    if docker_client is None:
-        docker_client = docker.from_env()
-    return docker_client
 
 
 def _import_from_path(import_path: str) -> Any:
@@ -469,6 +465,7 @@ def verify_sat(token: str) -> SatClaims:
 
 
 async def enforce_sat(
+    app: FastAPI,
     token: str | None,
     scenario_id: str | None,
     track: str | None,
@@ -492,7 +489,9 @@ async def enforce_sat(
     if tier and claims.tier != tier:
         raise HTTPException(status_code=403, detail="sat tier mismatch")
 
-    stored = await replay_protector.check_and_store(claims.jti, claims.exp)
+    stored = await app.state.replay_protector.check_and_store(
+        claims.jti, claims.exp
+    )
     if not stored:
         raise HTTPException(status_code=401, detail="sat replayed")
 
@@ -595,14 +594,6 @@ async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
             if response.status_code >= 400:
                 return False, f"OPA error: {response.status_code}"
 
-            result = response.json()
-            allowed = result.get("result", False)
-            if not allowed:
-                return False, "Policy denied"
-            return True, None
-        except httpx.RequestError as e:
-            logger.warning("OPA request failed: %s", e)
-            return False, f"OPA unavailable: {e}"
 
 
 async def _check_opa_ready() -> None:
@@ -728,13 +719,14 @@ def _audit_path(scenario_id: str) -> Path:
 
 
 def append_audit_event(
+    app: FastAPI,
     scenario_id: str,
     event_type: str,
     actor: str,
     correlation_id: str,
     details: dict[str, Any],
 ) -> None:
-    audit_path = _audit_path(scenario_id)
+    audit_path = _audit_path(app, scenario_id)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
 
     prev_hash = "0" * 64
@@ -864,6 +856,7 @@ async def complete_scenario(
     completion_reason: str,
     completion_timestamp: datetime | None = None,
 ) -> ScenarioState:
+    scenarios = app.state.scenarios
     if scenario_id not in scenarios:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
@@ -882,6 +875,7 @@ async def complete_scenario(
 
     try:
         append_audit_event(
+            app,
             scenario_id=scenario_id,
             event_type="scenario.complete",
             actor="operator",
@@ -898,6 +892,7 @@ async def complete_scenario(
             state.tier,
             state.retention_days,
             request_id_ctx.get(),
+            app,
         )
         state.status = ScenarioStatus.COMPLETED
     except Exception as exc:
@@ -965,9 +960,11 @@ async def process_spawn_request(msg: Any) -> None:
             retention_days=claims.retention_days,
             status=ScenarioStatus.CREATING,
         )
+        scenarios = app.state.scenarios
         scenarios[scenario_id] = state
 
         append_audit_event(
+            app,
             scenario_id=scenario_id,
             event_type="scenario.create",
             actor=claims.subject,
@@ -1133,6 +1130,7 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
     scenarios[scenario_id] = state
 
     append_audit_event(
+        http_request.app,
         scenario_id=scenario_id,
         event_type="scenario.create",
         actor=claims.subject,
@@ -1149,7 +1147,7 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         raise HTTPException(status_code=403, detail=reason)
 
     try:
-        network_id = create_scenario_network(scenario_id)
+        network_id = create_scenario_network(http_request.app, scenario_id)
         state.network_id = network_id
     except Exception as e:
         state.status = ScenarioStatus.FAILED
@@ -1157,12 +1155,14 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         raise HTTPException(status_code=500, detail=f"Network creation failed: {e}") from e
 
     try:
-        container_ids = launch_scenario_containers(scenario_id, network_id, template)
+        container_ids = launch_scenario_containers(
+            http_request.app, scenario_id, network_id, template
+        )
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
         state.updated_at = datetime.now(timezone.utc)
     except Exception as e:
-        cleanup_scenario(scenario_id)
+        cleanup_scenario(http_request.app, scenario_id)
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
         raise HTTPException(status_code=500, detail=f"Container launch failed: {e}") from e
