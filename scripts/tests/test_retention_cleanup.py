@@ -1,8 +1,8 @@
+from datetime import UTC, datetime, timedelta
 import os
+from pathlib import Path
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from scripts import retention_cleanup
 
@@ -27,7 +27,7 @@ class RetentionCleanupTests(unittest.TestCase):
             (scenario_dir / retention_cleanup.INVESTIGATION_FLAG).write_text(
                 "active", encoding="utf-8"
             )
-            past = datetime.now(timezone.utc) - timedelta(days=40)
+            past = datetime.now(UTC) - timedelta(days=40)
             os.utime(results_dir, (past.timestamp(), past.timestamp()))
             targets = retention_cleanup.find_expired_results(root, 30)
             self.assertEqual(targets, [])
@@ -38,7 +38,7 @@ class RetentionCleanupTests(unittest.TestCase):
             scenario_dir = root / "scenarios" / "scn-2"
             results_dir = scenario_dir / "results"
             results_dir.mkdir(parents=True)
-            past = datetime.now(timezone.utc) - timedelta(days=40)
+            past = datetime.now(UTC) - timedelta(days=40)
             os.utime(results_dir, (past.timestamp(), past.timestamp()))
             targets = retention_cleanup.find_expired_results(root, 30)
             logs = retention_cleanup.perform_cleanup(targets, dry_run=True)

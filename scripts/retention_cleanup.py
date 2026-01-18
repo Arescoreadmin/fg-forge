@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 import hmac
 import os
-import shutil
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import shutil
 
 INVESTIGATION_FLAG = "investigation.flag"
 
@@ -47,7 +47,7 @@ def _results_dir(scenario_dir: Path) -> Path:
 def find_expired_results(
     storage_root: Path, retention_days: int, now: datetime | None = None
 ) -> list[CleanupTarget]:
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=retention_days)
     targets: list[CleanupTarget] = []
     for scenario_dir in _scenario_dirs(storage_root):
@@ -56,7 +56,7 @@ def find_expired_results(
         results_dir = _results_dir(scenario_dir)
         if not results_dir.is_dir():
             continue
-        mtime = datetime.fromtimestamp(results_dir.stat().st_mtime, tz=timezone.utc)
+        mtime = datetime.fromtimestamp(results_dir.stat().st_mtime, tz=UTC)
         if mtime <= cutoff:
             targets.append(
                 CleanupTarget(

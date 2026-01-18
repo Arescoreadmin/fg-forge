@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
 import logging
 import os
-import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+import uuid
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, ValidationError
@@ -28,9 +28,9 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def _canonical_json(payload: dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
 
 
 def normalize_tier(value: str) -> str:
@@ -45,7 +45,7 @@ class ReceiptClaims(BaseModel):
     tier: str
     retention_days: int = Field(..., ge=0)
     exp: int
-    subject: Optional[str] = None
+    subject: str | None = None
 
 
 class EntitlementTokenClaims(BaseModel):
@@ -65,7 +65,7 @@ class EntitlementDecision:
     tier: str
     retention_days: int
     source: str
-    receipt_exp: Optional[int] = None
+    receipt_exp: int | None = None
 
 
 class EntitlementResolver:
@@ -77,9 +77,7 @@ class EntitlementResolver:
         file_path: str | None = None,
     ) -> None:
         self._redis_url = redis_url or os.getenv("ENTITLEMENTS_REDIS_URL")
-        self._redis_hash = redis_hash or os.getenv(
-            "ENTITLEMENTS_REDIS_HASH", "entitlements"
-        )
+        self._redis_hash = redis_hash or os.getenv("ENTITLEMENTS_REDIS_HASH", "entitlements")
         self._file_path = file_path or os.getenv("ENTITLEMENTS_FILE")
         self._redis_client = None
 
@@ -113,12 +111,10 @@ class EntitlementResolver:
 
     def _resolve_from_receipt(
         self, token: str, *, tenant_id: str, subject: str
-    ) -> Optional[EntitlementDecision]:
+    ) -> EntitlementDecision | None:
         secret = os.getenv("RECEIPT_HMAC_SECRET")
         if not secret:
-            raise HTTPException(
-                status_code=500, detail="receipt verification not configured"
-            )
+            raise HTTPException(status_code=500, detail="receipt verification not configured")
         try:
             payload_encoded, signature_encoded = token.split(".", 1)
         except ValueError as exc:
@@ -137,7 +133,7 @@ class EntitlementResolver:
         except (json.JSONDecodeError, ValidationError) as exc:
             raise HTTPException(status_code=401, detail="invalid receipt") from exc
 
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         if claims.exp < now:
             raise HTTPException(status_code=401, detail="receipt expired")
         if claims.tenant_id != tenant_id:
@@ -154,7 +150,7 @@ class EntitlementResolver:
             receipt_exp=claims.exp,
         )
 
-    def _resolve_from_store(self, *, tenant_id: str) -> Optional[EntitlementDecision]:
+    def _resolve_from_store(self, *, tenant_id: str) -> EntitlementDecision | None:
         if self._redis_url:
             record = self._read_from_redis(tenant_id)
             if record:
@@ -165,7 +161,7 @@ class EntitlementResolver:
                 return self._decision_from_record(record, source="file")
         return None
 
-    def _read_from_redis(self, tenant_id: str) -> Optional[dict[str, Any]]:
+    def _read_from_redis(self, tenant_id: str) -> dict[str, Any] | None:
         if self._redis_client is None:
             import redis
 
@@ -173,9 +169,7 @@ class EntitlementResolver:
                 self._redis_client = redis.from_url(
                     self._redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=float(
-                        os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")
-                    ),
+                    socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")),
                     socket_timeout=float(os.getenv("REDIS_TIMEOUT_SECONDS", "1.0")),
                 )
             except Exception as exc:
@@ -187,36 +181,28 @@ class EntitlementResolver:
             data = self._redis_client.hget(self._redis_hash, tenant_id)
         except Exception as exc:
             logger.warning("Entitlements redis read failed: %s", exc)
-            raise HTTPException(
-                status_code=503, detail="entitlements store unavailable"
-            ) from exc
+            raise HTTPException(status_code=503, detail="entitlements store unavailable") from exc
         if not data:
             return None
         try:
             parsed = json.loads(data)
         except json.JSONDecodeError as exc:
             logger.warning("Entitlements redis payload invalid")
-            raise HTTPException(
-                status_code=503, detail="entitlements store invalid"
-            ) from exc
+            raise HTTPException(status_code=503, detail="entitlements store invalid") from exc
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=503, detail="entitlements store invalid")
         return parsed
 
-    def _read_from_file(self, tenant_id: str) -> Optional[dict[str, Any]]:
+    def _read_from_file(self, tenant_id: str) -> dict[str, Any] | None:
         try:
-            with open(self._file_path, "r", encoding="utf-8") as handle:
+            with open(self._file_path, encoding="utf-8") as handle:
                 payload = json.load(handle)
         except FileNotFoundError as exc:
             logger.warning("Entitlements file missing")
-            raise HTTPException(
-                status_code=503, detail="entitlements store unavailable"
-            ) from exc
+            raise HTTPException(status_code=503, detail="entitlements store unavailable") from exc
         except json.JSONDecodeError as exc:
             logger.warning("Entitlements file invalid")
-            raise HTTPException(
-                status_code=503, detail="entitlements store invalid"
-            ) from exc
+            raise HTTPException(status_code=503, detail="entitlements store invalid") from exc
 
         if not isinstance(payload, dict):
             raise HTTPException(status_code=503, detail="entitlements store invalid")
@@ -228,20 +214,16 @@ class EntitlementResolver:
             raise HTTPException(status_code=503, detail="entitlements store invalid")
         return record
 
-    def _decision_from_record(
-        self, record: dict[str, Any], *, source: str
-    ) -> EntitlementDecision:
+    def _decision_from_record(self, record: dict[str, Any], *, source: str) -> EntitlementDecision:
         try:
             tier = normalize_tier(str(record["tier"]))
             retention_days = int(record["retention_days"])
         except (KeyError, ValueError, TypeError) as exc:
             raise HTTPException(status_code=503, detail="entitlements store invalid") from exc
-        return EntitlementDecision(
-            tier=tier, retention_days=retention_days, source=source
-        )
+        return EntitlementDecision(tier=tier, retention_days=retention_days, source=source)
 
 
-_et_secret_cache: Optional[str] = None
+_et_secret_cache: str | None = None
 _et_secret_warning_emitted = False
 
 
@@ -264,7 +246,7 @@ def _get_et_secret() -> str:
 
 
 def _et_issued_at() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
+    return int(datetime.now(UTC).timestamp())
 
 
 def _et_expiration(issued_at: int) -> int:
@@ -289,9 +271,7 @@ def mint_et(claims: dict) -> str:
     if "exp" not in payload:
         payload["exp"] = payload["expires_at"]
     payload_bytes = _canonical_json(payload)
-    signature = hmac.new(
-        _get_et_secret().encode("utf-8"), payload_bytes, "sha256"
-    ).digest()
+    signature = hmac.new(_get_et_secret().encode("utf-8"), payload_bytes, "sha256").digest()
     return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
 
 
@@ -350,7 +330,7 @@ def verify_et(token: str) -> dict:
     if issued_at != iat or expires_at != exp:
         raise HTTPException(status_code=401, detail="invalid entitlement token")
 
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     if expires_at < now or exp < now:
         raise HTTPException(status_code=401, detail="entitlement token expired")
 
@@ -450,9 +430,7 @@ def append_billing_audit_event(
         if _forge_env() in {"dev", "development"}:
             logger.warning("Billing audit chain skipped: %s", exc)
             return
-        raise HTTPException(
-            status_code=500, detail="billing audit chain unavailable"
-        ) from exc
+        raise HTTPException(status_code=500, detail="billing audit chain unavailable") from exc
 
     chain: list[dict] = []
     if audit_path.exists():
@@ -466,18 +444,14 @@ def append_billing_audit_event(
             if _forge_env() in {"dev", "development"}:
                 logger.warning("Billing audit chain skipped: %s", exc)
                 return
-            raise HTTPException(
-                status_code=500, detail="billing audit chain invalid"
-            ) from exc
+            raise HTTPException(status_code=500, detail="billing audit chain invalid") from exc
         if not verify_audit_chain(chain):
             if _forge_env() in {"dev", "development"}:
                 logger.warning("Billing audit chain skipped: invalid chain")
                 return
-            raise HTTPException(
-                status_code=500, detail="billing audit chain invalid"
-            )
+            raise HTTPException(status_code=500, detail="billing audit chain invalid")
     entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "tenant_id": tenant_id,
         "subject": subject,
         "plan": normalize_tier(plan),
@@ -492,9 +466,7 @@ def append_billing_audit_event(
         if _forge_env() in {"dev", "development"}:
             logger.warning("Billing audit chain skipped: %s", exc)
             return
-        raise HTTPException(
-            status_code=500, detail="billing audit chain unavailable"
-        ) from exc
+        raise HTTPException(status_code=500, detail="billing audit chain unavailable") from exc
 
 
 def verify_billing_audit_chain(path: Path) -> bool:

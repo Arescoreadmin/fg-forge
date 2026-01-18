@@ -1,12 +1,12 @@
 import asyncio
 import importlib.util
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
-import uuid
-from pathlib import Path
 from unittest import mock
+import uuid
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -14,13 +14,16 @@ from httpx import ASGITransport, AsyncClient
 
 
 def load_scoreboard_module(storage_root: Path, signing_key_path: str | None):
-    repo_root = Path(__file__).resolve().parents[3]
     os.environ["STORAGE_ROOT"] = str(storage_root)
     if signing_key_path is None:
         os.environ.pop("SIGNING_KEY_PATH", None)
     else:
         os.environ["SIGNING_KEY_PATH"] = signing_key_path
-    module_path = repo_root / "services" / "scoreboard" / "app" / "main.py"
+
+    module_path = (
+        Path(__file__).resolve().parents[3] / "services" / "scoreboard" / "app" / "main.py"
+    )
+
     module_name = f"scoreboard_main_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
@@ -89,9 +92,7 @@ class ScoreboardReadyzTests(unittest.TestCase):
                 def json(self):
                     return {"dry_run": True}
 
-            with mock.patch.object(
-                module, "_request_with_retries", return_value=FakeResponse()
-            ):
+            with mock.patch.object(module, "_request_with_retries", return_value=FakeResponse()):
                 response = run_readyz(module)
             self.assertEqual(response.status_code, 503)
             os.environ.pop("EGRESS_GATEWAY_URL", None)

@@ -7,25 +7,25 @@ Subscribes to scenario.created events and runs success criteria checks.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import hashlib
+from io import BytesIO
 import json
 import logging
 import os
+from pathlib import Path
 import tarfile
 import tempfile
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from enum import Enum
-from io import BytesIO
-from pathlib import Path
 from typing import Any
+import uuid
 
 import docker
-import nats
 from fastapi import FastAPI, HTTPException, Request
 from minio import Minio
+import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -35,7 +35,7 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -91,7 +91,7 @@ class CriterionResult(BaseModel):
 class EvidenceBundle(BaseModel):
     scenario_id: str
     track: str
-    collected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    collected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     artifacts: list[Artifact] = Field(default_factory=list)
     criteria_results: list[CriterionResult] = Field(default_factory=list)
 
@@ -140,7 +140,9 @@ def load_template(track: str) -> dict:
         return yaml.safe_load(f)
 
 
-def find_container(scenario_id: str, container_name: str) -> docker.models.containers.Container | None:
+def find_container(
+    scenario_id: str, container_name: str
+) -> docker.models.containers.Container | None:
     """Find a container by scenario ID and name."""
     client = get_docker_client()
     containers = client.containers.list(
@@ -154,9 +156,7 @@ def find_container(scenario_id: str, container_name: str) -> docker.models.conta
     return containers[0] if containers else None
 
 
-def execute_command(
-    scenario_id: str, container_name: str, command: str
-) -> tuple[int, str, str]:
+def execute_command(scenario_id: str, container_name: str, command: str) -> tuple[int, str, str]:
     """Execute a command in a scenario container."""
     container = find_container(scenario_id, container_name)
     if not container:
@@ -171,13 +171,11 @@ def execute_command(
         stdout = result.output[0].decode() if result.output[0] else ""
         stderr = result.output[1].decode() if result.output[1] else ""
         return exit_code, stdout, stderr
-    except Exception as e:
-        return -1, "", str(e)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def capture_file(
-    scenario_id: str, container_name: str, file_path: str
-) -> tuple[bool, str]:
+def capture_file(scenario_id: str, container_name: str, file_path: str) -> tuple[bool, str]:
     """Capture a file from a scenario container."""
     container = find_container(scenario_id, container_name)
     if not container:
@@ -216,9 +214,7 @@ def evaluate_criterion(
 
         if evidence_type == "command":
             command = evidence_spec.get("command", "true")
-            exit_code, stdout, stderr = execute_command(
-                scenario_id, container_name, command
-            )
+            exit_code, stdout, stderr = execute_command(scenario_id, container_name, command)
 
             # Create artifact
             artifact_name = f"{criterion_id}_{container_name}_cmd"
@@ -239,9 +235,7 @@ def evaluate_criterion(
             expected_exit = expect.get("exit_code")
             if expected_exit is not None and exit_code != expected_exit:
                 passed = False
-                messages.append(
-                    f"Expected exit code {expected_exit}, got {exit_code}"
-                )
+                messages.append(f"Expected exit code {expected_exit}, got {exit_code}")
 
             expected_stdout = expect.get("stdout_contains")
             if expected_stdout and expected_stdout not in stdout:
@@ -488,5 +482,5 @@ async def collect(scenario_id: str, track: str) -> dict:
             "evidence_url": evidence_url,
             "criteria": [r.model_dump() for r in bundle.criteria_results],
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

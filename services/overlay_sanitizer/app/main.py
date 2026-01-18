@@ -8,25 +8,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import hashlib
 import io
 import json
 import logging
 import os
 import re
+from typing import Any
 import uuid
 import zipfile
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
 
-import nats
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minio import Minio
+import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -36,7 +36,7 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -146,7 +146,7 @@ class SanitizationResult(BaseModel):
     files_processed: int = 0
     total_redactions: int = 0
     sanitized_url: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class AuditBundle(BaseModel):
@@ -155,7 +155,7 @@ class AuditBundle(BaseModel):
     sanitization_result: SanitizationResult
     content_hash: str
     signature: str
-    signed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    signed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     export_url: str | None = None
 
 
@@ -417,7 +417,7 @@ async def create_audit_bundle(
         manifest = {
             "scenario_id": scenario_id,
             "sanitization": sanitization_result.model_dump(mode="json"),
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
@@ -614,10 +614,7 @@ async def list_results(
 async def create_bundle(scenario_id: str) -> AuditBundle:
     """Create an audit bundle for a scenario."""
     # Find most recent sanitization result for scenario
-    results = [
-        r for r in sanitization_results.values()
-        if r.scenario_id == scenario_id
-    ]
+    results = [r for r in sanitization_results.values() if r.scenario_id == scenario_id]
     if not results:
         raise HTTPException(
             status_code=404,
@@ -650,9 +647,7 @@ async def download_bundle(bundle_id: str) -> StreamingResponse:
     return StreamingResponse(
         response,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": f"attachment; filename={bundle_id}.zip"
-        },
+        headers={"Content-Disposition": f"attachment; filename={bundle_id}.zip"},
     )
 
 

@@ -22,6 +22,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_PYTHON_VERSION_WARNING: "1"
       PYTHONPATH: "."
+      # Make runtime expectations explicit (don’t “accidentally dev”).
+      FORGE_ENV: "dev"
 
     steps:
       - name: Checkout
@@ -64,8 +66,14 @@ jobs:
             -r services/scoreboard/requirements.txt
 
       # ---------------------------
-      # Fast safeguards (fail early)
+      # Lint + formatting (fail early)
       # ---------------------------
+
+      - name: Format (ruff)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check .
 
       - name: Lint (ruff)
         shell: bash
@@ -108,14 +116,12 @@ jobs:
             exit 1
           fi
 
-
       - name: Dependency vulnerability scan (pip-audit)
         shell: bash
         run: |
           set -euo pipefail
 
           # If you want strict mode, remove IGNORE_ARGS and fix deps instead.
-          # Keeping CI unblocked while you iterate, but still visible.
           IGNORE_ARGS=(
             "--ignore-vuln" "PYSEC-2024-38"
             "--ignore-vuln" "CVE-2024-35195"

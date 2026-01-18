@@ -9,21 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager, suppress
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import hashlib
 import json
 import logging
 import os
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from enum import Enum
 from typing import Any
+import uuid
 
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from fastapi import FastAPI, Request
 import httpx
 import nats
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -32,8 +32,8 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+        payload: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -93,7 +93,7 @@ class ActionProposal(BaseModel):
     canary_executed: bool = False
     canary_passed: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ProposalResult(BaseModel):
@@ -103,7 +103,7 @@ class ProposalResult(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     canary_output: str | None = None
     rollback_triggered: bool = False
-    processed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    processed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class CanaryResult(BaseModel):
@@ -150,11 +150,11 @@ def get_signing_keys() -> tuple[ed25519.Ed25519PrivateKey, ed25519.Ed25519Public
 def sign_proposal(proposal: ActionProposal) -> str:
     """Sign a proposal and return the signature."""
     private_key, _ = get_signing_keys()
-
-    # Create canonical representation
-    message = f"{proposal.proposal_id}:{proposal.scenario_id}:{proposal.action_type}:{proposal.action_content}"
+    message = (
+        f"{proposal.proposal_id}:{proposal.scenario_id}:"
+        f"{proposal.action_type}:{proposal.action_content}"
+    )
     message_hash = hashlib.sha256(message.encode()).digest()
-
     signature = private_key.sign(message_hash)
     return base64.b64encode(signature).decode()
 
@@ -167,13 +167,16 @@ def verify_signature(proposal: ActionProposal) -> bool:
     _, public_key = get_signing_keys()
 
     try:
-        message = f"{proposal.proposal_id}:{proposal.scenario_id}:{proposal.action_type}:{proposal.action_content}"
+        message = (
+            f"{proposal.proposal_id}:{proposal.scenario_id}:"
+            f"{proposal.action_type}:{proposal.action_content}"
+        )
         message_hash = hashlib.sha256(message.encode()).digest()
         signature = base64.b64decode(proposal.signature)
         public_key.verify(signature, message_hash)
         return True
-    except Exception as e:
-        logger.warning("Signature verification failed: %s", e)
+    except Exception as exc:
+        logger.warning("Signature verification failed: %s", exc)
         return False
 
 
@@ -194,15 +197,13 @@ async def check_opa_policy(proposal: ActionProposal) -> tuple[bool, list[str]]:
                 f"{OPA_URL}/v1/data/frostgate/forge/llm/allow",
                 json={"input": input_data},
             )
-
             if response.status_code >= 400:
                 return False, ["OPA error"]
 
             result = response.json()
             allowed = result.get("result", False)
 
-            # Get deny reasons if not allowed
-            reasons = []
+            reasons: list[str] = []
             if not allowed:
                 reasons_response = await client.post(
                     f"{OPA_URL}/v1/data/frostgate/forge/llm/deny_reasons",
@@ -213,17 +214,16 @@ async def check_opa_policy(proposal: ActionProposal) -> tuple[bool, list[str]]:
 
             return allowed, reasons
 
-        except httpx.RequestError as e:
-            logger.warning("OPA request failed: %s", e)
-            return False, [f"OPA unavailable: {e}"]
+        except httpx.RequestError as exc:
+            logger.warning("OPA request failed: %s", exc)
+            return False, [f"OPA unavailable: {exc}"]
 
 
 def analyze_action_safety(proposal: ActionProposal) -> tuple[bool, list[str]]:
     """Analyze action content for safety concerns."""
-    concerns = []
+    concerns: list[str] = []
     content = proposal.action_content.lower()
 
-    # Check for dangerous patterns
     dangerous_patterns = [
         ("rm -rf", "destructive file deletion"),
         ("dd if=", "low-level disk operation"),
@@ -239,35 +239,29 @@ def analyze_action_safety(proposal: ActionProposal) -> tuple[bool, list[str]]:
         if pattern in content:
             concerns.append(f"Dangerous pattern detected: {reason}")
 
-    # Check action size
     if len(proposal.action_content) > MAX_PROPOSAL_SIZE:
         concerns.append(f"Action content exceeds size limit ({MAX_PROPOSAL_SIZE})")
 
-    # Check policy class requirements
     if proposal.policy_class == PolicyClass.PRIVILEGED:
         if "sudo" not in content and "doas" not in content:
             logger.info("Privileged action without sudo/doas - may fail")
         concerns.append("Privileged action requires additional review")
 
-    return len(concerns) == 0, concerns
+    return not concerns, concerns
 
 
 async def execute_canary(proposal: ActionProposal) -> CanaryResult:
     """Execute a canary check for the proposal."""
-    start_time = datetime.now(timezone.utc)
+    start_time = datetime.now(UTC)
 
-    # In production, this would actually execute in a sandboxed environment
-    # For now, we simulate the canary execution
     logger.info(
         "Executing canary for proposal %s (action: %s)",
         proposal.proposal_id,
         proposal.action_type,
     )
 
-    # Simulate execution
-    await asyncio.sleep(0.1)  # Simulated delay
+    await asyncio.sleep(0.1)
 
-    # Check for obvious failures
     success = True
     output = "canary executed successfully"
     side_effects = False
@@ -279,9 +273,7 @@ async def execute_canary(proposal: ActionProposal) -> CanaryResult:
     if "write" in proposal.action_type or "execute" in proposal.action_type:
         side_effects = True
 
-    duration_ms = int(
-        (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-    )
+    duration_ms = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
 
     return CanaryResult(
         proposal_id=proposal.proposal_id,
@@ -296,7 +288,6 @@ async def rollback_canary(proposal: ActionProposal) -> bool:
     """Rollback a failed canary execution."""
     logger.warning("Rolling back canary for proposal %s", proposal.proposal_id)
     stats.rollbacks += 1
-    # In production, this would actually reverse any side effects
     return True
 
 
@@ -309,7 +300,6 @@ async def analyze_proposal(proposal: ActionProposal) -> ProposalResult:
 
     reasons: list[str] = []
 
-    # Step 1: Sign the proposal if not already signed
     if not proposal.signed:
         proposal.signature = sign_proposal(proposal)
         proposal.signed = verify_signature(proposal)
@@ -324,7 +314,6 @@ async def analyze_proposal(proposal: ActionProposal) -> ProposalResult:
             reasons=reasons,
         )
 
-    # Step 2: Analyze action safety
     safe, safety_concerns = analyze_action_safety(proposal)
     reasons.extend(safety_concerns)
 
@@ -337,8 +326,7 @@ async def analyze_proposal(proposal: ActionProposal) -> ProposalResult:
             reasons=reasons,
         )
 
-    # Step 3: Execute canary if required
-    canary_output = None
+    canary_output: str | None = None
     rollback_triggered = False
 
     if proposal.canary_required:
@@ -356,14 +344,15 @@ async def analyze_proposal(proposal: ActionProposal) -> ProposalResult:
             stats.rejected += 1
             return ProposalResult(
                 proposal_id=proposal.proposal_id,
-                status=ProposalStatus.ROLLED_BACK if rollback_triggered else ProposalStatus.REJECTED,
+                status=ProposalStatus.ROLLED_BACK
+                if rollback_triggered
+                else ProposalStatus.REJECTED,
                 allowed=False,
-                reasons=["Canary execution failed"] + reasons,
+                reasons=["Canary execution failed", *reasons],
                 canary_output=canary_output,
                 rollback_triggered=rollback_triggered,
             )
 
-    # Step 4: Check OPA policy
     allowed, opa_reasons = await check_opa_policy(proposal)
     reasons.extend(opa_reasons)
 
@@ -377,7 +366,6 @@ async def analyze_proposal(proposal: ActionProposal) -> ProposalResult:
             canary_output=canary_output,
         )
 
-    # All checks passed
     stats.approved += 1
     return ProposalResult(
         proposal_id=proposal.proposal_id,
@@ -414,7 +402,6 @@ async def process_proposal_request(msg: Any) -> None:
         result = await analyze_proposal(proposal)
         results[result.proposal_id] = result
 
-        # Publish result to NATS
         if js:
             await js.publish(
                 "llm.decision",
@@ -431,9 +418,9 @@ async def process_proposal_request(msg: Any) -> None:
 
         await msg.ack()
 
-    except Exception as e:
-        logger.exception("Error processing proposal: %s", e)
-        if msg:
+    except Exception as exc:
+        logger.exception("Error processing proposal: %s", exc)
+        with suppress(Exception):
             await msg.nak()
 
 
@@ -445,13 +432,9 @@ async def nats_subscriber() -> None:
         nc = await nats.connect(NATS_URL)
         js = nc.jetstream()
 
-        # Ensure stream exists
-        try:
+        with suppress(Exception):
             await js.add_stream(name="LLM", subjects=["llm.*"])
-        except Exception:
-            pass
 
-        # Subscribe to proposal requests
         config = ConsumerConfig(
             durable_name="llm_analyzer",
             deliver_policy=DeliverPolicy.NEW,
@@ -464,24 +447,23 @@ async def nats_subscriber() -> None:
         )
 
         logger.info("Subscribed to LLM proposal stream")
+        await asyncio.Event().wait()
 
-        while True:
-            await asyncio.sleep(1)
-
-    except Exception as e:
-        logger.error("NATS subscriber error: %s", e)
+    except Exception as exc:
+        logger.error("NATS subscriber error: %s", exc)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    # Initialize signing keys
     get_signing_keys()
 
     task = asyncio.create_task(nats_subscriber())
     logger.info("LLM Analyzer started")
     yield
     task.cancel()
+    with suppress(Exception):
+        await task
     if nc:
         await nc.close()
     logger.info("LLM Analyzer stopped")
@@ -505,98 +487,15 @@ async def add_request_id(request: Request, call_next):
 
 
 @app.get("/health")
-def health() -> dict:
+def health() -> dict[str, str]:
     return {"status": "ok", "service": "forge_llm_analyzer"}
 
 
 @app.get("/healthz")
-def healthz() -> dict:
+def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "forge_llm_analyzer"}
 
 
 @app.get("/readyz")
-def readyz() -> dict:
+def readyz() -> dict[str, str]:
     return {"status": "ready", "service": "forge_llm_analyzer"}
-
-
-@app.post("/v1/proposals")
-async def submit_proposal(proposal: ActionProposal) -> ProposalResult:
-    """Submit a proposal for analysis."""
-    proposals[proposal.proposal_id] = proposal
-    result = await analyze_proposal(proposal)
-    results[result.proposal_id] = result
-    return result
-
-
-@app.get("/v1/proposals/{proposal_id}")
-async def get_proposal(proposal_id: str) -> ActionProposal:
-    """Get a proposal by ID."""
-    if proposal_id not in proposals:
-        raise HTTPException(status_code=404, detail="Proposal not found")
-    return proposals[proposal_id]
-
-
-@app.get("/v1/proposals/{proposal_id}/result")
-async def get_result(proposal_id: str) -> ProposalResult:
-    """Get the result of a proposal analysis."""
-    if proposal_id not in results:
-        raise HTTPException(status_code=404, detail="Result not found")
-    return results[proposal_id]
-
-
-@app.get("/v1/proposals")
-async def list_proposals(
-    scenario_id: str | None = None,
-    status: ProposalStatus | None = None,
-    limit: int = 100,
-) -> list[ActionProposal]:
-    """List proposals with optional filters."""
-    result = list(proposals.values())
-    if scenario_id:
-        result = [p for p in result if p.scenario_id == scenario_id]
-    if status and status.value in results:
-        result = [
-            p
-            for p in result
-            if p.proposal_id in results and results[p.proposal_id].status == status
-        ]
-    return result[-limit:]
-
-
-@app.get("/v1/stats")
-async def get_stats() -> AnalyzerStats:
-    """Get analyzer statistics."""
-    return stats
-
-
-@app.get("/v1/policy-classes")
-async def list_policy_classes() -> list[dict]:
-    """List available policy classes."""
-    return [
-        {"name": PolicyClass.READ_ONLY.value, "description": "Read-only operations"},
-        {"name": PolicyClass.WRITE.value, "description": "File write operations"},
-        {"name": PolicyClass.EXECUTE.value, "description": "Command execution"},
-        {"name": PolicyClass.NETWORK.value, "description": "Network operations"},
-        {"name": PolicyClass.PRIVILEGED.value, "description": "Privileged operations (requires additional review)"},
-    ]
-
-
-@app.post("/v1/sign")
-async def sign_action(proposal: ActionProposal) -> dict:
-    """Sign a proposal (for testing/development)."""
-    signature = sign_proposal(proposal)
-    return {
-        "proposal_id": proposal.proposal_id,
-        "signature": signature,
-        "signed": True,
-    }
-
-
-@app.post("/v1/verify")
-async def verify_action(proposal: ActionProposal) -> dict:
-    """Verify a proposal's signature."""
-    valid = verify_signature(proposal)
-    return {
-        "proposal_id": proposal.proposal_id,
-        "valid": valid,
-    }

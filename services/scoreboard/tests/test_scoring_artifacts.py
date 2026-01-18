@@ -1,15 +1,15 @@
 import base64
+from datetime import UTC, datetime
 import gzip
 import importlib.util
+from io import BytesIO
 import json
+from pathlib import Path
 import sys
 import tarfile
 import tempfile
 import unittest
 import uuid
-from datetime import datetime, timezone
-from io import BytesIO
-from pathlib import Path
 
 
 def load_module():
@@ -28,7 +28,7 @@ def load_module():
 class ScoreboardArtifactsTests(unittest.TestCase):
     def test_score_json_deterministic(self):
         module = load_module()
-        fixed_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        fixed_time = datetime(2024, 1, 1, tzinfo=UTC)
         score = module.ScoreResult(
             scenario_id="scn-1",
             track="netplus",
@@ -132,7 +132,7 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             scenario_id="scn-plan",
             track="netplus",
             completion_reason="finished",
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
             subject="user-1",
             tenant_id="tenant-1",
             plan=None,
@@ -146,7 +146,7 @@ class ScoreboardArtifactsTests(unittest.TestCase):
         score_hash = "a" * 64
         evidence_hash = "b" * 64
         verdict = module.sign_verdict(score_hash, evidence_hash, "scn-1")
-        message = f"{score_hash}:{evidence_hash}".encode("utf-8")
+        message = f"{score_hash}:{evidence_hash}".encode()
         signature_bytes = base64.b64decode(verdict.signature)
         module.SIGNING_KEY.public_key().verify(signature_bytes, message)
 
@@ -173,9 +173,7 @@ class ScoreboardArtifactsTests(unittest.TestCase):
             evidence_hash = module._hash_bytes(evidence.payload)
             verdict = module.sign_verdict(score_hash, evidence_hash, scenario_id)
             score_path, evidence_path, verdict_path, pub_path = (
-                module.store_score_artifacts_filesystem(
-                    scenario_id, score_bytes, evidence, verdict
-                )
+                module.store_score_artifacts_filesystem(scenario_id, score_bytes, evidence, verdict)
             )
 
             results_dir = Path(tmpdir) / "scenarios" / scenario_id / "results"
