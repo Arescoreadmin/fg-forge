@@ -1,14 +1,14 @@
 import asyncio
 import base64
+from datetime import UTC, datetime
 import hmac
+import importlib.util
 import json
 import os
+from pathlib import Path
 import sys
 import unittest
 import uuid
-import importlib.util
-from datetime import datetime, timezone
-from pathlib import Path
 
 
 def b64url_encode(data: bytes) -> str:
@@ -24,7 +24,7 @@ def mint_sat(secret: str, claims: dict) -> str:
     header = {"alg": "HS256", "typ": "SAT"}
     header_encoded = b64url_encode(json.dumps(header).encode("utf-8"))
     payload_encoded = b64url_encode(json.dumps(claims).encode("utf-8"))
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    signing_input = f"{header_encoded}.{payload_encoded}".encode()
     signature = hmac.new(secret.encode("utf-8"), signing_input, "sha256").digest()
     return f"{header_encoded}.{payload_encoded}.{b64url_encode(signature)}"
 
@@ -63,7 +63,7 @@ class OrchestratorSatTests(unittest.TestCase):
     def test_sat_replay_rejected(self):
         module = load_module()
         module.replay_protector = module.ReplayProtector()
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         claims = {
             "jti": "jti-123",
             "exp": now + 300,
@@ -82,9 +82,7 @@ class OrchestratorSatTests(unittest.TestCase):
     def test_spawn_request_denied_without_sat(self):
         module = load_module()
         module.scenarios.clear()
-        msg = DummyMsg(
-            {"scenario_id": "scn-123", "track": "netplus", "request_id": "req-1"}
-        )
+        msg = DummyMsg({"scenario_id": "scn-123", "track": "netplus", "request_id": "req-1"})
         asyncio.run(module.process_spawn_request(msg))
         self.assertTrue(msg.acked)
         self.assertEqual(module.scenarios, {})
@@ -92,7 +90,7 @@ class OrchestratorSatTests(unittest.TestCase):
     def test_opa_unavailable_denies_prelaunch(self):
         module = load_module()
         module.replay_protector = module.ReplayProtector()
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         claims = {
             "jti": "jti-456",
             "exp": now + 300,
@@ -127,7 +125,7 @@ class OrchestratorSatTests(unittest.TestCase):
     def test_sat_missing_tenant_or_subject_rejected(self):
         module = load_module()
         module.replay_protector = module.ReplayProtector()
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         claims = {
             "jti": "jti-missing",
             "exp": now + 300,
@@ -154,7 +152,7 @@ class OrchestratorSatTests(unittest.TestCase):
     def test_opa_payload_includes_entitlements(self):
         module = load_module()
         module.replay_protector = module.ReplayProtector()
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         claims = {
             "jti": "jti-789",
             "exp": now + 300,

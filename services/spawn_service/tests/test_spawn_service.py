@@ -1,19 +1,19 @@
-import os
-import unittest
-from pathlib import Path
-import sys
-import uuid
-import importlib.util
 import asyncio
 import base64
 import hmac
+import importlib.util
 import json
+import os
+from pathlib import Path
+import sys
 import tempfile
 import time
+import unittest
 from unittest import mock
+import uuid
 
-import httpx
 from fastapi import HTTPException
+import httpx
 
 
 def b64url_decode(value: str) -> bytes:
@@ -74,9 +74,7 @@ async def request(
     headers: dict | None = None,
 ) -> httpx.Response:
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://testserver"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.request(method, path, json=json, headers=headers)
 
 
@@ -186,13 +184,11 @@ class SpawnServiceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         token = response.json()["sat"]
         header_encoded, payload_encoded, signature = token.split(".")
-        signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+        signing_input = f"{header_encoded}.{payload_encoded}".encode()
         expected_signature = hmac.new(
             os.environ["SAT_HMAC_SECRET"].encode("utf-8"), signing_input, "sha256"
         ).digest()
-        expected_encoded = (
-            base64.urlsafe_b64encode(expected_signature).rstrip(b"=").decode("utf-8")
-        )
+        expected_encoded = base64.urlsafe_b64encode(expected_signature).rstrip(b"=").decode("utf-8")
         self.assertEqual(signature, expected_encoded)
         payload = json.loads(b64url_decode(payload_encoded).decode("utf-8"))
         self.assertIn("jti", payload)
@@ -473,17 +469,17 @@ class SpawnServiceTests(unittest.TestCase):
             "exp": exp,
             "subject": "user-receipt",
         }
-        payload_encoded = base64.urlsafe_b64encode(
-            json.dumps(receipt_payload).encode("utf-8")
-        ).rstrip(b"=").decode("utf-8")
+        payload_encoded = (
+            base64.urlsafe_b64encode(json.dumps(receipt_payload).encode("utf-8"))
+            .rstrip(b"=")
+            .decode("utf-8")
+        )
         signature = hmac.new(
             os.environ["RECEIPT_HMAC_SECRET"].encode("utf-8"),
             payload_encoded.encode("utf-8"),
             "sha256",
         ).digest()
-        signature_encoded = (
-            base64.urlsafe_b64encode(signature).rstrip(b"=").decode("utf-8")
-        )
+        signature_encoded = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("utf-8")
         receipt = f"{payload_encoded}.{signature_encoded}"
         response = asyncio.run(
             request(
@@ -554,10 +550,7 @@ class SpawnServiceTests(unittest.TestCase):
             retention_days=30,
         )
         payload_encoded, signature_encoded = token.split(".")
-        tampered_signature = (
-            signature_encoded[:-1]
-            + ("A" if signature_encoded[-1] != "A" else "B")
-        )
+        tampered_signature = signature_encoded[:-1] + ("A" if signature_encoded[-1] != "A" else "B")
         with self.assertRaises(HTTPException) as ctx:
             entitlements.verify_et(f"{payload_encoded}.{tampered_signature}")
         self.assertEqual(ctx.exception.status_code, 401)
@@ -625,9 +618,7 @@ class SpawnServiceTests(unittest.TestCase):
         with mock.patch.object(
             module,
             "verify_et",
-            side_effect=module.HTTPException(
-                status_code=401, detail="invalid entitlement token"
-            ),
+            side_effect=module.HTTPException(status_code=401, detail="invalid entitlement token"),
         ):
             response = asyncio.run(
                 request(

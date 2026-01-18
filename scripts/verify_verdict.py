@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+from dataclasses import dataclass
 import hashlib
 import json
-from dataclasses import dataclass
 from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -81,7 +81,7 @@ def verify_verdict(
         try:
             signature = base64.b64decode(signature_b64)
             public_key = _load_public_key(verdict_pub_path)
-            public_key.verify(signature, f"{score_hash}:{evidence_hash}".encode("utf-8"))
+            public_key.verify(signature, f"{score_hash}:{evidence_hash}".encode())
         except Exception as exc:  # pragma: no cover - explicit error path
             errors.append(f"signature verification failed: {exc}")
 

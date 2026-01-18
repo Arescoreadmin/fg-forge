@@ -1,9 +1,9 @@
 import base64
+from datetime import UTC, datetime
 import json
+from pathlib import Path
 import tempfile
 import unittest
-from datetime import datetime, timezone
-from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -14,17 +14,17 @@ from scripts.verify_verdict import verify_verdict
 class VerifyVerdictTests(unittest.TestCase):
     def test_verify_verdict_success(self):
         key = ed25519.Ed25519PrivateKey.generate()
-        score_payload = {"score": 0.9, "computed_at": datetime.now(timezone.utc).isoformat()}
+        score_payload = {"score": 0.9, "computed_at": datetime.now(UTC).isoformat()}
         score_bytes = json.dumps(score_payload, sort_keys=True).encode("utf-8")
         evidence_bytes = b"evidence"
         score_hash = __import__("hashlib").sha256(score_bytes).hexdigest()
         evidence_hash = __import__("hashlib").sha256(evidence_bytes).hexdigest()
-        signature = key.sign(f"{score_hash}:{evidence_hash}".encode("utf-8"))
+        signature = key.sign(f"{score_hash}:{evidence_hash}".encode())
         verdict = {
             "scenario_id": "scn-1",
             "score_hash": score_hash,
             "evidence_hash": evidence_hash,
-            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "computed_at": datetime.now(UTC).isoformat(),
             "signature": base64.b64encode(signature).decode("utf-8"),
         }
 
@@ -42,9 +42,7 @@ class VerifyVerdictTests(unittest.TestCase):
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw,
             )
-            pub_path.write_text(
-                base64.b64encode(public_bytes).decode("utf-8"), encoding="utf-8"
-            )
+            pub_path.write_text(base64.b64encode(public_bytes).decode("utf-8"), encoding="utf-8")
 
             result = verify_verdict(score_path, evidence_path, verdict_path, pub_path)
             self.assertTrue(result.ok)
@@ -56,12 +54,12 @@ class VerifyVerdictTests(unittest.TestCase):
         evidence_bytes = b"evidence"
         score_hash = __import__("hashlib").sha256(score_bytes).hexdigest()
         evidence_hash = __import__("hashlib").sha256(evidence_bytes).hexdigest()
-        signature = key.sign(f"{score_hash}:{evidence_hash}".encode("utf-8"))
+        signature = key.sign(f"{score_hash}:{evidence_hash}".encode())
         verdict = {
             "scenario_id": "scn-1",
             "score_hash": score_hash,
             "evidence_hash": evidence_hash,
-            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "computed_at": datetime.now(UTC).isoformat(),
             "signature": base64.b64encode(signature).decode("utf-8"),
         }
 
@@ -79,9 +77,7 @@ class VerifyVerdictTests(unittest.TestCase):
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw,
             )
-            pub_path.write_text(
-                base64.b64encode(public_bytes).decode("utf-8"), encoding="utf-8"
-            )
+            pub_path.write_text(base64.b64encode(public_bytes).decode("utf-8"), encoding="utf-8")
 
             result = verify_verdict(score_path, evidence_path, verdict_path, pub_path)
             self.assertFalse(result.ok)

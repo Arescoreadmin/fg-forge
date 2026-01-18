@@ -7,19 +7,19 @@ with optional allowlist profiles per scenario network.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import json
 import logging
 import os
 import subprocess
-import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from enum import Enum
 from typing import Any
+import uuid
 
-import nats
 from fastapi import FastAPI, HTTPException, Request
+import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -29,7 +29,7 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -72,11 +72,11 @@ class EgressPolicy(BaseModel):
     allowed_hosts: list[str] = Field(default_factory=list)
     allowed_ports: list[int] = Field(default_factory=list)
     enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class EgressLogEntry(BaseModel):
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     scenario_id: str | None = None
     network_id: str | None = None
     action: str  # "allow" or "deny"
@@ -112,7 +112,7 @@ def run_nft_command(args: list[str]) -> tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            [NFT_BINARY] + args,
+            [NFT_BINARY, *args],
             capture_output=True,
             text=True,
             timeout=10,
@@ -416,10 +416,8 @@ async def nats_subscriber() -> None:
         js = nc.jetstream()
 
         # Ensure audit stream exists
-        try:
+        with suppress(Exception):
             await js.add_stream(name="AUDIT", subjects=["audit.*"])
-        except Exception:
-            pass
 
         # Subscribe to scenario events
         created_config = ConsumerConfig(

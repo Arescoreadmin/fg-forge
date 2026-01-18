@@ -1,15 +1,15 @@
 import asyncio
 import base64
+from datetime import UTC, datetime
 import hashlib
 import importlib.util
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from httpx import ASGITransport, AsyncClient
@@ -58,7 +58,7 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
             scoreboard_module = load_scoreboard_module()
 
             scenario_id = "scn-e2e"
-            issued_at = int(datetime.now(timezone.utc).timestamp())
+            issued_at = int(datetime.now(UTC).timestamp())
             claims = spawn_module.SatClaims(
                 jti=str(uuid.uuid4()),
                 exp=issued_at + 300,
@@ -74,17 +74,15 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
             orchestrator_module.verify_sat(sat)
 
             orchestrator_module.scenarios.clear()
-            orchestrator_module.scenarios[scenario_id] = (
-                orchestrator_module.ScenarioState(
-                    scenario_id=scenario_id,
-                    request_id="req-1",
-                    track="netplus",
-                    subject="user-1",
-                    tenant_id="tenant-1",
-                    tier="FREE",
-                    retention_days=30,
-                    status=orchestrator_module.ScenarioStatus.RUNNING,
-                )
+            orchestrator_module.scenarios[scenario_id] = orchestrator_module.ScenarioState(
+                scenario_id=scenario_id,
+                request_id="req-1",
+                track="netplus",
+                subject="user-1",
+                tenant_id="tenant-1",
+                tier="FREE",
+                retention_days=30,
+                status=orchestrator_module.ScenarioStatus.RUNNING,
             )
 
             def scoreboard_client():
@@ -94,9 +92,7 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
             orchestrator_module._scoreboard_client = scoreboard_client
 
             asyncio.run(
-                orchestrator_module.complete_scenario(
-                    scenario_id, completion_reason="finished"
-                )
+                orchestrator_module.complete_scenario(scenario_id, completion_reason="finished")
             )
 
             results_dir = Path(tmpdir) / "scenarios" / scenario_id / "results"
@@ -116,11 +112,9 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
 
             verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
             signature = base64.b64decode(verdict["signature"])
-            public_key_bytes = base64.b64decode(
-                public_key_path.read_text(encoding="utf-8")
-            )
+            public_key_bytes = base64.b64decode(public_key_path.read_text(encoding="utf-8"))
             public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
-            public_key.verify(signature, f"{score_hash}:{evidence_hash}".encode("utf-8"))
+            public_key.verify(signature, f"{score_hash}:{evidence_hash}".encode())
 
 
 if __name__ == "__main__":

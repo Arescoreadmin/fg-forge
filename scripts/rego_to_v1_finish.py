@@ -21,6 +21,7 @@ RE_FUNC = re.compile(r"^(\s*)([A-Za-z_]\w*\s*\([^)]*\)\s*(?::=|=)\s*.+?)\s*\{\s*
 # Normal rule head: allow {  or container_safe(x) {  or valid_actor {
 RE_RULE = re.compile(r"^(\s*)([A-Za-z_]\w*(?:\s*\([^)]*\))?)\s*\{\s*$")
 
+
 def convert_lines(lines: list[str]) -> tuple[list[str], bool]:
     out: list[str] = []
     changed = False
@@ -58,6 +59,7 @@ def convert_lines(lines: list[str]) -> tuple[list[str], bool]:
 
     return out, changed
 
+
 def main() -> int:
     changed_any = False
     for p in sorted(POLICY_DIR.glob("*.rego")):
@@ -71,6 +73,7 @@ def main() -> int:
     if not changed_any:
         print("No changes made on finish pass.")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

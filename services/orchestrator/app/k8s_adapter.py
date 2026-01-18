@@ -1,10 +1,9 @@
 import os
 import time
-from typing import Dict, Optional
 
-import yaml
 from kubernetes import client, config, utils
 from kubernetes.client.rest import ApiException
+import yaml
 
 
 def load_kube() -> None:
@@ -21,7 +20,7 @@ class K8sAdapter:
         self.api_client = client.ApiClient()
         self.core = client.CoreV1Api()
 
-    def create_namespace(self, name: str, labels: Optional[Dict[str, str]] = None) -> None:
+    def create_namespace(self, name: str, labels: dict[str, str] | None = None) -> None:
         labels = labels or {}
         body = client.V1Namespace(metadata=client.V1ObjectMeta(name=name, labels=labels))
         try:
@@ -46,12 +45,13 @@ class K8sAdapter:
                 continue
             utils.create_from_dict(self.api_client, d, namespace=namespace)
 
-    def wait_pods_ready(self, namespace: str, label_selector: str, timeout_seconds: int = 120) -> None:
+    def wait_pods_ready(
+        self, namespace: str, label_selector: str, timeout_seconds: int = 120
+    ) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             pods = self.core.list_namespaced_pod(
-                namespace=namespace,
-                label_selector=label_selector
+                namespace=namespace, label_selector=label_selector
             ).items
 
             if not pods:

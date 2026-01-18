@@ -1,10 +1,10 @@
 import asyncio
 import importlib.util
 import os
+from pathlib import Path
 import sys
 import unittest
 import uuid
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 import httpx
