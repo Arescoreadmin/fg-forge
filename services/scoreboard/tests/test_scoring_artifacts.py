@@ -13,16 +13,8 @@ import uuid
 
 
 def load_module():
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / "services" / "scoreboard" / "app" / "main.py"
-    module_name = f"scoreboard_main_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if spec.loader is None:
-        raise RuntimeError("Failed to load scoreboard module")
-    spec.loader.exec_module(module)
-    return module
+    module = importlib.import_module("services.scoreboard.app.main")
+    return importlib.reload(module)
 
 
 class ScoreboardArtifactsTests(unittest.TestCase):

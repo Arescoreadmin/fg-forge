@@ -28,7 +28,7 @@ import uuid
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 import httpx
 from minio import Minio
 import nats
@@ -62,6 +62,23 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("forge_scoreboard")
+
+router = APIRouter()
+
+
+@dataclass(frozen=True)
+class ScoreboardConfig:
+    storage_root: Path
+    nats_url: str
+    event_bus_backend: str
+
+    @classmethod
+    def from_env(cls) -> "ScoreboardConfig":
+        return cls(
+            storage_root=Path(os.getenv("STORAGE_ROOT", "storage")),
+            nats_url=os.getenv("NATS_URL", "nats://forge_nats:4222"),
+            event_bus_backend=os.getenv("SCOREBOARD_EVENT_BUS", "nats"),
+        )
 
 # Configuration
 NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
@@ -129,6 +146,7 @@ class ScoreboardEntry(BaseModel):
     track: str
     score: ScoreResult
     evidence_url: str
+    evidence_sha256: str
     verdict_url: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -683,12 +701,21 @@ def finalize_scoring(
         verdict,
     )
 
+    forge_env = os.getenv("FORGE_ENV", "dev").lower()
+    if forge_env in {"dev", "development"}:
+        evidence_url = f"file://{evidence_path}"
+        verdict_url = f"file://{verdict_path}"
+    else:
+        evidence_url = "stored"
+        verdict_url = "stored"
+
     entry = ScoreboardEntry(
         scenario_id=payload.scenario_id,
         track=payload.track,
         score=score,
-        evidence_url=f"file://{evidence_path}",
-        verdict_url=f"file://{verdict_path}",
+        evidence_url=evidence_url,
+        evidence_sha256=evidence_hash,
+        verdict_url=verdict_url,
     )
     scoreboard[payload.scenario_id] = entry
     logger.info("Stored score artifacts for %s", payload.scenario_id)
@@ -777,23 +804,6 @@ async def nats_subscriber() -> None:
         logger.error("NATS subscriber error: %s", e)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    _enforce_startup_config()
-    task = asyncio.create_task(nats_subscriber())
-    logger.info("Scoreboard started")
-    yield
-    task.cancel()
-    if nc:
-        await nc.close()
-    logger.info("Scoreboard stopped")
-
-
-app = FastAPI(title="FrostGate Forge Scoreboard", lifespan=lifespan)
-
-
-@app.middleware("http")
 async def add_request_id(request: Request, call_next):
     request_id = (
         request.headers.get("x-request-id")
@@ -807,17 +817,47 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-@app.get("/health")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    _enforce_startup_config()
+    task = None
+    if app.state.config.event_bus_backend == "nats":
+        task = asyncio.create_task(nats_subscriber())
+    logger.info("Scoreboard started")
+    yield
+    if task:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    if nc:
+        await nc.close()
+    logger.info("Scoreboard stopped")
+
+
+def create_app(config: ScoreboardConfig) -> FastAPI:
+    global STORAGE_ROOT, NATS_URL
+    STORAGE_ROOT = config.storage_root
+    NATS_URL = config.nats_url
+
+    app = FastAPI(title="FrostGate Forge Scoreboard", lifespan=lifespan)
+    app.state.config = config
+    app.middleware("http")(add_request_id)
+    app.include_router(router)
+    return app
+
+
+@router.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "forge_scoreboard"}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok", "service": "forge_scoreboard"}
 
 
-@app.get("/readyz")
+@router.get("/readyz")
 def readyz() -> dict:
     _check_read_only_fs()
     _check_egress_gateway()
@@ -826,7 +866,7 @@ def readyz() -> dict:
     return {"status": "ready", "service": "forge_scoreboard"}
 
 
-@app.post("/internal/scenario/{scenario_id}/score")
+@router.post("/internal/scenario/{scenario_id}/score")
 async def score_internal(
     scenario_id: str,
     payload: ScenarioCompletionPayload,
@@ -854,11 +894,18 @@ async def score_internal(
         "status": "scored",
         "results_dir": results_dir.as_posix(),
         "evidence_url": entry.evidence_url,
+        "evidence_sha256": entry.evidence_sha256,
         "verdict_url": entry.verdict_url,
     }
 
 
-@app.get("/v1/scores/{scenario_id}")
+@router.get("/v1/audit/{scenario_id}/verify")
+async def verify_audit(scenario_id: str) -> dict:
+    path = audit_log_path(scenario_id)
+    return {"scenario_id": scenario_id, "audit_ok": verify_audit_chain(path)}
+
+
+@router.get("/v1/scores/{scenario_id}")
 async def get_score(scenario_id: str) -> ScoreboardEntry:
     """Get score for a scenario."""
     if scenario_id not in scoreboard:
@@ -877,7 +924,7 @@ async def list_scores(track: str | None = None, limit: int = 100) -> list[Scoreb
     return entries[:limit]
 
 
-@app.get("/v1/leaderboard/{track}")
+@router.get("/v1/leaderboard/{track}")
 async def get_leaderboard(track: str, limit: int = 10) -> list[dict]:
     """Get leaderboard for a specific track."""
     entries = [e for e in scoreboard.values() if e.track == track]
@@ -896,7 +943,7 @@ async def get_leaderboard(track: str, limit: int = 10) -> list[dict]:
     ]
 
 
-@app.get("/v1/stats")
+@router.get("/v1/stats")
 async def get_stats() -> dict:
     """Get aggregate scoring statistics."""
     if not scoreboard:
@@ -929,3 +976,6 @@ async def get_stats() -> dict:
         "total_scenarios": len(scoreboard),
         "by_track": by_track,
     }
+
+
+app = create_app(ScoreboardConfig.from_env())

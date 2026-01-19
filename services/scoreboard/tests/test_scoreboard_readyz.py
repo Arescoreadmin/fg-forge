@@ -1,5 +1,5 @@
 import asyncio
-import importlib.util
+import importlib
 import os
 from pathlib import Path
 import sys
@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 def load_scoreboard_module(storage_root: Path, signing_key_path: str | None):
     os.environ["STORAGE_ROOT"] = str(storage_root)
+    os.environ["SCOREBOARD_EVENT_BUS"] = "memory"
     if signing_key_path is None:
         os.environ.pop("SIGNING_KEY_PATH", None)
     else:

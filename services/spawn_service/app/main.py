@@ -544,6 +544,51 @@ def _timeout_config() -> tuple[float, float]:
     return connect, read
 
 
+def _httpx_timeout() -> httpx.Timeout:
+    connect, read = _timeout_config()
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+async def _async_request_with_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict | None = None,
+    breaker: CircuitBreaker | None = None,
+) -> httpx.Response:
+    if breaker and breaker.is_open():
+        raise httpx.RequestError(f"{breaker.name} circuit breaker open")
+    max_attempts = int(os.getenv("HTTP_MAX_RETRIES", "2")) + 1
+    base_delay = float(os.getenv("HTTP_RETRY_BASE_DELAY_SECONDS", "0.2"))
+    jitter = float(os.getenv("HTTP_RETRY_JITTER_SECONDS", "0.2"))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = await client.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+            )
+            if response.status_code >= 500:
+                raise httpx.RequestError(f"upstream {response.status_code}")
+            if breaker:
+                breaker.record_success()
+            return response
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if breaker:
+                breaker.record_failure()
+            if attempt >= max_attempts - 1:
+                break
+            delay = base_delay + random.uniform(0, jitter)
+            await asyncio.sleep(delay)
+    raise httpx.RequestError("request failed") from last_exc
+
+
 def _request_with_retries(
     method: str,
     url: str,
@@ -648,16 +693,19 @@ def resolve_subject_identifier(
     payload: SpawnRequest, request: Request, sat_claims: SatClaims | None
 ) -> str:
     subject = payload.subject.strip() if payload.subject else ""
+    client_header = request.app.state.config.client_id_header
     if sat_claims:
         if subject and sat_claims.subject != subject:
             raise HTTPException(status_code=403, detail="subject mismatch")
         subject = sat_claims.subject
     if not subject:
-        subject = request.headers.get(CLIENT_ID_HEADER, "").strip()
+        subject = request.headers.get(client_header, "").strip()
     if not subject:
         raise HTTPException(
             status_code=403,
-            detail=f"subject identifier required (provide subject or {CLIENT_ID_HEADER})",
+            detail=(
+                f"subject identifier required (provide subject or {client_header})"
+            ),
         )
     return subject
 
@@ -913,7 +961,7 @@ def _check_egress_gateway() -> None:
 
 
 def _check_opa_ready() -> None:
-    opa_url = os.getenv("OPA_URL")
+    opa_url = OPA_URL
     if not opa_url:
         if _forge_env() in {"dev", "development"}:
             return

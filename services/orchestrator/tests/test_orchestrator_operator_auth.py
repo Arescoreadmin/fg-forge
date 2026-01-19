@@ -13,15 +13,8 @@ from httpx import ASGITransport, AsyncClient
 def load_orchestrator_module():
     repo_root = Path(__file__).resolve().parents[3]
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
-    module_path = repo_root / "services" / "orchestrator" / "app" / "main.py"
-    module_name = f"orchestrator_main_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if spec.loader is None:
-        raise RuntimeError("Failed to load orchestrator module")
-    spec.loader.exec_module(module)
-    return module
+    module = importlib.import_module("services.orchestrator.app.main")
+    return importlib.reload(module)
 
 
 class OrchestratorOperatorAuthTests(unittest.TestCase):
@@ -30,7 +23,21 @@ class OrchestratorOperatorAuthTests(unittest.TestCase):
         os.environ["ORCHESTRATOR_INTERNAL_TOKEN"] = "internal"
         os.environ["OPERATOR_TOKEN"] = "operator"
         scenario_id = "scn-auth"
-        module.scenarios[scenario_id] = module.ScenarioState(
+        app = module.create_app(
+            module.OrchestratorConfig(
+                template_dir=Path(os.environ["TEMPLATE_DIR"]),
+                opa_url="http://unused",
+                nats_url="nats://memory",
+                scoreboard_url="http://scoreboard",
+                scoreboard_app=None,
+                storage_root=Path("storage"),
+                policy_backend="allow_all",
+                container_backend="stub",
+                event_bus_backend="memory",
+                storage_backend="fs",
+            )
+        )
+        app.state.scenarios[scenario_id] = module.ScenarioState(
             scenario_id=scenario_id,
             request_id="req-1",
             track="netplus",
@@ -38,7 +45,7 @@ class OrchestratorOperatorAuthTests(unittest.TestCase):
         )
 
         async def run():
-            transport = ASGITransport(app=module.app)
+            transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://orch") as client:
                 response = await client.post(
                     f"/internal/scenario/{scenario_id}/complete",
