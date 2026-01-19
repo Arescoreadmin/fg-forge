@@ -13,3 +13,11 @@ __pycache__/
 
 # Dev scripts
 /tmp/
+
+# local env files
+.env*
+
+.env.staging
+
+# local env files
+.env*

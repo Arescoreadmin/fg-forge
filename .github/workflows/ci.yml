@@ -22,6 +22,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_PYTHON_VERSION_WARNING: "1"
       PYTHONPATH: "."
+      # Make runtime expectations explicit (don’t “accidentally dev”).
+      FORGE_ENV: "dev"
 
     steps:
       - name: Checkout
@@ -32,40 +34,65 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          # Cache against ALL python requirement files we might install
           cache-dependency-path: |
-            services/spawn_service/requirements.txt
-            services/orchestrator/requirements.txt
-            services/scoreboard/requirements.txt
-            scripts/requirements.txt
+            **/requirements.txt
+            **/requirements-dev.txt
+            **/requirements-ci.txt
 
       - name: Install system deps (ripgrep)
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ripgrep
+          sudo rm -rf /var/lib/apt/lists/*
 
-      - name: Install tooling + dependencies
+      - name: Install tooling + dependencies (ALL services)
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install ruff pip-audit
+          python -m pip install --upgrade pip wheel
+          python -m pip install ruff pip-audit
 
-          # scripts deps (helpers/tests)
+          echo "== Discovering requirements files =="
+          # Install scripts requirements first (helpers/tests)
           if [ -f scripts/requirements.txt ]; then
-            pip install -r scripts/requirements.txt
+            echo "Installing scripts/requirements.txt"
+            python -m pip install -r scripts/requirements.txt
           fi
 
-          # service deps
-          pip install \
-            -r services/spawn_service/requirements.txt \
-            -r services/orchestrator/requirements.txt \
-            -r services/scoreboard/requirements.txt
+          # Install every service requirements file found under services/*/
+          # This prevents the classic CI fail where only 3 services were installed,
+          # but tests/imports touch other services that need yaml/requests/redis/etc.
+          mapfile -t REQ_FILES < <(
+            find services -maxdepth 2 -type f \( -name "requirements.txt" -o -name "requirements-dev.txt" -o -name "requirements-ci.txt" \) -print \
+              | sort
+          )
+
+          if [ "${#REQ_FILES[@]}" -eq 0 ]; then
+            echo "No requirements files found under services/"
+            exit 1
+          fi
+
+          echo "== Installing service requirements =="
+          for req in "${REQ_FILES[@]}"; do
+            echo "Installing ${req}"
+            python -m pip install -r "${req}"
+          done
+
+          echo "== Installed package set =="
+          python -m pip freeze | sort | head -n 200
 
       # ---------------------------
-      # Fast safeguards (fail early)
+      # Lint + formatting (fail early)
       # ---------------------------
+
+      - name: Format (ruff)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruff format --check .
 
       - name: Lint (ruff)
         shell: bash
@@ -92,7 +119,6 @@ jobs:
         run: |
           set -euo pipefail
           PATTERN='BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}'
-
           if rg -n --hidden --no-ignore-vcs \
             --glob '!.git/**' \
             --glob '!.venv/**' \
@@ -108,14 +134,11 @@ jobs:
             exit 1
           fi
 
-
       - name: Dependency vulnerability scan (pip-audit)
         shell: bash
         run: |
           set -euo pipefail
 
-          # If you want strict mode, remove IGNORE_ARGS and fix deps instead.
-          # Keeping CI unblocked while you iterate, but still visible.
           IGNORE_ARGS=(
             "--ignore-vuln" "PYSEC-2024-38"
             "--ignore-vuln" "CVE-2024-35195"
@@ -125,12 +148,17 @@ jobs:
             "--ignore-vuln" "CVE-2024-47874"
           )
 
-          pip-audit -r services/spawn_service/requirements.txt "${IGNORE_ARGS[@]}"
-          pip-audit -r services/orchestrator/requirements.txt "${IGNORE_ARGS[@]}"
-          pip-audit -r services/scoreboard/requirements.txt "${IGNORE_ARGS[@]}"
-          if [ -f scripts/requirements.txt ]; then
-            pip-audit -r scripts/requirements.txt "${IGNORE_ARGS[@]}"
-          fi
+          # Audit every requirements file we installed
+          mapfile -t AUDIT_FILES < <(
+            { test -f scripts/requirements.txt && echo scripts/requirements.txt; } ; \
+            find services -maxdepth 2 -type f \( -name "requirements.txt" -o -name "requirements-dev.txt" -o -name "requirements-ci.txt" \) -print \
+              | sort
+          )
+
+          for req in "${AUDIT_FILES[@]}"; do
+            echo "pip-audit -r ${req}"
+            pip-audit -r "${req}" "${IGNORE_ARGS[@]}"
+          done
 
       - name: CI fingerprint
         shell: bash

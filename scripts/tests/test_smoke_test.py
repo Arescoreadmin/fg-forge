@@ -20,7 +20,9 @@ class SmokeTestScriptTests(unittest.TestCase):
 
     def test_compose_cmd_includes_files(self):
         cmd = smoke_test._compose_cmd(["up", "-d"])
-        self.assertEqual(cmd[:6], ["docker", "compose", "-f", "compose.yml", "-f", "compose.staging.yml"])
+        self.assertEqual(
+            cmd[:6], ["docker", "compose", "-f", "compose.yml", "-f", "compose.staging.yml"]
+        )
         self.assertEqual(cmd[6:], ["up", "-d"])
 
 

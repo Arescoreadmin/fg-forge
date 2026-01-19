@@ -8,30 +8,30 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import asynccontextmanager, suppress
 import contextvars
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import gzip
 import hashlib
 import hmac
+from io import BytesIO
 import json
 import logging
 import os
-import tarfile
-import uuid
-import random
-import time
-from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from io import BytesIO
 from pathlib import Path
+import random
+import tarfile
+import time
 from typing import Any
+import uuid
 
-import nats
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 import httpx
 from minio import Minio
+import nats
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
 
@@ -41,7 +41,7 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -107,6 +107,7 @@ def _enforce_startup_config() -> None:
         if missing:
             raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
 
+
 # Signing key (in production, load from Vault/KMS)
 SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 
@@ -129,7 +130,7 @@ class ScoreResult(BaseModel):
     passed: int
     total: int
     criteria: list[CriterionScore] = Field(default_factory=list)
-    computed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    computed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class Verdict(BaseModel):
@@ -147,7 +148,7 @@ class ScoreboardEntry(BaseModel):
     evidence_url: str
     evidence_sha256: str
     verdict_url: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ScenarioCompletionPayload(BaseModel):
@@ -362,15 +363,15 @@ def append_audit_event(
     if path.exists():
         last_line = ""
         with path.open("r", encoding="utf-8") as handle:
-            for last_line in handle:
-                pass
+            for line in handle:
+                last_line = line
         if last_line:
             try:
                 prev_hash = json.loads(last_line).get("entry_hash", prev_hash)
             except json.JSONDecodeError:
                 prev_hash = "0" * 64
     entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "scenario_id": scenario_id,
         "event_type": event_type,
         "actor": actor,
@@ -435,9 +436,7 @@ def _check_storage_writable() -> None:
         test_file = scenarios_dir / ".readyz"
         test_file.write_bytes(b"")
     except OSError as exc:
-        raise HTTPException(
-            status_code=503, detail=f"storage not writable: {exc}"
-        ) from exc
+        raise HTTPException(status_code=503, detail=f"storage not writable: {exc}") from exc
     finally:
         test_file = scenarios_dir / ".readyz"
         if test_file.exists():
@@ -448,9 +447,7 @@ def _check_signing_key_ready() -> None:
     try:
         get_signing_key()
     except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail=f"signing key unavailable: {exc}"
-        ) from exc
+        raise HTTPException(status_code=503, detail=f"signing key unavailable: {exc}") from exc
 
 
 def _read_only_required() -> bool:
@@ -469,10 +466,8 @@ def _check_read_only_fs() -> None:
     except OSError:
         return
     else:
-        try:
+        with suppress(OSError):
             probe_path.unlink()
-        except OSError:
-            pass
         raise HTTPException(status_code=503, detail="filesystem not read-only")
 
 
@@ -503,9 +498,7 @@ def _check_egress_gateway() -> None:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(
-            status_code=503, detail="egress gateway invalid response"
-        ) from exc
+        raise HTTPException(status_code=503, detail="egress gateway invalid response") from exc
     if str(payload.get("dry_run", "")).lower() != expected.lower():
         raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
@@ -561,9 +554,7 @@ def build_evidence_bundle(
 ) -> EvidenceBundle:
     buffer = BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
-        log_payload = (
-            f"scoreboard evidence placeholder for {scenario_id} ({track})\n"
-        ).encode("utf-8")
+        log_payload = (f"scoreboard evidence placeholder for {scenario_id} ({track})\n").encode()
         _tar_add_bytes(tar, "logs/scoreboard.log", log_payload)
 
         telemetry_payload = json.dumps(
@@ -595,7 +586,7 @@ def build_evidence_bundle(
             _tar_add_bytes(
                 tar,
                 "source_evidence.txt",
-                f"{source_evidence_url}\n".encode("utf-8"),
+                f"{source_evidence_url}\n".encode(),
             )
 
         if artifacts_root:
@@ -626,7 +617,7 @@ def build_evidence_bundle(
 def sign_verdict(score_hash: str, evidence_hash: str, scenario_id: str) -> Verdict:
     """Create a signed verdict for a scenario completion."""
     key = get_signing_key()
-    computed_at = datetime.now(timezone.utc).isoformat()
+    computed_at = datetime.now(UTC).isoformat()
 
     # Create message to sign
     message = f"{score_hash}:{evidence_hash}"
@@ -752,7 +743,7 @@ async def process_scenario_completed(msg: Any) -> None:
             scenario_id=scenario_id,
             track=track,
             completion_reason=data.get("completion_reason", "nats_event"),
-            completed_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(UTC),
             subject=subject,
             tenant_id=tenant_id,
             plan=plan,
@@ -922,10 +913,8 @@ async def get_score(scenario_id: str) -> ScoreboardEntry:
     return scoreboard[scenario_id]
 
 
-@router.get("/v1/scores")
-async def list_scores(
-    track: str | None = None, limit: int = 100
-) -> list[ScoreboardEntry]:
+@app.get("/v1/scores")
+async def list_scores(track: str | None = None, limit: int = 100) -> list[ScoreboardEntry]:
     """List all scores, optionally filtered by track."""
     entries = list(scoreboard.values())
     if track:

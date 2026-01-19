@@ -4,16 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib import error, request
 import uuid
-from pathlib import Path
-from typing import Iterable
-from urllib import request, error
-
 
 COMPOSE_FILES = ["compose.yml", "compose.staging.yml"]
 
@@ -69,6 +68,7 @@ def _wait_for_ready(url: str, timeout_seconds: int = 120) -> None:
 def _wait_for_artifacts(scenario_id: str, timeout_seconds: int = 120) -> Path:
     deadline = time.time() + timeout_seconds
     results_dir = Path("storage") / "scenarios" / scenario_id / "results"
+
     while time.time() < deadline:
         if results_dir.is_dir():
             score = results_dir / "score.json"
@@ -76,10 +76,17 @@ def _wait_for_artifacts(scenario_id: str, timeout_seconds: int = 120) -> Path:
             verdict_pub = results_dir / "verdict.pub"
             evidence_zst = results_dir / "evidence.tar.zst"
             evidence_gz = results_dir / "evidence.tar.gz"
-            if score.exists() and verdict.exists() and verdict_pub.exists():
-                if evidence_zst.exists() or evidence_gz.exists():
-                    return results_dir
+
+            if (
+                score.exists()
+                and verdict.exists()
+                and verdict_pub.exists()
+                and (evidence_zst.exists() or evidence_gz.exists())
+            ):
+                return results_dir
+
         time.sleep(2)
+
     raise RuntimeError("timeout waiting for scoring artifacts")
 
 

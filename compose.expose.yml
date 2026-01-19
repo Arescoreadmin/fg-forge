@@ -1,0 +1,36 @@
+services:
+  forge_opa:
+    ports:
+      - "18181:8181"
+
+  forge_redis:
+    ports:
+      - "6379:6379"
+
+  forge_nats:
+    ports:
+      # publish on alternate host ports to avoid collisions
+      - "14222:4222"
+      - "18222:8222"
+
+  forge_minio:
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+
+  forge_loki:
+    ports:
+      - "3100:3100"
+
+  forge_prometheus:
+    ports:
+      - "9090:9090"
+
+  forge_grafana:
+    ports:
+      - "3000:3000"
+
+  forge_spawn_service:
+    ports:
+      - "8082:8080"
+ 

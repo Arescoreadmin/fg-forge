@@ -1,4 +1,5 @@
-"""FrostGate Forge Orchestrator Service.
+"""
+FrostGate Forge Orchestrator Service.
 
 Central coordinator for scenario lifecycle management. Validates templates,
 enforces OPA policies, creates isolated networks, and manages container lifecycles.
@@ -8,32 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import OrderedDict
+from contextlib import asynccontextmanager, suppress
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import hashlib
 import hmac
-import inspect
 import importlib
+import inspect
 import json
 import logging
 import os
+from pathlib import Path
 import random
 import time
+from typing import Any
 import uuid
-from collections import OrderedDict
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
 
 import docker
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 import httpx
 import nats
-import yaml
-from fastapi import APIRouter, FastAPI, HTTPException, Request
 from nats.js.api import ConsumerConfig, DeliverPolicy
 from pydantic import BaseModel, Field
+import yaml
+
+
+def cfg_orch_backend() -> str:
+    return os.getenv("ORCH_BACKEND", "docker").lower()
+
 
 # -----------------------------------------------------------------------------
 # Routers (declare first; mount inside create_app())
@@ -44,13 +49,14 @@ internal_router = APIRouter(prefix="/internal")
 # Request correlation id (used by logger + middleware)
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -71,6 +77,7 @@ def configure_logging() -> None:
 
 configure_logging()
 logger = logging.getLogger("forge_orchestrator")
+
 
 # -----------------------------------------------------------------------------
 # Configuration (NO import-time freezing)
@@ -147,8 +154,8 @@ class ScenarioState(BaseModel):
     status: ScenarioStatus = ScenarioStatus.PENDING
     network_id: str | None = None
     containers: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     completed_at: datetime | None = None
     completion_reason: str | None = None
     error: str | None = None
@@ -182,8 +189,8 @@ class SatClaims(BaseModel):
     tenant_id: str
     tier: str
     retention_days: int | None = None
-    requested_limits: Optional[dict[str, int]] = None
-    scenario_id: Optional[str] = None
+    requested_limits: dict[str, int] | None = None
+    scenario_id: str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -197,13 +204,15 @@ class ReplayProtector:
         self._lock = asyncio.Lock()
 
     async def _get_redis(self) -> Any | None:
-        # REDIS_URL may be overridden in tests, so re-read env if client not created.
         if not os.getenv("REDIS_URL"):
             return None
         if self._redis_client is None:
             import redis.asyncio as redis
 
-            self._redis_client = redis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+            self._redis_client = redis.from_url(
+                os.getenv("REDIS_URL"),
+                decode_responses=True,
+            )
         return self._redis_client
 
     def _purge_expired(self, now: int) -> None:
@@ -212,7 +221,7 @@ class ReplayProtector:
             self._cache.pop(key, None)
 
     async def check_and_store(self, jti: str, exp: int) -> bool:
-        now = int(datetime.now(timezone.utc).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         ttl = exp - now
         if ttl <= 0:
             return False
@@ -350,7 +359,9 @@ def _scoreboard_client() -> httpx.AsyncClient:
         try:
             asgi_app = _import_from_path(import_path)
         except Exception as exc:
-            raise RuntimeError(f"Failed to import SCOREBOARD_ASGI_IMPORT={import_path}: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to import SCOREBOARD_ASGI_IMPORT={import_path}: {exc}"
+            ) from exc
 
         return httpx.AsyncClient(
             transport=ASGITransport(app=asgi_app),
@@ -385,7 +396,16 @@ def load_template(track: str) -> dict:
         return {
             "id": track,
             "track": track,
-            "assets": {"containers": [{"name": "trainer", "image": "alpine:3.19", "read_only": True, "environment": {}}]},
+            "assets": {
+                "containers": [
+                    {
+                        "name": "trainer",
+                        "image": "alpine:3.19",
+                        "read_only": True,
+                        "environment": {},
+                    }
+                ]
+            },
         }
 
     raise HTTPException(status_code=404, detail=f"Template not found: {track}")
@@ -421,7 +441,7 @@ def _get_sat_secret() -> str:
     raise HTTPException(status_code=500, detail="SAT secret not configured")
 
 
-def _parse_bearer_token(value: str) -> Optional[str]:
+def _parse_bearer_token(value: str) -> str | None:
     if not value:
         return None
     parts = value.split()
@@ -444,8 +464,10 @@ def verify_sat(token: str) -> SatClaims:
     if header.get("alg") != "HS256" or header.get("typ") != "SAT":
         raise HTTPException(status_code=401, detail="invalid sat")
 
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    expected_signature = hmac.new(_get_sat_secret().encode("utf-8"), signing_input, "sha256").digest()
+    signing_input = f"{header_encoded}.{payload_encoded}".encode()
+    expected_signature = hmac.new(
+        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
+    ).digest()
     expected_encoded = _b64url_encode(expected_signature)
     if not hmac.compare_digest(expected_encoded, signature_encoded):
         raise HTTPException(status_code=401, detail="invalid sat")
@@ -455,7 +477,7 @@ def verify_sat(token: str) -> SatClaims:
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="invalid sat") from exc
 
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     if payload.iat > payload.exp:
         raise HTTPException(status_code=401, detail="invalid sat")
     if payload.exp < now:
@@ -591,16 +613,34 @@ async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
                 json_body={"input": input_payload},
                 breaker=_opa_breaker,
             )
+
             if response.status_code >= 400:
                 return False, f"OPA error: {response.status_code}"
 
+            result = response.json()
+            allowed = result.get("result", False)
+            if not allowed:
+                return False, "Policy denied"
+
+            return True, None
+
+        except httpx.RequestError as e:
+            logger.warning("OPA request failed: %s", e)
+            return False, f"OPA unavailable: {e}"
+
+        except Exception:
+            # This is the “adult” pattern: log + re-raise.
+            logger.exception("orchestrator: unhandled error in OPA policy check")
+            raise
 
 
 async def _check_opa_ready() -> None:
     opa_url = cfg_opa_url()
     async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
-            response = await _request_with_retries(client, "GET", f"{opa_url}/health", breaker=_opa_breaker)
+            response = await _request_with_retries(
+                client, "GET", f"{opa_url}/health", breaker=_opa_breaker
+            )
         except httpx.RequestError as exc:
             raise HTTPException(status_code=503, detail=f"opa unavailable: {exc}") from exc
     if response.status_code >= 400:
@@ -623,10 +663,8 @@ def _check_read_only_fs() -> None:
     except OSError:
         return
     else:
-        try:
+        with suppress(OSError):
             probe_path.unlink()
-        except OSError:
-            pass
         raise HTTPException(status_code=503, detail="filesystem not read-only")
 
 
@@ -641,12 +679,18 @@ async def _check_egress_gateway() -> None:
 
     async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
-            response = await _request_with_retries(client, "GET", f"{egress_url}/readyz", breaker=_egress_breaker)
+            response = await _request_with_retries(
+                client, "GET", f"{egress_url}/readyz", breaker=_egress_breaker
+            )
         except httpx.RequestError as exc:
-            raise HTTPException(status_code=503, detail=f"egress gateway unavailable: {exc}") from exc
+            raise HTTPException(
+                status_code=503, detail=f"egress gateway unavailable: {exc}"
+            ) from exc
 
     if response.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"egress gateway unhealthy: {response.status_code}")
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
 
     try:
         payload = response.json()
@@ -733,8 +777,8 @@ def append_audit_event(
     if audit_path.exists():
         last_line = ""
         with audit_path.open("r", encoding="utf-8") as handle:
-            for last_line in handle:
-                pass
+            for line in handle:
+                last_line = line
         if last_line:
             try:
                 prev_hash = json.loads(last_line).get("entry_hash", prev_hash)
@@ -742,7 +786,7 @@ def append_audit_event(
                 prev_hash = "0" * 64
 
     entry = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(UTC).isoformat(),
         "scenario_id": scenario_id,
         "event_type": event_type,
         "actor": actor,
@@ -768,7 +812,7 @@ def create_scenario_network(scenario_id: str) -> str:
         internal=True,
         labels={
             "forge.scenario_id": scenario_id,
-            "forge.created_at": datetime.now(timezone.utc).isoformat(),
+            "forge.created_at": datetime.now(UTC).isoformat(),
             "forge.managed": "true",
         },
     )
@@ -814,7 +858,9 @@ def launch_scenario_containers(scenario_id: str, network_id: str, template: dict
         try:
             container = _run()
             container_ids.append(container.id)
-            logger.info("Launched container %s (%s) for scenario %s", container_name, image, scenario_id)
+            logger.info(
+                "Launched container %s (%s) for scenario %s", container_name, image, scenario_id
+            )
         except docker.errors.ImageNotFound:
             logger.warning("Image %s not found, pulling...", image)
             client.images.pull(image)
@@ -830,7 +876,9 @@ def launch_scenario_containers(scenario_id: str, network_id: str, template: dict
 def cleanup_scenario(scenario_id: str) -> None:
     client = get_docker_client()
 
-    containers = client.containers.list(all=True, filters={"label": f"forge.scenario_id={scenario_id}"})
+    containers = client.containers.list(
+        all=True, filters={"label": f"forge.scenario_id={scenario_id}"}
+    )
     for container in containers:
         try:
             container.stop(timeout=5)
@@ -861,10 +909,10 @@ async def complete_scenario(
         raise HTTPException(status_code=404, detail="Scenario not found")
 
     state = scenarios[scenario_id]
-    completed_at = completion_timestamp or datetime.now(timezone.utc)
+    completed_at = completion_timestamp or datetime.now(UTC)
     state.completed_at = completed_at
     state.completion_reason = completion_reason
-    state.updated_at = datetime.now(timezone.utc)
+    state.updated_at = datetime.now(UTC)
 
     logger.info(
         "Scenario completed: scenario_id=%s reason=%s completed_at=%s",
@@ -880,7 +928,11 @@ async def complete_scenario(
             event_type="scenario.complete",
             actor="operator",
             correlation_id=request_id_ctx.get(),
-            details={"reason": completion_reason, "subject": state.subject, "tenant_id": state.tenant_id},
+            details={
+                "reason": completion_reason,
+                "subject": state.subject,
+                "tenant_id": state.tenant_id,
+            },
         )
         await _trigger_scoreboard(
             scenario_id,
@@ -924,12 +976,10 @@ async def process_spawn_request(msg: Any) -> None:
             await msg.ack()
             return
 
-        # NOTE: process_spawn_request runs outside request context, so request_id_ctx may be "-"
         request_id_ctx.set(correlation_id)
 
         try:
             template_id = data.get("template_id") or track
-            # app object isn't required for our enforce_sat signature, but keep adapter anyway.
             claims = await _call_enforce_sat(None, sat, scenario_id, track, template_id, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
@@ -940,7 +990,12 @@ async def process_spawn_request(msg: Any) -> None:
             await msg.ack()
             return
 
-        logger.info("Processing spawn request: scenario_id=%s track=%s request_id=%s", scenario_id, track, request_id)
+        logger.info(
+            "Processing spawn request: scenario_id=%s track=%s request_id=%s",
+            scenario_id,
+            track,
+            request_id,
+        )
 
         template = load_template(track)
 
@@ -978,15 +1033,22 @@ async def process_spawn_request(msg: Any) -> None:
         container_ids = launch_scenario_containers(scenario_id, network_id, template)
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
-        state.updated_at = datetime.now(timezone.utc)
+        state.updated_at = datetime.now(UTC)
 
-        logger.info("Scenario %s is now running with %d containers", scenario_id, len(container_ids))
+        logger.info(
+            "Scenario %s is now running with %d containers", scenario_id, len(container_ids)
+        )
 
         if js:
             await js.publish(
                 "scenario.created",
                 json.dumps(
-                    {"scenario_id": scenario_id, "track": track, "network_id": network_id, "containers": container_ids}
+                    {
+                        "scenario_id": scenario_id,
+                        "track": track,
+                        "network_id": network_id,
+                        "containers": container_ids,
+                    }
                 ).encode("utf-8"),
             )
 
@@ -994,10 +1056,8 @@ async def process_spawn_request(msg: Any) -> None:
 
     except Exception as e:
         logger.exception("Error processing spawn request: %s", e)
-        try:
+        with suppress(Exception):
             await msg.nak()
-        except Exception:
-            pass
 
 
 async def nats_subscriber() -> None:
@@ -1008,12 +1068,12 @@ async def nats_subscriber() -> None:
         nc = await nats.connect(cfg_nats_url())
         js = nc.jetstream()
 
-        try:
+        with suppress(Exception):
             await js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
-        except Exception:
-            pass
 
-        consumer_config = ConsumerConfig(durable_name="orchestrator", deliver_policy=DeliverPolicy.ALL, ack_wait=30)
+        consumer_config = ConsumerConfig(
+            durable_name="orchestrator", deliver_policy=DeliverPolicy.ALL, ack_wait=30
+        )
         await js.subscribe("spawn.request", cb=process_spawn_request, config=consumer_config)
         logger.info("Subscribed to spawn.request")
 
@@ -1029,8 +1089,6 @@ async def nats_subscriber() -> None:
 # -----------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
-    global scenarios
-
     app_.state.scenarios = scenarios
 
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
@@ -1042,6 +1100,8 @@ async def lifespan(app_: FastAPI):
         yield
     finally:
         task.cancel()
+        with suppress(Exception):
+            await task
         if nc:
             await nc.close()
         logger.info("Orchestrator stopped")
@@ -1052,7 +1112,11 @@ def create_app() -> FastAPI:
 
     @app_.middleware("http")
     async def add_request_id(request: Request, call_next):
-        rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id") or str(uuid.uuid4())
+        rid = (
+            request.headers.get("x-request-id")
+            or request.headers.get("x-correlation-id")
+            or str(uuid.uuid4())
+        )
         token = request_id_ctx.set(rid)
         try:
             response = await call_next(request)
@@ -1061,10 +1125,8 @@ def create_app() -> FastAPI:
         response.headers["x-request-id"] = rid
         return response
 
-    # Mount routers (this fixes your 404/401 mess)
     app_.include_router(router)
     app_.include_router(internal_router)
-
     return app_
 
 
@@ -1089,7 +1151,9 @@ async def readyz() -> dict:
 
     try:
         async with _scoreboard_client() as client:
-            response = await _request_with_retries(client, "GET", "/readyz", breaker=_scoreboard_breaker)
+            response = await _request_with_retries(
+                client, "GET", "/readyz", breaker=_scoreboard_breaker
+            )
     except httpx.RequestError as exc:
         raise HTTPException(status_code=503, detail=f"scoreboard unavailable: {exc}") from exc
 
@@ -1100,22 +1164,32 @@ async def readyz() -> dict:
 
 
 @router.post("/v1/scenarios", response_model=CreateScenarioResponse)
-async def create_scenario(request: CreateScenarioRequest, http_request: Request) -> CreateScenarioResponse:
+async def create_scenario(
+    request: CreateScenarioRequest, http_request: Request
+) -> CreateScenarioResponse:
     """Create a new scenario (direct API, bypasses NATS)."""
     scenario_id = request.scenario_id
     track = request.template
 
-    token = http_request.headers.get("x-sat") or _parse_bearer_token(http_request.headers.get("authorization", ""))
+    token = http_request.headers.get("x-sat") or _parse_bearer_token(
+        http_request.headers.get("authorization", "")
+    )
     template_id = getattr(request, "template_id", None) or track
 
-    claims = await _call_enforce_sat(http_request.app, token, scenario_id, track, template_id, request.tier)
+    claims = await _call_enforce_sat(
+        http_request.app, token, scenario_id, track, template_id, request.tier
+    )
 
     store: dict[str, ScenarioState] = http_request.app.state.scenarios
 
+    # Idempotency: if scenario already exists, return current state
     if scenario_id in store:
         state = store[scenario_id]
-        return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=state.network_id)
+        return CreateScenarioResponse(
+            scenario_id=scenario_id, status=state.status, network_id=state.network_id
+        )
 
+    # Create state once
     state = ScenarioState(
         scenario_id=scenario_id,
         request_id=request.request_id,
@@ -1135,17 +1209,79 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         event_type="scenario.create",
         actor=claims.subject,
         correlation_id=request_id_ctx.get(),
-        details={"track": track, "tenant_id": claims.tenant_id},
+        details={"track": track, "tenant_id": claims.tenant_id, "backend": cfg_orch_backend()},
     )
 
+    # Load template + OPA gate before launching anything
     template = load_template(track)
-
     allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
     if not allowed:
         state.status = ScenarioStatus.FAILED
         state.error = reason
         raise HTTPException(status_code=403, detail=reason)
 
+    # --- K8s backend (no docker.sock) ---
+    if cfg_orch_backend() == "k8s":
+        try:
+            # Optional components; only imported when backend is k8s.
+            from .k8s_adapter import K8sAdapter  # type: ignore
+            from .scenario_manifests import learner_pod_yaml  # type: ignore
+        except Exception as exc:
+            state.status = ScenarioStatus.FAILED
+            state.error = f"k8s backend not available: {exc}"
+            raise HTTPException(status_code=500, detail=state.error) from exc
+
+        k8s = K8sAdapter()
+        ns = scenario_id if scenario_id.startswith("scn-") else f"scn-{scenario_id}"
+
+        try:
+            k8s.create_namespace(ns, labels={"forge.scenario": "true", "scenario_id": scenario_id})
+
+            deny_path = (
+                Path(__file__).resolve().parents[3]
+                / "infra"
+                / "k8s"
+                / "base"
+                / "deny-all-networkpolicy.yaml"
+            )
+            k8s.apply_yaml(ns, deny_path.read_text(encoding="utf-8"))
+
+            k8s.apply_yaml(ns, learner_pod_yaml(scenario_id))
+            k8s.wait_pods_ready(
+                ns, label_selector=f"scenario_id={scenario_id}", timeout_seconds=120
+            )
+
+            state.network_id = f"k8s:{ns}"
+            state.status = ScenarioStatus.RUNNING
+            state.updated_at = datetime.now(UTC)
+
+            append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.k8s.started",
+                actor=claims.subject,
+                correlation_id=request_id_ctx.get(),
+                details={"namespace": ns},
+            )
+
+            return CreateScenarioResponse(
+                scenario_id=scenario_id, status=state.status, network_id=state.network_id
+            )
+
+        except Exception as e:
+            state.status = ScenarioStatus.FAILED
+            state.error = str(e)
+
+            append_audit_event(
+                scenario_id=scenario_id,
+                event_type="scenario.k8s.failed",
+                actor=claims.subject,
+                correlation_id=request_id_ctx.get(),
+                details={"namespace": ns, "error": str(e)},
+            )
+
+            raise HTTPException(status_code=500, detail=f"K8s scenario launch failed: {e}") from e
+
+    # --- Docker backend ---
     try:
         network_id = create_scenario_network(http_request.app, scenario_id)
         state.network_id = network_id
@@ -1160,14 +1296,16 @@ async def create_scenario(request: CreateScenarioRequest, http_request: Request)
         )
         state.containers = container_ids
         state.status = ScenarioStatus.RUNNING
-        state.updated_at = datetime.now(timezone.utc)
+        state.updated_at = datetime.now(UTC)
     except Exception as e:
         cleanup_scenario(http_request.app, scenario_id)
         state.status = ScenarioStatus.FAILED
         state.error = str(e)
         raise HTTPException(status_code=500, detail=f"Container launch failed: {e}") from e
 
-    return CreateScenarioResponse(scenario_id=scenario_id, status=state.status, network_id=network_id)
+    return CreateScenarioResponse(
+        scenario_id=scenario_id, status=state.status, network_id=network_id
+    )
 
 
 @router.get("/v1/scenarios/{scenario_id}")
@@ -1207,7 +1345,9 @@ async def complete_scenario_endpoint(
 ) -> ScenarioState:
     _require_internal_auth(request)
     _require_operator_auth(request)
-    return await complete_scenario(scenario_id, payload.completion_reason, payload.completion_timestamp)
+    return await complete_scenario(
+        scenario_id, payload.completion_reason, payload.completion_timestamp
+    )
 
 
 # -----------------------------------------------------------------------------
