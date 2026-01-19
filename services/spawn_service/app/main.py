@@ -1,27 +1,26 @@
 from __future__ import annotations
 
-import traceback
-
+import asyncio
 import base64
+from contextlib import asynccontextmanager, suppress
 import contextvars
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 import hmac
 import json
 import logging
 import os
+from pathlib import Path
 import random
 import threading
 import time
+import traceback
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Dict, Optional, Tuple
 
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
 import requests
 import yaml
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
 
 # -------------------------------------------------------------------
 # Import entitlements in a way that survives BOTH:
@@ -37,7 +36,7 @@ try:
         normalize_tier,
         verify_et,
     )
-except ImportError:
+except ImportError:  # pragma: no cover
     import sys
 
     spawn_service_root = Path(__file__).resolve().parent.parent  # .../services/spawn_service
@@ -53,21 +52,44 @@ except ImportError:
         verify_et,
     )
 
+# -----------------------------------------------------------------------------
+# Globals
+# -----------------------------------------------------------------------------
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 logger = logging.getLogger("forge_spawn_service")
 
 _warned_sat_secret_alias = False
-_fallback_warning_emitted = False
-
-# ACCESS TOKEN SECRET: keep dev fallback stable per process, warn once
 _warned_access_token_secret = False
 _dev_access_token_secret: str | None = None
 
+_fallback_warning_emitted = False
 
+entitlement_resolver = EntitlementResolver()
+
+TRACKS = {"netplus", "ccna", "cissp"}
+TRACK_TEMPLATE = {
+    "netplus": "netplus.yaml",
+    "ccna": "ccna.yaml",
+    "cissp": "cissp.yaml",
+}
+
+ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
+CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
+TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
+
+TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
+
+# NOTE: in-memory cache is dev-friendly but not multi-replica safe.
+REQUEST_CACHE: dict[str, dict] = {}
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -106,7 +128,6 @@ def _get_access_token_secret() -> str:
         return secret
 
     if _forge_env() in {"dev", "development"}:
-        # Tests expect this path to be allowed.
         if _dev_access_token_secret is None:
             _dev_access_token_secret = uuid.uuid4().hex
         if not _warned_access_token_secret:
@@ -114,7 +135,6 @@ def _get_access_token_secret() -> str:
             _warned_access_token_secret = True
         return _dev_access_token_secret
 
-    # non-dev: fail closed at enforcement points, not at import-time
     return ""
 
 
@@ -123,59 +143,6 @@ def _require_access_token_secret() -> str:
     if secret:
         return secret
     raise HTTPException(status_code=500, detail="ACCESS_TOKEN_SECRET not configured")
-
-
-# One module-level secret used by signing/verification paths.
-# In non-dev it can be "", but those codepaths should not be reachable without enforcement.
-_TOKEN_SECRET = _get_access_token_secret()
-
-# Ensure this symbol exists deterministically for request handlers/tests.
-entitlement_resolver = EntitlementResolver()
-
-TRACKS = {"netplus", "ccna", "cissp"}
-TRACK_TEMPLATE = {
-    "netplus": "netplus.yaml",
-    "ccna": "ccna.yaml",
-    "cissp": "cissp.yaml",
-}
-
-ENTITLEMENT_RECEIPT_HEADER = os.getenv("ENTITLEMENT_RECEIPT_HEADER", "x-receipt-token")
-CLIENT_ID_HEADER = os.getenv("CLIENT_ID_HEADER", "x-client-id")
-TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
-
-TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
-REQUEST_CACHE: Dict[str, dict] = {}
-
-
-@dataclass(frozen=True)
-class PlanEntitlements:
-    max_spawns_per_minute: int
-    max_concurrent_scenarios: int
-    allowed_tracks: frozenset[str]
-
-
-PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
-    "FREE": PlanEntitlements(
-        max_spawns_per_minute=5,
-        max_concurrent_scenarios=1,
-        allowed_tracks=frozenset({"netplus"}),
-    ),
-    "PRO": PlanEntitlements(
-        max_spawns_per_minute=20,
-        max_concurrent_scenarios=3,
-        allowed_tracks=frozenset({"netplus", "ccna"}),
-    ),
-    "TEAM": PlanEntitlements(
-        max_spawns_per_minute=60,
-        max_concurrent_scenarios=10,
-        allowed_tracks=frozenset({"netplus", "ccna", "cissp"}),
-    ),
-    "ENTERPRISE": PlanEntitlements(
-        max_spawns_per_minute=200,
-        max_concurrent_scenarios=50,
-        allowed_tracks=frozenset(TRACKS),
-    ),
-}
 
 
 def _warn_sat_secret_alias_once() -> None:
@@ -215,87 +182,41 @@ def _enforce_startup_config() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
     _enforce_startup_config()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias_once()
+
+    # makes asyncio usage deterministic and gives a cheap startup marker
+    app.state.startup_loop_time = asyncio.get_running_loop().time()
     yield
-    # shutdown
 
 
-app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PlanEntitlements:
+    max_spawns_per_minute: int
+    max_concurrent_scenarios: int
+    allowed_tracks: frozenset[str]
 
 
-@app.middleware("http")
-async def dump_exceptions(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
-        raise
-
-
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-correlation-id")
-        or str(uuid.uuid4())
-    )
-    token = request_id_ctx.set(request_id)
-    response = await call_next(request)
-    request_id_ctx.reset(token)
-    response.headers["x-request-id"] = request_id
-    return response
-
-
-def _b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
-
-
-def _b64url_decode(data: str) -> bytes:
-    padding = "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(data + padding)
-
-
-def _warn_sat_secret_alias() -> None:
-    _warn_sat_secret_alias_once()
-
-
-def _get_sat_secret() -> str:
-    sat_secret = os.getenv("SAT_HMAC_SECRET")
-    if sat_secret:
-        return sat_secret
-    legacy_secret = os.getenv("SAT_SECRET")
-    if legacy_secret:
-        _warn_sat_secret_alias()
-        return legacy_secret
-    raise HTTPException(status_code=500, detail="SAT secret not configured")
-
-
-def _sat_issued_at() -> int:
-    return int(datetime.now(timezone.utc).timestamp())
-
-
-def _sat_expiration(issued_at: int) -> int:
-    ttl_seconds = int(os.getenv("SAT_TTL_SECONDS", "300"))
-    return issued_at + ttl_seconds
+PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
+    "FREE": PlanEntitlements(5, 1, frozenset({"netplus"})),
+    "PRO": PlanEntitlements(20, 3, frozenset({"netplus", "ccna"})),
+    "TEAM": PlanEntitlements(60, 10, frozenset({"netplus", "ccna", "cissp"})),
+    "ENTERPRISE": PlanEntitlements(200, 50, frozenset(TRACKS)),
+}
 
 
 class SpawnRequest(BaseModel):
     track: str = Field(..., description="Training track identifier")
     subject: str = Field(..., description="User or session identifier")
-    tier: Optional[str] = Field(None, description="Billing tier (deprecated)")
-    template_id: Optional[str] = Field(None, description="Template identifier override")
-    requested_limits: Optional[dict[str, int]] = Field(
-        None, description="Requested resource limits"
-    )
-    scenario_id: Optional[str] = Field(
-        None, description="Optional pre-allocated scenario id"
-    )
-    request_id: Optional[str] = Field(
-        None, description="Client-supplied idempotency key"
-    )
+    tier: str | None = Field(None, description="Billing tier (deprecated)")
+    template_id: str | None = Field(None, description="Template identifier override")
+    requested_limits: dict[str, int] | None = Field(None, description="Requested resource limits")
+    scenario_id: str | None = Field(None, description="Optional pre-allocated scenario id")
+    request_id: str | None = Field(None, description="Client-supplied idempotency key")
 
 
 class SpawnResponse(BaseModel):
@@ -323,18 +244,51 @@ class SatClaims(BaseModel):
     subject: str
     tenant_id: str
     tier: str
-    retention_days: Optional[int] = None
-    requested_limits: Optional[dict[str, int]] = None
-    scenario_id: Optional[str] = None
+    retention_days: int | None = None
+    requested_limits: dict[str, int] | None = None
+    scenario_id: str | None = None
+
+
+# -----------------------------------------------------------------------------
+# Helpers: base64url
+# -----------------------------------------------------------------------------
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+# -----------------------------------------------------------------------------
+# SAT helpers
+# -----------------------------------------------------------------------------
+def _get_sat_secret() -> str:
+    sat_secret = os.getenv("SAT_HMAC_SECRET")
+    if sat_secret:
+        return sat_secret
+    legacy_secret = os.getenv("SAT_SECRET")
+    if legacy_secret:
+        _warn_sat_secret_alias_once()
+        return legacy_secret
+    raise HTTPException(status_code=500, detail="SAT secret not configured")
+
+
+def _sat_issued_at() -> int:
+    return int(datetime.now(UTC).timestamp())
+
+
+def _sat_expiration(issued_at: int) -> int:
+    ttl_seconds = int(os.getenv("SAT_TTL_SECONDS", "300"))
+    return issued_at + ttl_seconds
 
 
 def generate_access_token(payload: AccessTokenPayload) -> str:
     secret = _require_access_token_secret()
     payload_json = payload.model_dump_json()
     payload_encoded = _b64url_encode(payload_json.encode("utf-8"))
-    signature = hmac.new(
-        secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256"
-    ).digest()
+    signature = hmac.new(secret.encode("utf-8"), payload_encoded.encode("utf-8"), "sha256").digest()
     signature_encoded = _b64url_encode(signature)
     return f"{payload_encoded}.{signature_encoded}"
 
@@ -354,16 +308,14 @@ def verify_access_token(token: str) -> AccessTokenPayload:
         raise HTTPException(status_code=401, detail="invalid token")
 
     try:
-        payload = AccessTokenPayload.model_validate(
-            json.loads(_b64url_decode(payload_encoded))
-        )
+        payload = AccessTokenPayload.model_validate(json.loads(_b64url_decode(payload_encoded)))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="invalid token") from exc
 
     expires_at = datetime.fromisoformat(payload.expires_at)
     if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at < datetime.now(UTC):
         raise HTTPException(status_code=401, detail="token expired")
 
     return payload
@@ -374,18 +326,8 @@ def generate_sat(payload: SatClaims) -> str:
     header_encoded = _b64url_encode(json.dumps(header).encode("utf-8"))
     payload_encoded = _b64url_encode(payload.model_dump_json().encode("utf-8"))
 
-    try:
-        parsed = json.loads(_b64url_decode(header_encoded))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
-
-    if parsed.get("alg") != "HS256" or parsed.get("typ") != "SAT":
-        raise HTTPException(status_code=401, detail="invalid spawn authorization")
-
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
-    signature = hmac.new(
-        _get_sat_secret().encode("utf-8"), signing_input, "sha256"
-    ).digest()
+    signing_input = f"{header_encoded}.{payload_encoded}".encode()
+    signature = hmac.new(_get_sat_secret().encode("utf-8"), signing_input, "sha256").digest()
     signature_encoded = _b64url_encode(signature)
     return f"{header_encoded}.{payload_encoded}.{signature_encoded}"
 
@@ -396,7 +338,7 @@ def verify_sat(token: str) -> SatClaims:
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
 
-    signing_input = f"{header_encoded}.{payload_encoded}".encode("utf-8")
+    signing_input = f"{header_encoded}.{payload_encoded}".encode()
     expected_signature = hmac.new(
         _get_sat_secret().encode("utf-8"), signing_input, "sha256"
     ).digest()
@@ -409,7 +351,7 @@ def verify_sat(token: str) -> SatClaims:
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="invalid spawn authorization") from exc
 
-    now = int(datetime.now(timezone.utc).timestamp())
+    now = int(datetime.now(UTC).timestamp())
     if payload.iat > payload.exp:
         raise HTTPException(status_code=401, detail="invalid spawn authorization")
     if payload.exp < now:
@@ -418,7 +360,7 @@ def verify_sat(token: str) -> SatClaims:
     return payload
 
 
-def parse_bearer_token(value: str) -> Optional[str]:
+def parse_bearer_token(value: str) -> str | None:
     if not value:
         return None
     parts = value.split()
@@ -435,11 +377,11 @@ def resolve_entitlements(tier: str) -> PlanEntitlements:
     return entitlements
 
 
-def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
+def enforce_spawn_authorization(request: Request) -> SatClaims | None:
     sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
-    token = request.headers.get("x-sat")
-    if not token:
-        token = parse_bearer_token(request.headers.get("authorization", ""))
+    token = request.headers.get("x-sat") or parse_bearer_token(
+        request.headers.get("authorization", "")
+    )
 
     if not token:
         if sat_required:
@@ -449,6 +391,9 @@ def enforce_spawn_authorization(request: Request) -> Optional[SatClaims]:
     return verify_sat(token)
 
 
+# -----------------------------------------------------------------------------
+# Rate limiting + concurrency
+# -----------------------------------------------------------------------------
 class RateLimitState:
     def __init__(self, count: int, reset_at: float) -> None:
         self.count = count
@@ -468,9 +413,7 @@ class SpawnLimiter:
         global _fallback_warning_emitted
         if not self._redis_url:
             if not _fallback_warning_emitted:
-                logger.warning(
-                    "REDIS_URL not set; using in-memory rate limits (dev only)"
-                )
+                logger.warning("REDIS_URL not set; using in-memory rate limits (dev only)")
                 _fallback_warning_emitted = True
             return None
         if self._redis_client is None:
@@ -480,9 +423,7 @@ class SpawnLimiter:
                 self._redis_client = redis.from_url(
                     self._redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=float(
-                        os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")
-                    ),
+                    socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT_SECONDS", "1.0")),
                     socket_timeout=float(os.getenv("REDIS_TIMEOUT_SECONDS", "1.0")),
                 )
             except Exception as exc:
@@ -563,15 +504,16 @@ class SpawnLimiter:
             self._purge_active(subject, now)
             entries = self._active_cache.setdefault(subject, {})
             if scenario_id not in entries and len(entries) >= limit:
-                raise HTTPException(
-                    status_code=409, detail="concurrent scenario quota exceeded"
-                )
+                raise HTTPException(status_code=409, detail="concurrent scenario quota exceeded")
             entries[scenario_id] = expires_ts
 
 
 spawn_limiter = SpawnLimiter()
 
 
+# -----------------------------------------------------------------------------
+# HTTP retries + circuit breaker
+# -----------------------------------------------------------------------------
 class CircuitBreaker:
     def __init__(self, name: str, cooldown_seconds: float) -> None:
         self._name = name
@@ -592,7 +534,6 @@ class CircuitBreaker:
         return self._name
 
 
-# Keep this as a module-level function (tests patch it).
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
@@ -652,6 +593,9 @@ _egress_breaker = CircuitBreaker(
 )
 
 
+# -----------------------------------------------------------------------------
+# Template / OPA
+# -----------------------------------------------------------------------------
 def load_template(track: str) -> dict:
     template_name = TRACK_TEMPLATE[track]
     template_path = TEMPLATE_DIR / template_name
@@ -692,13 +636,16 @@ def record_billing(request_id: str, track: str) -> None:
     logger.info("billing=%s request_id=%s track=%s", billing_mode, request_id, track)
 
 
-def resolve_request_id(payload: SpawnRequest, request: Request) -> Optional[str]:
+# -----------------------------------------------------------------------------
+# Request resolution + spawn response
+# -----------------------------------------------------------------------------
+def resolve_request_id(payload: SpawnRequest, request: Request) -> str | None:
     header_name = os.getenv("REQUEST_ID_HEADER", "x-request-id")
     return payload.request_id or request.headers.get(header_name)
 
 
 def resolve_subject_identifier(
-    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
+    payload: SpawnRequest, request: Request, sat_claims: SatClaims | None
 ) -> str:
     subject = payload.subject.strip() if payload.subject else ""
     if sat_claims:
@@ -715,9 +662,7 @@ def resolve_subject_identifier(
     return subject
 
 
-def resolve_tenant_identifier(
-    request: Request, sat_claims: Optional[SatClaims], subject: str
-) -> str:
+def resolve_tenant_identifier(request: Request, sat_claims: SatClaims | None, subject: str) -> str:
     tenant_id = request.headers.get(TENANT_ID_HEADER, "").strip()
     if sat_claims:
         if tenant_id and sat_claims.tenant_id != tenant_id:
@@ -729,8 +674,8 @@ def resolve_tenant_identifier(
 
 
 def build_spawn_response(
-    payload: SpawnRequest, request: Request, sat_claims: Optional[SatClaims]
-) -> Tuple[SpawnResponse, EntitlementDecision]:
+    payload: SpawnRequest, request: Request, sat_claims: SatClaims | None
+) -> tuple[SpawnResponse, EntitlementDecision]:
     request_id = resolve_request_id(payload, request)
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id required")
@@ -754,7 +699,9 @@ def build_spawn_response(
         )
     else:
         entitlement = entitlement_resolver.resolve(
-            subject=subject, tenant_id=tenant_id, receipt_token=receipt_token
+            subject=subject,
+            tenant_id=tenant_id,
+            receipt_token=receipt_token,
         )
 
     if entitlement.source == "receipt" and entitlement.receipt_exp is not None:
@@ -780,9 +727,12 @@ def build_spawn_response(
         raise HTTPException(status_code=403, detail="tier mismatch")
     if sat_claims and normalize_tier(sat_claims.tier) != tier:
         raise HTTPException(status_code=403, detail="tier mismatch")
-    if sat_claims and sat_claims.retention_days is not None:
-        if sat_claims.retention_days != et_claims["retention_days"]:
-            raise HTTPException(status_code=403, detail="retention mismatch")
+    if (
+        sat_claims
+        and sat_claims.retention_days is not None
+        and sat_claims.retention_days != et_claims["retention_days"]
+    ):
+        raise HTTPException(status_code=403, detail="retention mismatch")
 
     if payload.track not in entitlements.allowed_tracks:
         raise HTTPException(status_code=403, detail="track not allowed for tier")
@@ -794,9 +744,12 @@ def build_spawn_response(
         cached_tier = cached.get("tier", tier)
         cached_retention = cached.get("retention_days", et_claims["retention_days"])
         cached_tenant = cached.get("tenant_id", tenant_id)
-        if cached_tier != tier or cached_tenant != tenant_id:
-            raise HTTPException(status_code=403, detail="entitlement mismatch")
-        if cached_retention != et_claims["retention_days"]:
+
+        if (
+            cached_tier != tier
+            or cached_tenant != tenant_id
+            or cached_retention != et_claims["retention_days"]
+        ):
             raise HTTPException(status_code=403, detail="entitlement mismatch")
 
         issued_at = _sat_issued_at()
@@ -822,7 +775,7 @@ def build_spawn_response(
     record_billing(request_id, payload.track)
 
     scenario_id = payload.scenario_id or f"scn-{uuid.uuid4().hex[:12]}"
-    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    expires_at = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
     base_url = os.getenv("SPAWN_BASE_URL", "http://localhost:8082")
 
     token_payload = AccessTokenPayload(
@@ -862,7 +815,7 @@ def build_spawn_response(
 
     expires_at_dt = datetime.fromisoformat(expires_at)
     if expires_at_dt.tzinfo is None:
-        expires_at_dt = expires_at_dt.replace(tzinfo=timezone.utc)
+        expires_at_dt = expires_at_dt.replace(tzinfo=UTC)
 
     spawn_limiter.check_concurrent(
         subject, scenario_id, expires_at_dt, entitlements.max_concurrent_scenarios
@@ -912,6 +865,9 @@ def notify_orchestrator(
         raise HTTPException(status_code=502, detail="orchestrator error")
 
 
+# -----------------------------------------------------------------------------
+# Readiness checks
+# -----------------------------------------------------------------------------
 def _read_only_required() -> bool:
     if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
         return True
@@ -928,10 +884,8 @@ def _check_read_only_fs() -> None:
     except OSError:
         return
     else:
-        try:
+        with suppress(OSError):
             probe_path.unlink()
-        except OSError:
-            pass
         raise HTTPException(status_code=503, detail="filesystem not read-only")
 
 
@@ -947,7 +901,9 @@ def _check_egress_gateway() -> None:
     except requests.RequestException as exc:
         raise HTTPException(status_code=503, detail=f"egress gateway unavailable: {exc}") from exc
     if response.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"egress gateway unhealthy: {response.status_code}")
+        raise HTTPException(
+            status_code=503, detail=f"egress gateway unhealthy: {response.status_code}"
+        )
     try:
         payload = response.json()
     except ValueError as exc:
@@ -970,53 +926,86 @@ def _check_opa_ready() -> None:
         raise HTTPException(status_code=503, detail=f"opa unhealthy: {response.status_code}")
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": "forge_spawn_service"}
+# -----------------------------------------------------------------------------
+# App factory: root health, router for API
+# -----------------------------------------------------------------------------
+def create_app() -> FastAPI:
+    app = FastAPI(title="forge_spawn_service", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def dump_exceptions(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
+            raise
+
+    @app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        request_id = (
+            request.headers.get("x-request-id")
+            or request.headers.get("x-correlation-id")
+            or str(uuid.uuid4())
+        )
+        token = request_id_ctx.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_ctx.reset(token)
+        response.headers["x-request-id"] = request_id
+        return response
+
+    # health endpoints EXACTLY at root
+    @app.get("/healthz")
+    def healthz() -> dict:
+        return {"status": "ok", "service": "forge_spawn_service"}
+
+    @app.get("/readyz")
+    def readyz() -> dict:
+        _check_read_only_fs()
+        _check_egress_gateway()
+        _check_opa_ready()
+        return {"status": "ready", "service": "forge_spawn_service"}
+
+    # Router holds actual API endpoints
+    router = APIRouter()
+
+    # IMPORTANT: tests call POST /api/spawn
+    @router.post("/api/spawn", response_model=SpawnResponse)
+    def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
+        sat_claims = enforce_spawn_authorization(request)
+        response, entitlement = build_spawn_response(payload, request, sat_claims)
+        notify_orchestrator(payload, response, request, entitlement.tier)
+        return response
+
+    # Keep /v1/spawn if you still want it
+    @router.post("/v1/spawn", response_model=SpawnResponse)
+    def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+        sat_claims = enforce_spawn_authorization(request)
+        response, entitlement = build_spawn_response(payload, request, sat_claims)
+        notify_orchestrator(payload, response, request, entitlement.tier)
+        return response
+
+    @router.get("/v1/access/{scenario_id}")
+    def access_scenario(scenario_id: str, request: Request) -> dict:
+        token = request.query_params.get("token") or request.headers.get("x-access-token")
+        if not token:
+            raise HTTPException(status_code=401, detail="token required")
+
+        payload = verify_access_token(token)
+        if payload.scenario_id != scenario_id:
+            raise HTTPException(status_code=403, detail="token mismatch")
+
+        return {
+            "scenario_id": payload.scenario_id,
+            "request_id": payload.request_id,
+            "track": payload.track,
+            "expires_at": payload.expires_at,
+        }
+
+    app.include_router(router)
+    return app
 
 
-@app.get("/healthz")
-def healthz() -> dict:
-    return {"status": "ok", "service": "forge_spawn_service"}
-
-
-@app.get("/readyz")
-def readyz() -> dict:
-    _check_read_only_fs()
-    _check_egress_gateway()
-    _check_opa_ready()
-    return {"status": "ready", "service": "forge_spawn_service"}
-
-
-@app.post("/v1/spawn", response_model=SpawnResponse)
-def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    sat_claims = enforce_spawn_authorization(request)
-    response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
-    return response
-
-
-@app.post("/api/spawn", response_model=SpawnResponse)
-def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    sat_claims = enforce_spawn_authorization(request)
-    response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
-    return response
-
-
-@app.get("/v1/access/{scenario_id}")
-def access_scenario(scenario_id: str, request: Request) -> dict:
-    token = request.query_params.get("token") or request.headers.get("x-access-token")
-    if not token:
-        raise HTTPException(status_code=401, detail="token required")
-
-    payload = verify_access_token(token)
-    if payload.scenario_id != scenario_id:
-        raise HTTPException(status_code=403, detail="token mismatch")
-
-    return {
-        "scenario_id": payload.scenario_id,
-        "request_id": payload.request_id,
-        "track": payload.track,
-        "expires_at": payload.expires_at,
-    }
+# what uvicorn imports
+app = create_app()

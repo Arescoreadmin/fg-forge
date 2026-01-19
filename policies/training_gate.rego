@@ -81,8 +81,8 @@ all_containers_safe(containers, privileged_allowed) if {
 }
 
 container_safe(container, _) if {
-        # Read-only filesystem required
-        container.read_only == true
+	# Read-only filesystem required
+	container.read_only == true
 }
 
 container_safe(container, privileged_allowed) if {
@@ -150,5 +150,5 @@ deny_reasons contains msg if {
 # If nothing is explicitly denied, allow the request.
 # This prevents "deny_reasons == [] but allow == false" footguns.
 allow if {
-  count(deny_reasons) == 0
+	count(deny_reasons) == 0
 }

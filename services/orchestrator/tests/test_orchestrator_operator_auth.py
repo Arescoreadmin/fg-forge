@@ -1,11 +1,11 @@
 import asyncio
+from datetime import UTC, datetime
 import importlib.util
 import os
+from pathlib import Path
 import sys
 import unittest
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
 
@@ -45,7 +45,7 @@ class OrchestratorOperatorAuthTests(unittest.TestCase):
                     headers={"x-internal-token": "internal"},
                     json={
                         "completion_reason": "done",
-                        "completion_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "completion_timestamp": datetime.now(UTC).isoformat(),
                     },
                 )
             return response

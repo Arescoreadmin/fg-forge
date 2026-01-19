@@ -7,17 +7,19 @@ Provides a structured way to define and run evaluation steps.
 from __future__ import annotations
 
 import contextvars
+from datetime import UTC, datetime
+from enum import Enum
 import json
 import logging
 import os
-import uuid
-from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
+import time
+import uuid
+
 import docker
-import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+import yaml
 
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
@@ -25,7 +27,7 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -48,7 +50,7 @@ configure_logging()
 logger = logging.getLogger("forge_playbook_runner")
 
 # Configuration
-TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
+# TEMPLATE_DIR was unused; keep PLAYBOOK_DIR only (Ruff will complain otherwise).
 PLAYBOOK_DIR = Path(os.getenv("PLAYBOOK_DIR", "/playbooks"))
 
 
@@ -134,12 +136,8 @@ def find_container(
     return containers[0] if containers else None
 
 
-def execute_step(
-    scenario_id: str, step: PlaybookStep
-) -> PlaybookResult:
+def execute_step(scenario_id: str, step: PlaybookStep) -> PlaybookResult:
     """Execute a single playbook step."""
-    import time
-
     start_time = time.time()
     result = PlaybookResult(
         step_name=step.name or f"{step.step.value}",
@@ -157,10 +155,9 @@ def execute_step(
         elif step.step == StepType.CHECK_NETWORK:
             result = check_network_step(scenario_id, step)
         elif step.step == StepType.WAIT:
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(
-                asyncio.sleep(step.timeout)
-            )
+            # This runner is synchronous. Using asyncio loop gymnastics here is fragile
+            # (fails inside an existing event loop). Just sleep deterministically.
+            time.sleep(step.timeout)
             result.passed = True
             result.output = f"Waited {step.timeout} seconds"
     except Exception as e:
@@ -171,9 +168,7 @@ def execute_step(
     return result
 
 
-def execute_command_step(
-    scenario_id: str, step: PlaybookStep
-) -> PlaybookResult:
+def execute_command_step(scenario_id: str, step: PlaybookStep) -> PlaybookResult:
     """Execute a command in a container."""
     result = PlaybookResult(
         step_name=step.name or "execute_command",
@@ -199,25 +194,21 @@ def execute_command_step(
 
         # Check expectations
         passed = True
-        if step.expect.exit_code is not None:
-            if exit_code != step.expect.exit_code:
-                passed = False
-                result.error = f"Expected exit code {step.expect.exit_code}, got {exit_code}"
+        if step.expect.exit_code is not None and exit_code != step.expect.exit_code:
+            passed = False
+            result.error = f"Expected exit code {step.expect.exit_code}, got {exit_code}"
 
-        if step.expect.stdout_contains:
-            if step.expect.stdout_contains not in stdout:
-                passed = False
-                result.error = f"stdout missing '{step.expect.stdout_contains}'"
+        if step.expect.stdout_contains and step.expect.stdout_contains not in stdout:
+            passed = False
+            result.error = f"stdout missing '{step.expect.stdout_contains}'"
 
-        if step.expect.stdout_not_contains:
-            if step.expect.stdout_not_contains in stdout:
-                passed = False
-                result.error = f"stdout contains forbidden '{step.expect.stdout_not_contains}'"
+        if step.expect.stdout_not_contains and step.expect.stdout_not_contains in stdout:
+            passed = False
+            result.error = f"stdout contains forbidden '{step.expect.stdout_not_contains}'"
 
-        if step.expect.stderr_contains:
-            if step.expect.stderr_contains not in stderr:
-                passed = False
-                result.error = f"stderr missing '{step.expect.stderr_contains}'"
+        if step.expect.stderr_contains and step.expect.stderr_contains not in stderr:
+            passed = False
+            result.error = f"stderr missing '{step.expect.stderr_contains}'"
 
         result.passed = passed
 
@@ -227,9 +218,7 @@ def execute_command_step(
     return result
 
 
-def check_file_step(
-    scenario_id: str, step: PlaybookStep
-) -> PlaybookResult:
+def check_file_step(scenario_id: str, step: PlaybookStep) -> PlaybookResult:
     """Check if a file exists and optionally validate its contents."""
     result = PlaybookResult(
         step_name=step.name or "check_file",
@@ -249,10 +238,9 @@ def check_file_step(
         )
         file_exists = exec_result.exit_code == 0
 
-        if step.expect.file_exists is not None:
-            if file_exists != step.expect.file_exists:
-                result.error = f"file_exists={file_exists}, expected={step.expect.file_exists}"
-                return result
+        if step.expect.file_exists is not None and file_exists != step.expect.file_exists:
+            result.error = f"file_exists={file_exists}, expected={step.expect.file_exists}"
+            return result
 
         # Check contents if needed
         if step.expect.contains and file_exists:
@@ -275,9 +263,7 @@ def check_file_step(
     return result
 
 
-def check_service_step(
-    scenario_id: str, step: PlaybookStep
-) -> PlaybookResult:
+def check_service_step(scenario_id: str, step: PlaybookStep) -> PlaybookResult:
     """Check if a service is running in a container."""
     result = PlaybookResult(
         step_name=step.name or "check_service",
@@ -299,10 +285,14 @@ def check_service_step(
 
         result.output = f"service_running={service_running}"
 
-        if step.expect.service_running is not None:
-            if service_running != step.expect.service_running:
-                result.error = f"service_running={service_running}, expected={step.expect.service_running}"
-                return result
+        if (
+            step.expect.service_running is not None
+            and service_running != step.expect.service_running
+        ):
+            result.error = (
+                f"service_running={service_running}, expected={step.expect.service_running}"
+            )
+            return result
 
         result.passed = True
 
@@ -312,9 +302,7 @@ def check_service_step(
     return result
 
 
-def check_network_step(
-    scenario_id: str, step: PlaybookStep
-) -> PlaybookResult:
+def check_network_step(scenario_id: str, step: PlaybookStep) -> PlaybookResult:
     """Check network connectivity or port availability."""
     result = PlaybookResult(
         step_name=step.name or "check_network",
@@ -336,10 +324,9 @@ def check_network_step(
             port_open = exec_result.exit_code == 0
             result.output = f"port_open={port_open}"
 
-            if step.expect.port_open is not None:
-                if port_open != step.expect.port_open:
-                    result.error = f"port_open={port_open}, expected={step.expect.port_open}"
-                    return result
+            if step.expect.port_open is not None and port_open != step.expect.port_open:
+                result.error = f"port_open={port_open}, expected={step.expect.port_open}"
+                return result
 
         result.passed = True
 
@@ -405,8 +392,10 @@ async def add_request_id(request: Request, call_next):
         or str(uuid.uuid4())
     )
     token = request_id_ctx.set(request_id)
-    response = await call_next(request)
-    request_id_ctx.reset(token)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_ctx.reset(token)
     response.headers["x-request-id"] = request_id
     return response
 
@@ -427,18 +416,14 @@ def readyz() -> dict:
 
 
 @app.post("/v1/run/{scenario_id}")
-async def run_scenario_playbook(
-    scenario_id: str, playbook_name: str
-) -> PlaybookRunResult:
+async def run_scenario_playbook(scenario_id: str, playbook_name: str) -> PlaybookRunResult:
     """Run a named playbook against a scenario."""
     playbook = load_playbook(playbook_name)
     return run_playbook(scenario_id, playbook)
 
 
 @app.post("/v1/run/{scenario_id}/inline")
-async def run_inline_playbook(
-    scenario_id: str, playbook: Playbook
-) -> PlaybookRunResult:
+async def run_inline_playbook(scenario_id: str, playbook: Playbook) -> PlaybookRunResult:
     """Run an inline playbook against a scenario."""
     return run_playbook(scenario_id, playbook)
 

@@ -20,6 +20,7 @@ RE_RULE_OPEN = re.compile(r"^(\s*)([A-Za-z_][\w]*(?:\[[^\]]+\])?)\s*\{\s*$")
 RE_FUNC_OPEN = re.compile(r"^(\s*)([A-Za-z_][\w]*\s*\([^)]*\)\s*(?::=|=)\s*[^ {]+)\s*\{\s*$")
 RE_OBJ_RULE_OPEN = re.compile(r"^(\s*)([A-Za-z_][\w]*\[[^\]]+\]\s*=\s*.+?)\s*\{\s*$")
 
+
 def convert_line(line: str) -> str:
     # already v1
     if re.search(r"\sif\s*\{\s*$", line):
@@ -52,6 +53,7 @@ def convert_line(line: str) -> str:
 
     return line
 
+
 def convert_file(path: pathlib.Path) -> bool:
     original = path.read_text(encoding="utf-8").splitlines(keepends=True)
     converted = [convert_line(line) for line in original]
@@ -59,6 +61,7 @@ def convert_file(path: pathlib.Path) -> bool:
         path.write_text("".join(converted), encoding="utf-8")
         return True
     return False
+
 
 def main() -> int:
     if not POLICY_DIR.exists():
@@ -74,6 +77,7 @@ def main() -> int:
     if not changed_any:
         print("No changes made. Either already v1 or patterns didn't match.")
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
