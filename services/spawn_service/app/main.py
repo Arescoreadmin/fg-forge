@@ -36,7 +36,7 @@ try:
         normalize_tier,
         verify_et,
     )
-except ImportError:
+except ImportError:  # pragma: no cover
     import sys
 
     spawn_service_root = Path(__file__).resolve().parent.parent  # .../services/spawn_service
@@ -59,13 +59,11 @@ request_id_ctx = contextvars.ContextVar("request_id", default="-")
 logger = logging.getLogger("forge_spawn_service")
 
 _warned_sat_secret_alias = False
-_fallback_warning_emitted = False
-
-# ACCESS TOKEN SECRET: keep dev fallback stable per process, warn once
 _warned_access_token_secret = False
 _dev_access_token_secret: str | None = None
 
-# Ensure this symbol exists deterministically for request handlers/tests.
+_fallback_warning_emitted = False
+
 entitlement_resolver = EntitlementResolver()
 
 TRACKS = {"netplus", "ccna", "cissp"}
@@ -82,7 +80,6 @@ TENANT_ID_HEADER = os.getenv("TENANT_ID_HEADER", "x-tenant-id")
 TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 
 # NOTE: in-memory cache is dev-friendly but not multi-replica safe.
-# Keep for now; swap to Redis keyed by request_id for prod scale-out.
 REQUEST_CACHE: dict[str, dict] = {}
 
 
@@ -138,7 +135,6 @@ def _get_access_token_secret() -> str:
             _warned_access_token_secret = True
         return _dev_access_token_secret
 
-    # non-dev: fail closed at enforcement points, not at import-time
     return ""
 
 
@@ -184,55 +180,15 @@ def _enforce_startup_config() -> None:
             raise RuntimeError("ALLOW_FREE_DEFAULT is not allowed in staging/prod")
 
 
-# -----------------------------------------------------------------------------
-# App + Router
-# -----------------------------------------------------------------------------
-router = APIRouter()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _enforce_startup_config()
     if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
         _warn_sat_secret_alias_once()
 
-    # Touch asyncio so it's real, not dead weight (and useful for debugging).
-    # This avoids Ruff "asyncio undefined" in refactored variants and gives
-    # you a stable startup timestamp.
+    # makes asyncio usage deterministic and gives a cheap startup marker
     app.state.startup_loop_time = asyncio.get_running_loop().time()
-
     yield
-    # shutdown: nothing special
-
-
-app = FastAPI(title="FrostGate Forge Spawn Service", lifespan=lifespan)
-app.include_router(router)
-
-
-@app.middleware("http")
-async def dump_exceptions(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
-        raise
-
-
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = (
-        request.headers.get("x-request-id")
-        or request.headers.get("x-correlation-id")
-        or str(uuid.uuid4())
-    )
-    token = request_id_ctx.set(request_id)
-    try:
-        response = await call_next(request)
-    finally:
-        # Always reset even if call_next explodes
-        request_id_ctx.reset(token)
-    response.headers["x-request-id"] = request_id
-    return response
 
 
 # -----------------------------------------------------------------------------
@@ -971,55 +927,85 @@ def _check_opa_ready() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Routes
+# App factory: root health, router for API
 # -----------------------------------------------------------------------------
-@router.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": "forge_spawn_service"}
+def create_app() -> FastAPI:
+    app = FastAPI(title="forge_spawn_service", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def dump_exceptions(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.error("UNHANDLED EXCEPTION:\n%s", traceback.format_exc())
+            raise
+
+    @app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        request_id = (
+            request.headers.get("x-request-id")
+            or request.headers.get("x-correlation-id")
+            or str(uuid.uuid4())
+        )
+        token = request_id_ctx.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_ctx.reset(token)
+        response.headers["x-request-id"] = request_id
+        return response
+
+    # health endpoints EXACTLY at root
+    @app.get("/healthz")
+    def healthz() -> dict:
+        return {"status": "ok", "service": "forge_spawn_service"}
+
+    @app.get("/readyz")
+    def readyz() -> dict:
+        _check_read_only_fs()
+        _check_egress_gateway()
+        _check_opa_ready()
+        return {"status": "ready", "service": "forge_spawn_service"}
+
+    # Router holds actual API endpoints
+    router = APIRouter()
+
+    # IMPORTANT: tests call POST /api/spawn
+    @router.post("/api/spawn", response_model=SpawnResponse)
+    def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
+        sat_claims = enforce_spawn_authorization(request)
+        response, entitlement = build_spawn_response(payload, request, sat_claims)
+        notify_orchestrator(payload, response, request, entitlement.tier)
+        return response
+
+    # Keep /v1/spawn if you still want it
+    @router.post("/v1/spawn", response_model=SpawnResponse)
+    def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
+        sat_claims = enforce_spawn_authorization(request)
+        response, entitlement = build_spawn_response(payload, request, sat_claims)
+        notify_orchestrator(payload, response, request, entitlement.tier)
+        return response
+
+    @router.get("/v1/access/{scenario_id}")
+    def access_scenario(scenario_id: str, request: Request) -> dict:
+        token = request.query_params.get("token") or request.headers.get("x-access-token")
+        if not token:
+            raise HTTPException(status_code=401, detail="token required")
+
+        payload = verify_access_token(token)
+        if payload.scenario_id != scenario_id:
+            raise HTTPException(status_code=403, detail="token mismatch")
+
+        return {
+            "scenario_id": payload.scenario_id,
+            "request_id": payload.request_id,
+            "track": payload.track,
+            "expires_at": payload.expires_at,
+        }
+
+    app.include_router(router)
+    return app
 
 
-@router.get("/healthz")
-def healthz() -> dict:
-    return {"status": "ok", "service": "forge_spawn_service"}
-
-
-@router.get("/readyz")
-def readyz() -> dict:
-    _check_read_only_fs()
-    _check_egress_gateway()
-    _check_opa_ready()
-    return {"status": "ready", "service": "forge_spawn_service"}
-
-
-@router.post("/v1/spawn", response_model=SpawnResponse)
-def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    sat_claims = enforce_spawn_authorization(request)
-    response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
-    return response
-
-
-@router.post("/api/spawn", response_model=SpawnResponse)
-def spawn_scenario_api(payload: SpawnRequest, request: Request) -> SpawnResponse:
-    sat_claims = enforce_spawn_authorization(request)
-    response, entitlement = build_spawn_response(payload, request, sat_claims)
-    notify_orchestrator(payload, response, request, entitlement.tier)
-    return response
-
-
-@router.get("/v1/access/{scenario_id}")
-def access_scenario(scenario_id: str, request: Request) -> dict:
-    token = request.query_params.get("token") or request.headers.get("x-access-token")
-    if not token:
-        raise HTTPException(status_code=401, detail="token required")
-
-    payload = verify_access_token(token)
-    if payload.scenario_id != scenario_id:
-        raise HTTPException(status_code=403, detail="token mismatch")
-
-    return {
-        "scenario_id": payload.scenario_id,
-        "request_id": payload.request_id,
-        "track": payload.track,
-        "expires_at": payload.expires_at,
-    }
+# what uvicorn imports
+app = create_app()
