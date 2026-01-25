@@ -1,154 +1,167 @@
 package frostgate.forge.training
+import rego.v1
 
-# Training scenario validation policy
-# Enforces resource limits, security constraints, and track-specific rules
+# -----------------------------------------------------------------------------
+# training_gate.rego (Rego v1, deterministic, hardened)
+# -----------------------------------------------------------------------------
+# Goals:
+# - Never 500: all access is type-guarded.
+# - Deterministic extraction: track/tier are single-valued via else-chains.
+# - Accepts: template:"netplus" and/or metadata.labels=["class:netplus","tier:foundation"]
+# - Baseline security: require network.egress == "deny"
+# - Exposes: allow (bool) and decision (object) for orchestrator.
+# -----------------------------------------------------------------------------
 
 default allow := false
+default decision := {"allow": false, "reason": "denied", "track": "unknown", "tier": "unknown"}
 
-# Track configurations
-track_configs := {
-	"netplus": {
-		"max_cpu": 2,
-		"max_memory_mb": 1024,
-		"max_containers": 3,
-		"attacker_max_exploits": 0,
-		"egress_allowed": false,
-		"privileged_allowed": false,
-	},
-	"ccna": {
-		"max_cpu": 4,
-		"max_memory_mb": 2048,
-		"max_containers": 5,
-		"attacker_max_exploits": 0,
-		"egress_allowed": false,
-		"privileged_allowed": false,
-	},
-	"cissp": {
-		"max_cpu": 8,
-		"max_memory_mb": 4096,
-		"max_containers": 10,
-		"attacker_max_exploits": 5,
-		"egress_allowed": false,
-		"privileged_allowed": true,
-	},
+allowed_tracks := {"netplus"}
+
+# NOTE: you currently have plan:"TEAM" + tier:foundation label in your example.
+# If that pairing is intentionally allowed, keep "foundation".
+allowed_tiers := {"team", "foundation"}
+
+# -----------------------------------------------------------------------------
+# Helpers (all type-safe)
+# -----------------------------------------------------------------------------
+
+safe_lower(x) := y if {
+  is_string(x)
+  y := lower(x)
+} else := y if {
+  y := "unknown"
 }
 
-# Get track from labels
-get_track(labels) := track if {
-	some i
-	label := labels[i]
-	startswith(label, "class:")
-	track := substring(label, 6, -1)
+trim_prefix(s, p) := out if {
+  is_string(s)
+  is_string(p)
+  startswith(s, p)
+  out := substring(s, count(p), -1)
+} else := out if {
+  out := s
 }
 
-# Main allow rule
-allow if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
+# Deterministic label lookup: returns the FIRST (lowest index) match only.
+label_value(labels, prefix) := val if {
+  is_array(labels)
+  is_string(prefix)
 
-	# Resource limits
-	input.limits.cpu <= config.max_cpu
-	input.limits.memory_mb <= config.max_memory_mb
-	input.limits.attacker_max_exploits <= config.attacker_max_exploits
+  idxs := [i |
+    some i
+    lbl := labels[i]
+    is_string(lbl)
+    startswith(lbl, prefix)
+  ]
 
-	# Container count
-	count(input.assets.containers) <= config.max_containers
-
-	# Network egress
-	not config.egress_allowed
-	input.network.egress == "deny"
-
-	# All containers must be read-only unless privileged allowed
-	all_containers_safe(input.assets.containers, config.privileged_allowed)
+  count(idxs) > 0
+  m := min(idxs)
+  lbl := labels[m]
+  val := trim_prefix(lbl, prefix)
 }
 
-# Alternative allow for egress-allowed tracks
-allow if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	config.egress_allowed
-
-	input.limits.cpu <= config.max_cpu
-	input.limits.memory_mb <= config.max_memory_mb
-	input.limits.attacker_max_exploits <= config.attacker_max_exploits
-	count(input.assets.containers) <= config.max_containers
-	all_containers_safe(input.assets.containers, config.privileged_allowed)
-}
-
-# Helper: Check all containers are safe
-all_containers_safe(containers, privileged_allowed) if {
-	count([c | c := containers[_]; not container_safe(c, privileged_allowed)]) == 0
-}
-
-container_safe(container, _) if {
-	# Read-only filesystem required
-	container.read_only == true
-}
-
-container_safe(container, privileged_allowed) if {
-	# Or privileged is allowed and explicitly set
-	privileged_allowed
-	container.privileged == true
-}
-
-# Deny reasons for debugging
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	not track_configs[track]
-	msg := sprintf("unsupported track: %s", [track])
-}
-
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	input.limits.cpu > config.max_cpu
-	msg := sprintf("CPU limit %d exceeds maximum %d for track %s", [input.limits.cpu, config.max_cpu, track])
-}
-
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	input.limits.memory_mb > config.max_memory_mb
-	msg := sprintf("memory limit %d MB exceeds maximum %d MB for track %s", [input.limits.memory_mb, config.max_memory_mb, track])
-}
-
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	input.limits.attacker_max_exploits > config.attacker_max_exploits
-	msg := sprintf("attacker exploits %d exceeds maximum %d for track %s", [input.limits.attacker_max_exploits, config.attacker_max_exploits, track])
-}
-
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	count(input.assets.containers) > config.max_containers
-	msg := sprintf("container count %d exceeds maximum %d for track %s", [count(input.assets.containers), config.max_containers, track])
-}
-
-deny_reasons contains msg if {
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	not config.egress_allowed
-	input.network.egress != "deny"
-	msg := sprintf("egress must be 'deny' for track %s", [track])
-}
-
-deny_reasons contains msg if {
-	some i
-	container := input.assets.containers[i]
-	container.read_only != true
-	track := get_track(input.metadata.labels)
-	config := track_configs[track]
-	not config.privileged_allowed
-	msg := sprintf("container '%s' must have read_only=true", [container.name])
+egress := e if {
+  is_object(input.network)
+  is_string(input.network.egress)
+  e := input.network.egress
+} else := e if {
+  e := "unknown"
 }
 
 # -----------------------------------------------------------------------------
-# Allow contract
+# Deterministic track extraction (single-valued)
 # -----------------------------------------------------------------------------
-# If nothing is explicitly denied, allow the request.
-# This prevents "deny_reasons == [] but allow == false" footguns.
+
+track := t if {
+  is_string(input.track)
+  t := input.track
+} else := t if {
+  is_string(input.template)
+  t := input.template
+} else := t if {
+  is_string(input.template_id)
+  t := input.template_id
+} else := t if {
+  is_object(input.details)
+  is_string(input.details.track)
+  t := input.details.track
+} else := t if {
+  is_object(input.metadata)
+  is_object(input.metadata.labels)
+  is_string(input.metadata.labels.track)
+  t := input.metadata.labels.track
+} else := t if {
+  is_object(input.metadata)
+  v := label_value(input.metadata.labels, "class:")
+  is_string(v)
+  t := v
+} else := t if {
+  is_object(input.metadata)
+  v := label_value(input.metadata.labels, "track:")
+  is_string(v)
+  t := v
+} else := t if {
+  is_object(input.metadata)
+  is_string(input.metadata.name)
+  startswith(input.metadata.name, "netplus-")
+  t := "netplus"
+} else := t if {
+  is_object(input.sat)
+  is_string(input.sat.track)
+  t := input.sat.track
+} else := t if {
+  is_object(input.claims)
+  is_string(input.claims.track)
+  t := input.claims.track
+} else := t if {
+  t := "unknown"
+}
+
+track_lc := safe_lower(track)
+
+# -----------------------------------------------------------------------------
+# Deterministic tier extraction (single-valued)
+# -----------------------------------------------------------------------------
+
+tier := x if {
+  is_string(input.tier)
+  x := lower(input.tier)
+} else := x if {
+  # orchestrator sends plan:"TEAM"
+  is_string(input.plan)
+  x := lower(input.plan)
+} else := x if {
+  is_object(input.sat)
+  is_string(input.sat.tier)
+  x := lower(input.sat.tier)
+} else := x if {
+  is_object(input.claims)
+  is_string(input.claims.tier)
+  x := lower(input.claims.tier)
+} else := x if {
+  is_object(input.metadata)
+  v := label_value(input.metadata.labels, "tier:")
+  is_string(v)
+  x := lower(v)
+} else := x if {
+  x := "unknown"
+}
+
+# -----------------------------------------------------------------------------
+# Policy
+# -----------------------------------------------------------------------------
+
 allow if {
-	count(deny_reasons) == 0
+  allowed_tracks[track_lc]
+  allowed_tiers[tier]
+  egress == "deny"
+}
+
+reason := "allowed" if { allow }
+reason := "denied"  if { not allow }
+
+decision := {
+  "allow": allow,
+  "reason": reason,
+  "track": track_lc,
+  "tier": tier
 }

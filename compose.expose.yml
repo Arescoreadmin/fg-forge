@@ -9,7 +9,6 @@ services:
 
   forge_nats:
     ports:
-      # publish on alternate host ports to avoid collisions
       - "14222:4222"
       - "18222:8222"
 
@@ -28,9 +27,44 @@ services:
 
   forge_grafana:
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
   forge_spawn_service:
     ports:
       - "8082:8080"
- 
+
+  forge_orchestrator:
+    ports:
+      - "8083:8080"
+
+  forge_worker_agent:
+    ports:
+      - "8084:8080"
+
+  forge_observer_hub:
+    ports:
+      - "8085:8080"
+
+  forge_scoreboard:
+    ports:
+      - "8086:8080"
+
+  forge_playbook_runner:
+    ports:
+      - "8087:8080"
+
+  forge_metrics_tuner:
+    ports:
+      - "8088:8080"
+
+  forge_egress_gateway:
+    ports:
+      - "8089:8080"
+
+  forge_llm_analyzer:
+    ports:
+      - "8090:8080"
+
+  forge_overlay_sanitizer:
+    ports:
+      - "8091:8091"

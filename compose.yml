@@ -1,9 +1,8 @@
-# compose.yml (dev base)
-# - No version key (compose v2 ignores it)
-# - Safe anchors (string mounts, not nested lists)
-# - Infra is writable; apps are read-only
-# - Healthchecks avoid assuming wget/curl in minimal images
-# - Designed to layer with compose.expose.yml + compose.staging.yml
+# compose.yml (base, environment-agnostic)
+# RULES:
+# - Base publishes NO ports. Exposure is ONLY via compose.expose.yml (dev) or ingress/LB (prod).
+# - Dev-friendly defaults allowed here.
+# - Prod strictness enforced in compose.prod.yml using ${VAR:?required}.
 
 x-app-defaults: &app_defaults
   read_only: true
@@ -30,7 +29,7 @@ x-templates-mount: &templates_mount ./templates:/templates:ro
 
 services:
   # ----------------------------
-  # App services (dev publishes ports)
+  # App services (NO published ports in base)
   # ----------------------------
 
   forge_spawn_service:
@@ -40,23 +39,79 @@ services:
     image: forge_spawn_service:local
     container_name: forge_spawn_service
     environment:
-      FORGE_ENV: dev
-      BILLING_MODE: stub
-      SPAWN_BASE_URL: http://localhost:8082
-      REQUEST_ID_HEADER: x-request-id
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      BILLING_MODE: ${BILLING_MODE:-stub}
+
+      SPAWN_BASE_URL: ${SPAWN_BASE_URL:-http://forge_spawn_service:8080}
+
+      REQUEST_ID_HEADER: ${REQUEST_ID_HEADER:-x-request-id}
       TEMPLATE_DIR: /templates
-      OPA_URL: http://forge_opa:8181
-      NATS_URL: nats://forge_nats:4222
-      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
+      OPA_URL: ${OPA_URL:-http://forge_opa:8181}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
+
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-dev-sat-secret-change-me}
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:-dev-access-secret-change-me}
+
+      DEV_ALLOW_MISSING_ET_SECRET: ${DEV_ALLOW_MISSING_ET_SECRET:-true}
+      ET_HMAC_SECRET: ${ET_HMAC_SECRET:-dev-et-secret-change-me}
+
+      RECEIPT_HMAC_SECRET: ${RECEIPT_HMAC_SECRET:-dev-receipt-secret-change-me}
+
+      ENTITLEMENT_ALLOW_ALL: ${ENTITLEMENT_ALLOW_ALL:-true}
+      ENTITLEMENT_ALLOW_ALL_TIER: ${ENTITLEMENT_ALLOW_ALL_TIER:-TEAM}
+      ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS: ${ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS:-30}
+      ENTITLEMENTS_JSON: ${ENTITLEMENTS_JSON:-[{"subject":"dev-user","tier":"BASIC","tracks":["netplus","ccna","cissp"],"retention_days":30}]}
+
+      DEV_ALLOW_XPLAN: ${DEV_ALLOW_XPLAN:-false}
+      DEV_XPLAN_RETENTION_DAYS: ${DEV_XPLAN_RETENTION_DAYS:-30}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - *templates_mount
-    ports:
-      - "8082:8080"
     depends_on:
-      forge_opa:
+      forge_opa_probe:
         condition: service_healthy
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
+      forge_redis:
+        condition: service_healthy
+
+  # ---------------------------------------
+  # Orchestrator persistent storage bootstrap
+  # ---------------------------------------
+
+  forge_orchestrator_storage_init:
+    image: alpine:3.19
+    container_name: forge_orchestrator_storage_init
+    user: "0:0"
+    command:
+      - sh
+      - -lc
+      - |
+        set -euo pipefail
+        mkdir -p /app/storage
+        chown -R 1000:999 /app/storage
+        chmod -R u+rwX,g+rwX /app/storage
+    volumes:
+      - forge_orchestrator_storage:/app/storage
+    restart: "no"
+
+  forge_orchestrator_state_init:
+    image: alpine:3.19
+    container_name: forge_orchestrator_state_init
+    user: "0:0"
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        mkdir -p /data/forge
+        chown -R 1000:999 /data
+        chmod -R u+rwX,g+rwX /data
+    volumes:
+      - forge_orch_state:/data
+    restart: "no"
 
   forge_orchestrator:
     <<: *app_defaults
@@ -65,16 +120,22 @@ services:
     image: forge_orchestrator:local
     container_name: forge_orchestrator
     environment:
-      FORGE_ENV: dev
+      FORGE_ENV: ${FORGE_ENV:-dev}
       TEMPLATE_DIR: /templates
-      OPA_URL: http://forge_opa:8181
-      NATS_URL: nats://forge_nats:4222
-      SCOREBOARD_URL: http://forge_scoreboard:8080
-      LOG_LEVEL: INFO
-      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-}
+      OPA_URL: ${OPA_URL:-http://forge_opa:8181}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      SCOREBOARD_URL: ${SCOREBOARD_URL:-http://forge_scoreboard:8080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      STORAGE_ROOT: /app/storage
+
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:-dev-sat-secret-change-me}
       ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:-dev-internal}
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:-dev-operator}
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:-dev-scoreboard}
+
+      DOCKER_HOST: unix:///var/run/docker.sock
+      FORGE_STATE_DIR: /data/forge
     networks:
       default:
         aliases:
@@ -82,15 +143,23 @@ services:
           - orch
     volumes:
       - *templates_mount
-    ports:
-      - "8083:8080"
+      - forge_orchestrator_storage:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - forge_orch_state:/data
     depends_on:
-      forge_opa:
+      forge_orchestrator_storage_init:
+        condition: service_completed_successfully
+      forge_orchestrator_state_init:
+        condition: service_completed_successfully
+      forge_opa_probe:
         condition: service_healthy
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
       forge_scoreboard:
         condition: service_healthy
+    user: "1000:999"
+    group_add:
+      - "${DOCKER_GID}"
 
   forge_worker_agent:
     <<: *app_defaults
@@ -99,23 +168,19 @@ services:
     image: forge_worker_agent:local
     container_name: forge_worker_agent
     environment:
-      FORGE_ENV: dev
+      FORGE_ENV: ${FORGE_ENV:-dev}
       TEMPLATE_DIR: /templates
-      NATS_URL: nats://forge_nats:4222
-      MINIO_ENDPOINT: forge_minio:9000
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-forge_minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
-      MINIO_BUCKET: forge-evidence
-      LOG_LEVEL: INFO
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - *templates_mount
-    ports:
-      - "8084:8080"
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
-      forge_minio:
-        condition: service_started
       forge_minio_probe:
         condition: service_healthy
 
@@ -125,54 +190,38 @@ services:
       context: ./services/scoreboard
     image: forge_scoreboard:local
     container_name: forge_scoreboard
-
-    # dev: avoid the “volume owned by root, app runs as uid 1000” pain
-    # staging/prod should NOT run as root; fix perms via initContainer/chown job instead.
-    user: "0:0"
-
+    user: "${SCOREBOARD_UID:-1000}:${SCOREBOARD_GID:-1000}"
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      MINIO_ENDPOINT: forge_minio:9000
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-forge_minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
-      MINIO_BUCKET: forge-evidence
-      LOG_LEVEL: INFO
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       STORAGE_ROOT: /app/storage
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:-dev-scoreboard}
 
+      SIGNING_KEY_PATH: /run/secrets/scoreboard_ed25519.pem
     volumes:
       - forge_scoreboard_storage:/app/storage
-
+      - ./secrets/scoreboard_ed25519.pem:/run/secrets/scoreboard_ed25519.pem:ro
     networks:
       default:
         aliases:
           - scoreboard
-
-    ports:
-      - "8086:8080"
-
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
-      forge_minio:
-        condition: service_started
       forge_minio_probe:
         condition: service_healthy
-
-    # No wget/curl assumptions. Python is definitely present in your app image.
     healthcheck:
       test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2).read(); sys.exit(0)"
-        ]
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=2).read()"]
       interval: 10s
       timeout: 3s
-      retries: 10
-      start_period: 10s
+      retries: 20
+      start_period: 20s
 
   forge_observer_hub:
     <<: *app_defaults
@@ -181,14 +230,12 @@ services:
     image: forge_observer_hub:local
     container_name: forge_observer_hub
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      LOKI_URL: http://forge_loki:3100
-      LOG_LEVEL: INFO
-    ports:
-      - "8085:8080"
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      LOKI_URL: ${LOKI_URL:-http://forge_loki:3100}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
       forge_loki:
         condition: service_healthy
@@ -200,15 +247,13 @@ services:
     image: forge_playbook_runner:local
     container_name: forge_playbook_runner
     environment:
-      FORGE_ENV: dev
+      FORGE_ENV: ${FORGE_ENV:-dev}
       TEMPLATE_DIR: /templates
       PLAYBOOK_DIR: /playbooks
-      LOG_LEVEL: INFO
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - *templates_mount
       - ./playbooks:/playbooks:ro
-    ports:
-      - "8087:8080"
 
   forge_metrics_tuner:
     <<: *app_defaults
@@ -217,17 +262,15 @@ services:
     image: forge_metrics_tuner:local
     container_name: forge_metrics_tuner
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      REDIS_URL: redis://forge_redis:6379
-      DEFAULT_QUOTA_SCENARIOS: "10"
-      DEFAULT_QUOTA_WINDOW_HOURS: "24"
-      ABUSE_THRESHOLD_RATE: "5.0"
-      LOG_LEVEL: INFO
-    ports:
-      - "8088:8088"
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
+      DEFAULT_QUOTA_SCENARIOS: ${DEFAULT_QUOTA_SCENARIOS:-10}
+      DEFAULT_QUOTA_WINDOW_HOURS: ${DEFAULT_QUOTA_WINDOW_HOURS:-24}
+      ABUSE_THRESHOLD_RATE: ${ABUSE_THRESHOLD_RATE:-5.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
       forge_redis:
         condition: service_healthy
@@ -239,14 +282,12 @@ services:
     image: forge_egress_gateway:local
     container_name: forge_egress_gateway
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      DRY_RUN: "true"
-      LOG_LEVEL: INFO
-    ports:
-      - "8089:8089"
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      DRY_RUN: ${EGRESS_DRY_RUN:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
 
   forge_llm_analyzer:
@@ -256,18 +297,16 @@ services:
     image: forge_llm_analyzer:local
     container_name: forge_llm_analyzer
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      OPA_URL: http://forge_opa:8181
-      REDIS_URL: redis://forge_redis:6379
-      CANARY_TIMEOUT_SECONDS: "30"
-      LOG_LEVEL: INFO
-    ports:
-      - "8090:8090"
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      OPA_URL: ${OPA_URL:-http://forge_opa:8181}
+      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
+      CANARY_TIMEOUT_SECONDS: ${CANARY_TIMEOUT_SECONDS:-30}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
-      forge_opa:
+      forge_opa_probe:
         condition: service_healthy
       forge_redis:
         condition: service_healthy
@@ -279,57 +318,61 @@ services:
     image: forge_overlay_sanitizer:local
     container_name: forge_overlay_sanitizer
     environment:
-      FORGE_ENV: dev
-      NATS_URL: nats://forge_nats:4222
-      MINIO_ENDPOINT: forge_minio:9000
+      FORGE_ENV: ${FORGE_ENV:-dev}
+      NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-forge_minio:9000}
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-forgeadmin}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
-      MINIO_BUCKET: forge-evidence
-      SANITIZED_BUCKET: forge-sanitized
-      LOG_LEVEL: INFO
-    ports:
-      - "8091:8091"
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+      SANITIZED_BUCKET: ${SANITIZED_BUCKET:-forge-sanitized}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      forge_nats:
+      forge_nats_probe:
         condition: service_healthy
-      forge_minio:
-        condition: service_started
       forge_minio_probe:
         condition: service_healthy
 
   # ----------------------------
-  # Infra services
+  # Infra services (NO ports in base)
   # ----------------------------
 
   forge_opa:
     <<: *infra_defaults
     image: openpolicyagent/opa:1.12.3
     container_name: forge_opa
-    command: ["run", "--server", "--addr", "0.0.0.0:8181", "/policies"]
+    command:
+      ["run","--server","--addr","0.0.0.0:8181",
+       "--ignore",".*\\.bak_.*","--ignore",".*~","--ignore",".*\\.swp","--ignore",".*\\.tmp",
+       "/policies"]
     volumes:
       - ./policies:/policies:ro
     healthcheck:
-      # OPA image has /opa. Use that instead of curl/wget.
       test: ["CMD", "/opa", "version"]
       interval: 10s
       timeout: 3s
       retries: 10
       start_period: 5s
 
+  forge_opa_probe:
+    image: curlimages/curl:8.5.0
+    container_name: forge_opa_probe
+    command: ["sh", "-lc", "sleep infinity"]
+    restart: unless-stopped
+    depends_on:
+      forge_opa:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://forge_opa:8181/health?plugins >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
   forge_redis:
     <<: *infra_defaults
     image: redis:7.2.4-alpine
     container_name: forge_redis
-    command:
-      [
-        "redis-server",
-        "--appendonly",
-        "yes",
-        "--maxmemory",
-        "256mb",
-        "--maxmemory-policy",
-        "allkeys-lru"
-      ]
+    command: ["redis-server","--appendonly","yes","--maxmemory","256mb","--maxmemory-policy","allkeys-lru"]
     volumes:
       - forge_redis_data:/data
     healthcheck:
@@ -343,17 +386,34 @@ services:
     <<: *infra_defaults
     image: nats:2.10-alpine
     container_name: forge_nats
-    # JetStream enabled; store in /data. Avoid “unhealthy” flaps by giving it a start_period.
-    command: ["-js", "-sd", "/data", "-m", "8222"]
+    command:
+      - -js
+      - -sd
+      - /data/jetstream
+      - -m
+      - "8222"
     volumes:
       - forge_nats_data:/data
     healthcheck:
-      # Pragmatic dev choice: hits monitoring endpoint.
-      # If the image ever drops wget, add a probe sidecar like MinIO.
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "nc -z localhost 4222"]
       interval: 10s
+      timeout: 2s
+      retries: 3
+
+  forge_nats_probe:
+    image: curlimages/curl:8.5.0
+    container_name: forge_nats_probe
+    command: ["sh", "-lc", "sleep infinity"]
+    restart: unless-stopped
+    depends_on:
+      forge_nats:
+        condition: service_started
+    network_mode: "service:forge_nats"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8222/varz >/dev/null || exit 1"]
+      interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 60
       start_period: 15s
 
   forge_minio:
@@ -362,11 +422,8 @@ services:
     container_name: forge_minio
     command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
     environment:
-      # In dev base we still allow defaults, but staging/prod should override via env-file.
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-forgeadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
-
-      # Optional hardening (dev-safe; staging/prod recommended behind reverse proxy)
       MINIO_BROWSER: "off"
       MINIO_PROMETHEUS_AUTH_TYPE: "public"
     volumes:
@@ -376,7 +433,6 @@ services:
     healthcheck:
       test: ["NONE"]
 
-  # Known-good health probe for MinIO (curl is guaranteed here)
   forge_minio_probe:
     image: curlimages/curl:8.5.0
     container_name: forge_minio_probe
@@ -384,16 +440,36 @@ services:
     depends_on:
       forge_minio:
         condition: service_started
-    restart: unless-stopped
+    network_mode: "service:forge_minio"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://forge_minio:9000/minio/health/live >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 60
       start_period: 30s
+    restart: unless-stopped
 
-
-
+  # Creates buckets on fresh volumes (dev/prod safe)
+  forge_minio_init:
+    image: minio/mc:RELEASE.2024-01-16T16-06-34Z
+    container_name: forge_minio_init
+    entrypoint: ["/bin/sh", "-lc"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-forgeadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-forgeadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+      SANITIZED_BUCKET: ${SANITIZED_BUCKET:-forge-sanitized}
+    depends_on:
+      forge_minio_probe:
+        condition: service_healthy
+    restart: "no"
+    command: |
+      set -euo pipefail
+      mc alias set m http://forge_minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+      mc mb -p "m/$MINIO_BUCKET" || true
+      mc mb -p "m/$SANITIZED_BUCKET" || true
+      mc ls m
+    profiles: ["init"]
 
   forge_loki:
     <<: *infra_defaults
@@ -402,7 +478,6 @@ services:
     command: ["-config.file=/etc/loki/local-config.yaml"]
     volumes:
       - forge_loki_data:/loki
-    # Don’t pretend we can reliably probe without knowing installed tools.
     healthcheck:
       test: ["CMD", "true"]
       interval: 10s
@@ -429,7 +504,60 @@ services:
       - ./telemetry/grafana/provisioning:/etc/grafana/provisioning:ro
       - forge_grafana_data:/var/lib/grafana
 
+  # ----------------------------
+  # Internal test runner (profile: test)
+  # ----------------------------
+  forge_test_runner:
+    image: curlimages/curl:8.5.0
+    container_name: forge_test_runner
+    profiles: ["test"]
+    depends_on:
+      forge_spawn_service:
+        condition: service_started
+      forge_opa_probe:
+        condition: service_healthy
+      forge_nats_probe:
+        condition: service_healthy
+    command:
+      - sh
+      - -lc
+      - |
+          set -euo pipefail
+          echo "waiting readyz..."
+          code=""
+          for i in $(seq 1 90); do
+            code=$$(curl -s -o /dev/null -w '%$${http_code}' http://forge_spawn_service:8080/readyz || true)
+            if [ "$$code" = "200" ]; then
+              break
+            fi
+            sleep 1
+          done
+          echo "readyz=$$code"
+          [ "$$code" = "200" ]
+
+          REQ_ID="ci-$$(date +%s)"
+          echo "spawn REQ_ID=$$REQ_ID"
+          body=$$(curl -sS -H 'content-type: application/json' -H "x-request-id: $$REQ_ID" \
+            -d '{"track":"netplus","subject":"dev-user"}' \
+            http://forge_spawn_service:8080/v1/spawn)
+          echo "$$body"
+
+          scenario_id=$$(echo "$$body" | sed -n 's/.*"scenario_id":"\([^"]*\)".*/\1/p')
+          access_token=$$(echo "$$body" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+          if [ -z "$$scenario_id" ] || [ -z "$$access_token" ]; then
+            echo "ERROR: scenario_id or access_token missing"
+            echo "$$body"
+            exit 1
+          fi
+
+          echo "access (internal)..."
+          curl -fsS "http://forge_spawn_service:8080/v1/access/$$scenario_id?token=$$access_token" >/dev/null
+          echo "OK"
+
 volumes:
+  forge_orchestrator_storage:
+  forge_orch_state:
   forge_scoreboard_storage:
   forge_redis_data:
   forge_minio_data:

@@ -186,12 +186,19 @@ jobs:
             exit 1
           fi
 
+          # Guardrail: forbid backup/editor files in policies dir (OPA loads everything)
+          if find policies -maxdepth 1 -type f \( -name "*.bak_*" -o -name "*~" -o -name "*.swp" -o -name "*.tmp" \) | rg -n '.'; then
+            echo "ERROR: backup/editor files detected under policies/. Remove them (OPA loads everything)."
+            exit 1
+          fi
+
           OPA_IMAGE="openpolicyagent/opa@sha256:c0609fecc0924743f8648dc4a035d2f57ca163dc723ed1d13f3197ba5bd122b3"
           docker pull "$OPA_IMAGE"
           opa() { docker run --rm -v "$GITHUB_WORKSPACE:/workspace" -w /workspace "$OPA_IMAGE" "$@"; }
 
           opa version
           opa fmt --fail policies/
+          opa check policies/
           opa test -v policies/
 
       # ---------------------------

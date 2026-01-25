@@ -40,6 +40,80 @@ def normalize_tier(value: str) -> str:
     return tier
 
 
+def _truthy(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() == "true"
+
+
+def _forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
+
+
+def _parse_entitlements_json(
+    raw: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """
+    Returns (by_tenant_id, by_subject) record dicts.
+
+    Supported formats:
+
+    1) Dict keyed by tenant_id:
+      {
+        "tenantA": {"tier":"BASIC","retention_days":30},
+        "tenantB": {"tier":"PRO","retention_days":90}
+      }
+
+    2) List of records:
+      [
+        {"tenant_id":"tenantA","tier":"BASIC","retention_days":30},
+        {"subject":"dev-user","tier":"BASIC","retention_days":30},
+        {"tenant_id":"tenantB","plan":"PRO","retention_days":90}
+      ]
+
+    Notes:
+      - "tier" or "plan" accepted.
+      - retention_days defaults to ENTITLEMENTS_DEFAULT_RETENTION_DAYS (30) if missing.
+    """
+    by_tenant: dict[str, dict[str, Any]] = {}
+    by_subject: dict[str, dict[str, Any]] = {}
+
+    raw = (raw or "").strip()
+    if not raw:
+        return by_tenant, by_subject
+
+    default_ret = int(os.getenv("ENTITLEMENTS_DEFAULT_RETENTION_DAYS", "30"))
+    data = json.loads(raw)
+
+    def normalize_record(r: dict[str, Any]) -> dict[str, Any]:
+        tier = r.get("tier", r.get("plan", ""))
+        retention_days = r.get("retention_days", default_ret)
+        # Keep the record shape compatible with _decision_from_record
+        return {"tier": str(tier), "retention_days": int(retention_days)}
+
+    if isinstance(data, dict):
+        for tenant_id, rec in data.items():
+            if not str(tenant_id).strip():
+                continue
+            if not isinstance(rec, dict):
+                continue
+            by_tenant[str(tenant_id).strip()] = normalize_record(rec)
+        return by_tenant, by_subject
+
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            rec = normalize_record(item)
+            tenant_id = str(item.get("tenant_id", "")).strip()
+            subject = str(item.get("subject", "")).strip()
+            if tenant_id:
+                by_tenant[tenant_id] = rec
+            if subject:
+                by_subject[subject] = rec
+        return by_tenant, by_subject
+
+    raise ValueError("ENTITLEMENTS_JSON must be a JSON object (dict) or list")
+
+
 class ReceiptClaims(BaseModel):
     tenant_id: str
     tier: str
@@ -81,6 +155,27 @@ class EntitlementResolver:
         self._file_path = file_path or os.getenv("ENTITLEMENTS_FILE")
         self._redis_client = None
 
+        # Dev-only bypass (guarded in resolve()).
+        self._allow_all = _truthy("ENTITLEMENT_ALLOW_ALL", "false")
+        self._allow_all_tier = os.getenv("ENTITLEMENT_ALLOW_ALL_TIER", "BASIC")
+        self._allow_all_retention_days = int(os.getenv("ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS", "30"))
+
+        # Env-seeded entitlements (useful for dev + CI).
+        self._env_by_tenant: dict[str, dict[str, Any]] = {}
+        self._env_by_subject: dict[str, dict[str, Any]] = {}
+        raw_env = os.getenv("ENTITLEMENTS_JSON", "").strip()
+        if raw_env:
+            try:
+                self._env_by_tenant, self._env_by_subject = _parse_entitlements_json(raw_env)
+                logger.info(
+                    "Loaded ENTITLEMENTS_JSON env seed: tenants=%d subjects=%d",
+                    len(self._env_by_tenant),
+                    len(self._env_by_subject),
+                )
+            except Exception as exc:
+                logger.error("ENTITLEMENTS_JSON invalid: %s", exc)
+                raise HTTPException(status_code=500, detail="ENTITLEMENTS_JSON invalid") from exc
+
     def resolve(
         self,
         *,
@@ -88,6 +183,24 @@ class EntitlementResolver:
         tenant_id: str,
         receipt_token: str | None = None,
     ) -> EntitlementDecision:
+        # 0) Hard dev bypass (you wanted it; you also wanted not to accidentally ship it).
+        if self._allow_all:
+            env = _forge_env()
+            billing_mode = os.getenv("BILLING_MODE", "stub").lower()
+            # Allow in dev/development OR billing stub mode.
+            if env in {"dev", "development"} or billing_mode == "stub":
+                return EntitlementDecision(
+                    tier=normalize_tier(self._allow_all_tier),
+                    retention_days=int(self._allow_all_retention_days),
+                    source="allow-all",
+                )
+            logger.warning(
+                "ENTITLEMENT_ALLOW_ALL ignored outside dev/stub (env=%s billing=%s)",
+                env,
+                billing_mode,
+            )
+
+        # 1) Receipt token (authoritative)
         if receipt_token:
             decision = self._resolve_from_receipt(
                 receipt_token, tenant_id=tenant_id, subject=subject
@@ -95,10 +208,17 @@ class EntitlementResolver:
             if decision:
                 return decision
 
+        # 2) Env seed (CI/dev deterministic)
+        decision = self._resolve_from_env(tenant_id=tenant_id, subject=subject)
+        if decision:
+            return decision
+
+        # 3) Stores (redis/file)
         decision = self._resolve_from_store(tenant_id=tenant_id)
         if decision:
             return decision
 
+        # 4) Optional free default
         if os.getenv("ALLOW_FREE_DEFAULT", "false").lower() == "true":
             retention_days = int(os.getenv("FREE_DEFAULT_RETENTION_DAYS", "30"))
             return EntitlementDecision(
@@ -108,6 +228,12 @@ class EntitlementResolver:
             )
 
         raise HTTPException(status_code=403, detail="entitlement not found")
+
+    def _resolve_from_env(self, *, tenant_id: str, subject: str) -> EntitlementDecision | None:
+        record = self._env_by_tenant.get(tenant_id) or self._env_by_subject.get(subject)
+        if not record:
+            return None
+        return self._decision_from_record(record, source="env")
 
     def _resolve_from_receipt(
         self, token: str, *, tenant_id: str, subject: str
@@ -370,10 +496,6 @@ def verify_entitlement_token(token: str) -> EntitlementTokenClaims:
         return EntitlementTokenClaims.model_validate(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=401, detail="invalid entitlement token") from exc
-
-
-def _forge_env() -> str:
-    return os.getenv("FORGE_ENV", "dev").lower()
 
 
 def _billing_audit_dir() -> str:

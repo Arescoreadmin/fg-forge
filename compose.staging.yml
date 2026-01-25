@@ -1,25 +1,41 @@
 # compose.staging.yml
 # Staging overrides:
-# - Disable published app ports (compose.expose.yml controls exposure)
+# - No published app ports (compose.expose.yml controls exposure)
+# - Explicit env injection (no implicit env_file leakage)
+# - Enable x-plan ONLY in staging for E2E + manual testing
 # - Enforce required secrets/tokens
-# - Add MinIO readiness gate (probe sharing MinIO netns)
-# - Fix scoreboard volume permissions via one-shot job
+# - MinIO readiness gate
+# - Scoreboard volume permission fix
 
 services:
   forge_spawn_service:
     environment:
+      FORGE_ENV: staging
       BILLING_MODE: stripe
+
+      # hard requirements in staging
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
       SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
+      ET_HMAC_SECRET: ${ET_HMAC_SECRET:?required}
+      RECEIPT_HMAC_SECRET: ${RECEIPT_HMAC_SECRET:?required}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
+
+      # staging guardrails (explicit)
+      DEV_ALLOW_XPLAN: "false"
+      ALLOW_FREE_DEFAULT: "false"
     ports: []
 
   forge_orchestrator:
-    environment:
+     environment:
+      FORGE_ENV: staging
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
       ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:?required}
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
       SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
-    ports: []
+      ports: []
 
+  # One-shot fix for scoreboard volume permissions
   forge_scoreboard_storage_fix:
     image: alpine:3.19
     command: ["sh", "-lc", "chown -R 1000:1000 /data && ls -ld /data"]
@@ -29,7 +45,9 @@ services:
 
   forge_scoreboard:
     environment:
+      FORGE_ENV: staging
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
+
     user: "1000:1000"
     ports: []
     depends_on:
@@ -39,24 +57,47 @@ services:
         condition: service_healthy
 
   forge_worker_agent:
+    environment:
+      FORGE_ENV: staging
     ports: []
     depends_on:
       forge_minio_probe:
         condition: service_healthy
 
   forge_overlay_sanitizer:
+    environment:
+      FORGE_ENV: staging
     ports: []
     depends_on:
       forge_minio_probe:
         condition: service_healthy
 
-  forge_observer_hub: { ports: [] }
-  forge_playbook_runner: { ports: [] }
-  forge_metrics_tuner: { ports: [] }
-  forge_egress_gateway: { ports: [] }
-  forge_llm_analyzer: { ports: [] }
+  forge_observer_hub:
+    environment:
+      FORGE_ENV: staging
+    ports: []
 
-  # staging-only MinIO readiness gate (shares MinIO network namespace)
+  forge_playbook_runner:
+    environment:
+      FORGE_ENV: staging
+    ports: []
+
+  forge_metrics_tuner:
+    environment:
+      FORGE_ENV: staging
+    ports: []
+
+  forge_egress_gateway:
+    environment:
+      FORGE_ENV: staging
+    ports: []
+
+  forge_llm_analyzer:
+    environment:
+      FORGE_ENV: staging
+    ports: []
+
+  # Staging-only MinIO readiness gate (shares MinIO netns)
   forge_minio_probe:
     image: curlimages/curl:8.5.0
     command: ["sh", "-lc", "sleep infinity"]
@@ -66,7 +107,11 @@ services:
         condition: service_started
     network_mode: "service:forge_minio"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1",
+        ]
       interval: 5s
       timeout: 3s
       retries: 60

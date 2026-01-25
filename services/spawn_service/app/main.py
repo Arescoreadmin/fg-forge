@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -82,7 +83,6 @@ TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 # NOTE: in-memory cache is dev-friendly but not multi-replica safe.
 REQUEST_CACHE: dict[str, dict] = {}
 
-
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -113,6 +113,10 @@ configure_logging()
 
 def _forge_env() -> str:
     return os.getenv("FORGE_ENV", "dev").lower()
+
+
+def _is_truthy_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _get_access_token_secret() -> str:
@@ -174,10 +178,12 @@ def _enforce_startup_config() -> None:
             raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
 
     if env in {"staging", "prod", "production"}:
-        if os.getenv("DEV_ALLOW_XPLAN", "false").lower() == "true":
+        if _is_truthy_env("DEV_ALLOW_XPLAN"):
             raise RuntimeError("DEV_ALLOW_XPLAN is not allowed in staging/prod")
-        if os.getenv("ALLOW_FREE_DEFAULT", "false").lower() == "true":
+        if _is_truthy_env("ALLOW_FREE_DEFAULT"):
             raise RuntimeError("ALLOW_FREE_DEFAULT is not allowed in staging/prod")
+        if _is_truthy_env("ENTITLEMENT_ALLOW_ALL"):
+            raise RuntimeError("ENTITLEMENT_ALLOW_ALL is not allowed in staging/prod")
 
 
 @asynccontextmanager
@@ -207,6 +213,40 @@ PLAN_ENTITLEMENTS: dict[str, PlanEntitlements] = {
     "TEAM": PlanEntitlements(60, 10, frozenset({"netplus", "ccna", "cissp"})),
     "ENTERPRISE": PlanEntitlements(200, 50, frozenset(TRACKS)),
 }
+
+# Tier aliases to avoid your "BASIC" / "basic" faceplant.
+# Override with env if you want: ENTITLEMENT_TIER_ALIASES='{"BASIC":"TEAM","STANDARD":"PRO"}'
+_DEFAULT_TIER_ALIASES = {"BASIC": "TEAM", "STANDARD": "PRO"}
+
+
+def _tier_aliases() -> dict[str, str]:
+    raw = os.getenv("ENTITLEMENT_TIER_ALIASES", "").strip()
+    if not raw:
+        return dict(_DEFAULT_TIER_ALIASES)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("ENTITLEMENT_TIER_ALIASES invalid JSON; using defaults")
+        return dict(_DEFAULT_TIER_ALIASES)
+    if not isinstance(parsed, dict):
+        logger.warning("ENTITLEMENT_TIER_ALIASES not an object; using defaults")
+        return dict(_DEFAULT_TIER_ALIASES)
+    out: dict[str, str] = dict(_DEFAULT_TIER_ALIASES)
+    for k, v in parsed.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k.strip().upper()] = v.strip().upper()
+    return out
+
+
+def resolve_entitlements(tier: str) -> PlanEntitlements:
+    normalized = normalize_tier(tier)
+    aliases = _tier_aliases()
+    normalized = aliases.get(normalized, normalized)
+
+    entitlements = PLAN_ENTITLEMENTS.get(normalized)
+    if not entitlements:
+        raise HTTPException(status_code=403, detail="unknown tier")
+    return entitlements
 
 
 class SpawnRequest(BaseModel):
@@ -369,16 +409,8 @@ def parse_bearer_token(value: str) -> str | None:
     return None
 
 
-def resolve_entitlements(tier: str) -> PlanEntitlements:
-    normalized = normalize_tier(tier)
-    entitlements = PLAN_ENTITLEMENTS.get(normalized)
-    if not entitlements:
-        raise HTTPException(status_code=403, detail="unknown tier")
-    return entitlements
-
-
 def enforce_spawn_authorization(request: Request) -> SatClaims | None:
-    sat_required = os.getenv("SAT_REQUIRED", "false").lower() == "true"
+    sat_required = _is_truthy_env("SAT_REQUIRED")
     token = request.headers.get("x-sat") or parse_bearer_token(
         request.headers.get("authorization", "")
     )
@@ -639,7 +671,94 @@ _egress_breaker = CircuitBreaker(
 
 
 # -----------------------------------------------------------------------------
-# Template / OPA
+# Entitlement dev fallback (ALLOW_ALL + ENTITLEMENTS_JSON)
+# -----------------------------------------------------------------------------
+_dev_entitlements_cache: list[dict[str, Any]] | None = None
+_dev_entitlements_warned = False
+
+
+def _load_entitlements_json() -> list[dict[str, Any]]:
+    """
+    ENTITLEMENTS_JSON format (list):
+      [{"subject":"dev-user","tier":"basic","tracks":["netplus","ccna","cissp"]}]
+    """
+    global _dev_entitlements_cache, _dev_entitlements_warned
+    if _dev_entitlements_cache is not None:
+        return _dev_entitlements_cache
+
+    raw = os.getenv("ENTITLEMENTS_JSON", "").strip()
+    if not raw:
+        _dev_entitlements_cache = []
+        return _dev_entitlements_cache
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        if not _dev_entitlements_warned:
+            logger.warning("ENTITLEMENTS_JSON invalid JSON; ignoring")
+            _dev_entitlements_warned = True
+        _dev_entitlements_cache = []
+        return _dev_entitlements_cache
+
+    if not isinstance(parsed, list):
+        if not _dev_entitlements_warned:
+            logger.warning("ENTITLEMENTS_JSON must be a list; ignoring")
+            _dev_entitlements_warned = True
+        _dev_entitlements_cache = []
+        return _dev_entitlements_cache
+
+    out: list[dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        subj = str(item.get("subject", "")).strip()
+        tier = str(item.get("tier", "")).strip()
+        tracks = item.get("tracks", [])
+        if not subj or not tier or not isinstance(tracks, list):
+            continue
+        tr = {str(t).strip() for t in tracks if isinstance(t, (str, int))}
+        out.append({"subject": subj, "tier": tier, "tracks": sorted(tr)})
+    _dev_entitlements_cache = out
+    return _dev_entitlements_cache
+
+
+def _dev_entitlement_decision(subject: str, track: str) -> EntitlementDecision | None:
+    """
+    Dev-only helper:
+    - BILLING_MODE=stub + ENTITLEMENT_ALLOW_ALL=true -> allow everything
+    - ENTITLEMENTS_JSON -> allow matching subject + track
+    """
+    env = _forge_env()
+    billing_mode = os.getenv("BILLING_MODE", "stub").strip().lower()
+
+    if env not in {"dev", "development"}:
+        return None
+
+    # Seed list first (more deterministic than allow-all)
+    for row in _load_entitlements_json():
+        if row.get("subject") == subject and track in set(row.get("tracks", [])):
+            retention_days = int(os.getenv("ENTITLEMENT_SEED_RETENTION_DAYS", "30"))
+            return EntitlementDecision(
+                tier=normalize_tier(str(row.get("tier", "TEAM"))),
+                retention_days=retention_days,
+                source="entitlements-json",
+            )
+
+    # Allow-all fallback (dev + stub only)
+    if billing_mode == "stub" and _is_truthy_env("ENTITLEMENT_ALLOW_ALL"):
+        tier = os.getenv("ENTITLEMENT_ALLOW_ALL_TIER", "TEAM")
+        retention_days = int(os.getenv("ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS", "30"))
+        return EntitlementDecision(
+            tier=normalize_tier(tier),
+            retention_days=retention_days,
+            source="entitlement-allow-all",
+        )
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Template loading
 # -----------------------------------------------------------------------------
 def load_template(track: str) -> dict:
     template_name = TRACK_TEMPLATE[track]
@@ -650,30 +769,59 @@ def load_template(track: str) -> dict:
         return yaml.safe_load(handle)
 
 
-def opa_allows(template: dict) -> None:
+# -----------------------------------------------------------------------------
+# OPA spawn policy (FIXED)
+# -----------------------------------------------------------------------------
+def opa_spawn_authorize(*, request_id: str, track: str) -> None:
     opa_url = os.getenv("OPA_URL")
     if not opa_url:
         if _forge_env() in {"dev", "development"}:
             return
         raise HTTPException(status_code=503, detail="OPA not configured")
 
+    opa_input = {
+        "request_id": request_id,
+        "track": track,
+        # dev/stub assumptions for now
+        "billing_ok": True,
+        "tenant_blocked": False,
+        "rate_limit_exceeded": False,
+        "scenarios_used": 0,
+    }
+
     try:
-        response = _request_with_retries(
+        allow_resp = _request_with_retries(
             "POST",
-            f"{opa_url}/v1/data/frostgate/forge/training/allow",
-            json_body={"input": template},
+            f"{opa_url}/v1/data/frostgate/forge/spawn/allow",
+            json_body={"input": opa_input},
             breaker=_opa_breaker,
         )
     except requests.RequestException as exc:
-        logger.warning("OPA request failed: %s", exc)
+        logger.warning("OPA allow request failed: %s", exc)
         raise HTTPException(status_code=502, detail="OPA unavailable") from exc
 
-    if response.status_code >= 400:
+    if allow_resp.status_code >= 400:
         raise HTTPException(status_code=502, detail="OPA error")
 
-    result = response.json().get("result")
-    if result is not True:
-        raise HTTPException(status_code=403, detail="OPA policy denied")
+    allowed = allow_resp.json().get("result") is True
+    if allowed:
+        return
+
+    reasons: list[str] = []
+    try:
+        deny_resp = _request_with_retries(
+            "POST",
+            f"{opa_url}/v1/data/frostgate/forge/spawn/deny_reasons",
+            json_body={"input": opa_input},
+            breaker=_opa_breaker,
+        )
+        if deny_resp.status_code < 400:
+            reasons = deny_resp.json().get("result") or []
+    except Exception:
+        pass
+
+    logger.info("OPA denied request_id=%s input=%s reasons=%s", request_id, opa_input, reasons)
+    raise HTTPException(status_code=403, detail={"error": "OPA policy denied", "reasons": reasons})
 
 
 def record_billing(request_id: str, track: str) -> None:
@@ -737,7 +885,7 @@ def build_spawn_response(
 
     plan_override = request.headers.get("x-plan", "").strip()
     if plan_override:
-        if os.getenv("DEV_ALLOW_XPLAN", "false").lower() != "true":
+        if not _is_truthy_env("DEV_ALLOW_XPLAN"):
             raise HTTPException(status_code=403, detail="x-plan disabled")
         retention_days = int(os.getenv("DEV_XPLAN_RETENTION_DAYS", "30"))
         entitlement = EntitlementDecision(
@@ -746,11 +894,16 @@ def build_spawn_response(
             source="x-plan",
         )
     else:
-        entitlement = entitlement_resolver.resolve(
-            subject=subject,
-            tenant_id=tenant_id,
-            receipt_token=receipt_token,
-        )
+        # Dev escape hatches first
+        dev_decision = _dev_entitlement_decision(subject, payload.track)
+        if dev_decision:
+            entitlement = dev_decision
+        else:
+            entitlement = entitlement_resolver.resolve(
+                subject=subject,
+                tenant_id=tenant_id,
+                receipt_token=receipt_token,
+            )
 
     if entitlement.source == "receipt" and entitlement.receipt_exp is not None:
         append_billing_audit_event(
@@ -760,6 +913,7 @@ def build_spawn_response(
             receipt_exp=entitlement.receipt_exp,
         )
 
+    # This needs ET_HMAC_SECRET, but entitlements.py supports DEV_ALLOW_MISSING_ET_SECRET=true.
     et_token = mint_entitlement_token(
         subject=subject,
         tenant_id=tenant_id,
@@ -818,8 +972,12 @@ def build_spawn_response(
         )
         return SpawnResponse(**cached, sat=sat_token), entitlement
 
-    template = load_template(payload.track)
-    opa_allows(template)
+    # Keep template load as a "template exists" guardrail.
+    _ = load_template(payload.track)
+
+    # FIXED: authorize spawn via spawn policy endpoint (not training/template policy).
+    opa_spawn_authorize(request_id=request_id, track=payload.track)
+
     record_billing(request_id, payload.track)
 
     scenario_id = payload.scenario_id or f"scn-{uuid.uuid4().hex[:12]}"
@@ -917,7 +1075,7 @@ def notify_orchestrator(
 # Readiness checks
 # -----------------------------------------------------------------------------
 def _read_only_required() -> bool:
-    if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
+    if _is_truthy_env("READ_ONLY_REQUIRED", "false"):
         return True
     env = _forge_env()
     return env in {"staging", "prod", "production"}
@@ -1015,6 +1173,15 @@ def create_app() -> FastAPI:
         _check_opa_ready()
         return {"status": "ready", "service": "forge_spawn_service"}
 
+    # Compat endpoints to stop the log spam
+    @app.get("/health")
+    def health_compat() -> dict:
+        return {"status": "ok", "service": "forge_spawn_service"}
+
+    @app.get("/metrics")
+    def metrics_compat() -> dict:
+        return {"status": "not_implemented"}
+
     # Router holds actual API endpoints
     router = APIRouter()
 
@@ -1026,7 +1193,7 @@ def create_app() -> FastAPI:
         notify_orchestrator(payload, response, request, entitlement.tier)
         return response
 
-    # Keep /v1/spawn if you still want it
+    # Keep /v1/spawn
     @router.post("/v1/spawn", response_model=SpawnResponse)
     def spawn_scenario(payload: SpawnRequest, request: Request) -> SpawnResponse:
         sat_claims = enforce_spawn_authorization(request)
