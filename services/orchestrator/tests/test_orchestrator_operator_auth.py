@@ -3,9 +3,7 @@ from datetime import UTC, datetime
 import importlib.util
 import os
 from pathlib import Path
-import sys
 import unittest
-import uuid
 
 from httpx import ASGITransport, AsyncClient
 

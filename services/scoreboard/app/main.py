@@ -73,12 +73,13 @@ class ScoreboardConfig:
     event_bus_backend: str
 
     @classmethod
-    def from_env(cls) -> "ScoreboardConfig":
+    def from_env(cls) -> ScoreboardConfig:
         return cls(
             storage_root=Path(os.getenv("STORAGE_ROOT", "storage")),
             nats_url=os.getenv("NATS_URL", "nats://forge_nats:4222"),
             event_bus_backend=os.getenv("SCOREBOARD_EVENT_BUS", "nats"),
         )
+
 
 # Configuration
 NATS_URL = os.getenv("NATS_URL", "nats://forge_nats:4222")
@@ -913,7 +914,7 @@ async def get_score(scenario_id: str) -> ScoreboardEntry:
     return scoreboard[scenario_id]
 
 
-@app.get("/v1/scores")
+@router.get("/v1/scores")
 async def list_scores(track: str | None = None, limit: int = 100) -> list[ScoreboardEntry]:
     """List all scores, optionally filtered by track."""
     entries = list(scoreboard.values())

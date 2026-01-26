@@ -6,13 +6,11 @@ import importlib
 import json
 import os
 from pathlib import Path
-import sys
 import tempfile
 import unittest
 import uuid
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
-
 
 
 def _load_module(module_name: str):
@@ -53,7 +51,7 @@ class ScenarioCompletionIntegrationTests(unittest.TestCase):
                     event_bus_backend="memory",
                 )
             )
-            orchestrator_app = orchestrator_module.create_app(
+            _orchestrator_app = orchestrator_module.create_app(  # noqa: F841
                 orchestrator_module.OrchestratorConfig(
                     template_dir=Path(os.environ["TEMPLATE_DIR"]),
                     opa_url="http://unused",
