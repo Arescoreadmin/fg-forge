@@ -23,3 +23,9 @@ __pycache__/
 .env*
 
 .env.prod
+
+secrets/
+
+
+# local secrets
+secrets/
