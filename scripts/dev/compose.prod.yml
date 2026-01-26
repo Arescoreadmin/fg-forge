@@ -1,0 +1,134 @@
+services:
+  # ----------------------------
+  # Belt-and-suspenders: in prod, publish NOTHING.
+  # Even if someone "helpfully" adds ports to base later, this file wins.
+  # ----------------------------
+
+  forge_spawn_service:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      BILLING_MODE: ${BILLING_MODE:?required}
+      SPAWN_BASE_URL: ${SPAWN_BASE_URL:?required}
+
+      REQUEST_ID_HEADER: ${REQUEST_ID_HEADER:-x-request-id}
+      TEMPLATE_DIR: /templates
+
+      OPA_URL: ${OPA_URL:?required}
+      NATS_URL: ${NATS_URL:?required}
+      REDIS_URL: ${REDIS_URL:?required}
+
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
+      ET_HMAC_SECRET: ${ET_HMAC_SECRET:?required}
+      RECEIPT_HMAC_SECRET: ${RECEIPT_HMAC_SECRET:?required}
+
+      # Kill dev escape hatches in prod
+      DEV_ALLOW_MISSING_ET_SECRET: "false"
+      ENTITLEMENT_ALLOW_ALL: "false"
+      DEV_ALLOW_XPLAN: "false"
+
+  forge_orchestrator:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      TEMPLATE_DIR: /templates
+      OPA_URL: ${OPA_URL:?required}
+      NATS_URL: ${NATS_URL:?required}
+      SCOREBOARD_URL: ${SCOREBOARD_URL:?required}
+
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
+      ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:?required}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
+      SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
+
+  forge_scoreboard:
+    ports: []
+    user: "${SCOREBOARD_UID:-1000}:${SCOREBOARD_GID:-1000}"
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:?required}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?required}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:?required}
+
+      SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
+      SIGNING_KEY_PATH: /run/secrets/scoreboard_ed25519.pem
+    volumes:
+      - ./secrets/scoreboard_ed25519.pem:/run/secrets/scoreboard_ed25519.pem:ro
+
+  forge_worker_agent:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:?required}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?required}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:?required}
+
+  forge_overlay_sanitizer:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:?required}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?required}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:?required}
+      SANITIZED_BUCKET: ${SANITIZED_BUCKET:?required}
+
+  forge_llm_analyzer:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      OPA_URL: ${OPA_URL:?required}
+      REDIS_URL: ${REDIS_URL:?required}
+      CANARY_TIMEOUT_SECONDS: ${CANARY_TIMEOUT_SECONDS:-30}
+
+  forge_metrics_tuner:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      REDIS_URL: ${REDIS_URL:?required}
+      DEFAULT_QUOTA_SCENARIOS: ${DEFAULT_QUOTA_SCENARIOS:-10}
+      DEFAULT_QUOTA_WINDOW_HOURS: ${DEFAULT_QUOTA_WINDOW_HOURS:-24}
+      ABUSE_THRESHOLD_RATE: ${ABUSE_THRESHOLD_RATE:-5.0}
+
+  forge_egress_gateway:
+    ports: []
+    environment:
+      FORGE_ENV: ${FORGE_ENV:?required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      NATS_URL: ${NATS_URL:?required}
+      DRY_RUN: ${EGRESS_DRY_RUN:-false}
+
+  forge_observer_hub:      { ports: [] }
+  forge_playbook_runner:   { ports: [] }
+
+  # Infra: no published ports in prod, ever.
+  forge_opa:        { ports: [] }
+  forge_redis:      { ports: [] }
+  forge_nats:       { ports: [] }
+  forge_minio:      { ports: [] }
+  forge_loki:       { ports: [] }
+  forge_prometheus: { ports: [] }
+  forge_grafana:    { ports: [] }

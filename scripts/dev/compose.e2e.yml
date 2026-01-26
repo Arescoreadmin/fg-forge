@@ -1,0 +1,6 @@
+services:
+  forge_spawn_service:
+    environment:
+      FORGE_ENV: dev
+      DEV_ALLOW_XPLAN: "true"
+      BILLING_MODE: stub

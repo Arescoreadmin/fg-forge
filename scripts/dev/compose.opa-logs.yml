@@ -1,0 +1,21 @@
+# compose.opa-logs.yml
+services:
+  forge_opa:
+    command:
+      - run
+      - --server
+      - --addr
+      - 0.0.0.0:8181
+      - --set=decision_logs.console=true
+      - --set=decision_logs.reporting.min_delay_seconds=1
+      - --set=decision_logs.reporting.max_delay_seconds=1
+      - --log-level=debug
+      - --ignore
+      - .*\.bak_.*
+      - --ignore
+      - .*~
+      - --ignore
+      - .*\.swp
+      - --ignore
+      - .*\.tmp
+      - /policies

@@ -1,0 +1,5 @@
+# compose.netfix.yml
+# Minimal override to force a stable network name across all compose files.
+networks:
+  default:
+    name: forge_platform
