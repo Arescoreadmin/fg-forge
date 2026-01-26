@@ -73,9 +73,9 @@ class ContractGoldenPathTests(unittest.TestCase):
             scenario_id = "scn-contract-golden"
             subject = "user-e2e"
 
-            async def run_flow() -> tuple[
-                httpx.Response, httpx.Response, httpx.Response, httpx.Response
-            ]:
+            async def run_flow() -> (
+                tuple[httpx.Response, httpx.Response, httpx.Response, httpx.Response]
+            ):
                 spawn_transport = httpx.ASGITransport(app=spawn_app)
                 orchestrator_transport = httpx.ASGITransport(app=orchestrator_app)
                 scoreboard_transport = httpx.ASGITransport(app=scoreboard_app)
