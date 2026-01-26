@@ -40,6 +40,11 @@ def cfg_orch_backend() -> str:
     return os.getenv("ORCH_BACKEND", "docker").lower()
 
 
+def get_docker_client() -> docker.DockerClient:
+    """Get Docker client from environment."""
+    return docker.from_env()
+
+
 # -----------------------------------------------------------------------------
 # Routers (declare first; mount inside create_app())
 # -----------------------------------------------------------------------------
@@ -333,8 +338,6 @@ _scoreboard_breaker = CircuitBreaker("scoreboard", cfg_circuit_breaker_cooldown(
 _egress_breaker = CircuitBreaker("egress_gateway", cfg_circuit_breaker_cooldown())
 
 
-
-
 def _import_from_path(import_path: str) -> Any:
     """Import "module.sub:attr" and return attr."""
     if ":" not in import_path:
@@ -511,9 +514,7 @@ async def enforce_sat(
     if tier and claims.tier != tier:
         raise HTTPException(status_code=403, detail="sat tier mismatch")
 
-    stored = await app.state.replay_protector.check_and_store(
-        claims.jti, claims.exp
-    )
+    stored = await app.state.replay_protector.check_and_store(claims.jti, claims.exp)
     if not stored:
         raise HTTPException(status_code=401, detail="sat replayed")
 

@@ -1,0 +1,46 @@
+# compose.frontend.yml
+# Frontend service configuration
+# Usage: docker compose -f compose.yml -f compose.frontend.yml up -d
+
+services:
+  forge_frontend:
+    build:
+      context: ./frontend
+      args:
+        API_URL: http://forge_spawn_service:8080
+        ORCH_URL: http://forge_orchestrator:8080
+        SCORE_URL: http://forge_scoreboard:8080
+    image: forge_frontend:local
+    container_name: forge_frontend
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      API_URL: http://forge_spawn_service:8080
+      ORCH_URL: http://forge_orchestrator:8080
+      SCORE_URL: http://forge_scoreboard:8080
+    ports:
+      - "3000:3000"
+    depends_on:
+      - forge_spawn_service
+      - forge_orchestrator
+      - forge_scoreboard
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: forge_platform
+    external: true

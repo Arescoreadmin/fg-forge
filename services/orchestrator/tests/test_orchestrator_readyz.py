@@ -2,9 +2,7 @@ import asyncio
 import importlib
 import os
 from pathlib import Path
-import sys
 import unittest
-import uuid
 
 from fastapi import FastAPI, HTTPException
 import httpx
@@ -79,9 +77,7 @@ class OrchestratorReadyzTests(unittest.TestCase):
         class UnhealthyScoreboardClient(module.ScoreboardClient):
             async def get_ready(self) -> httpx.Response:
                 transport = ASGITransport(app=unhealthy_app)
-                async with AsyncClient(
-                    transport=transport, base_url="http://scoreboard"
-                ) as client:
+                async with AsyncClient(transport=transport, base_url="http://scoreboard") as client:
                     return await client.get("/readyz")
 
             async def post_score(self, scenario_id: str, payload: dict, headers: dict):

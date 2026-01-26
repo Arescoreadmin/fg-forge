@@ -1,7 +1,7 @@
+from dataclasses import dataclass
 import os
 import sys
 import time
-from dataclasses import dataclass
 
 import httpx
 
@@ -77,15 +77,11 @@ def run() -> int:
     if completion_response.status_code >= 400:
         raise RuntimeError(f"completion failed: {completion_response.text}")
 
-    score_response = httpx.get(
-        f"{urls.scoreboard}/v1/scores/{scenario_id}", timeout=10.0
-    )
+    score_response = httpx.get(f"{urls.scoreboard}/v1/scores/{scenario_id}", timeout=10.0)
     if score_response.status_code >= 400:
         raise RuntimeError(f"score lookup failed: {score_response.text}")
 
-    audit_response = httpx.get(
-        f"{urls.scoreboard}/v1/audit/{scenario_id}/verify", timeout=10.0
-    )
+    audit_response = httpx.get(f"{urls.scoreboard}/v1/audit/{scenario_id}/verify", timeout=10.0)
     if audit_response.status_code >= 400:
         raise RuntimeError(f"audit lookup failed: {audit_response.text}")
 

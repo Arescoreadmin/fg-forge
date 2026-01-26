@@ -5,11 +5,9 @@ import importlib.util
 from io import BytesIO
 import json
 from pathlib import Path
-import sys
 import tarfile
 import tempfile
 import unittest
-import uuid
 
 
 def load_module():

@@ -15,10 +15,11 @@ import random
 import threading
 import time
 import traceback
-import uuid
 from typing import Any
+import uuid
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
+import httpx
 from pydantic import BaseModel, Field
 import requests
 import yaml
@@ -82,6 +83,7 @@ TEMPLATE_DIR = Path(os.getenv("TEMPLATE_DIR", "/templates"))
 
 # NOTE: in-memory cache is dev-friendly but not multi-replica safe.
 REQUEST_CACHE: dict[str, dict] = {}
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -716,7 +718,7 @@ def _load_entitlements_json() -> list[dict[str, Any]]:
         tracks = item.get("tracks", [])
         if not subj or not tier or not isinstance(tracks, list):
             continue
-        tr = {str(t).strip() for t in tracks if isinstance(t, (str, int))}
+        tr = {str(t).strip() for t in tracks if isinstance(t, str | int)}
         out.append({"subject": subj, "tier": tier, "tracks": sorted(tr)})
     _dev_entitlements_cache = out
     return _dev_entitlements_cache
@@ -851,9 +853,7 @@ def resolve_subject_identifier(
     if not subject:
         raise HTTPException(
             status_code=403,
-            detail=(
-                f"subject identifier required (provide subject or {client_header})"
-            ),
+            detail=(f"subject identifier required (provide subject or {client_header})"),
         )
     return subject
 
@@ -1119,7 +1119,7 @@ def _check_egress_gateway() -> None:
 
 
 def _check_opa_ready() -> None:
-    opa_url = OPA_URL
+    opa_url = os.getenv("OPA_URL")
     if not opa_url:
         if _forge_env() in {"dev", "development"}:
             return

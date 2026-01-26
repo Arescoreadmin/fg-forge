@@ -158,7 +158,9 @@ class EntitlementResolver:
         # Dev-only bypass (guarded in resolve()).
         self._allow_all = _truthy("ENTITLEMENT_ALLOW_ALL", "false")
         self._allow_all_tier = os.getenv("ENTITLEMENT_ALLOW_ALL_TIER", "BASIC")
-        self._allow_all_retention_days = int(os.getenv("ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS", "30"))
+        self._allow_all_retention_days = int(
+            os.getenv("ENTITLEMENT_ALLOW_ALL_RETENTION_DAYS", "30")
+        )
 
         # Env-seeded entitlements (useful for dev + CI).
         self._env_by_tenant: dict[str, dict[str, Any]] = {}

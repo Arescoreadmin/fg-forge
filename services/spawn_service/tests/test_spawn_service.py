@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import sys
 import tempfile
 import time
 import unittest
@@ -517,9 +516,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_et_mint_verify_round_trip(self):
         _ = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         token = entitlements.mint_entitlement_token(
             subject="user-1",
             tenant_id="tenant-1",
@@ -536,9 +533,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_et_signature_failure(self):
         _ = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         token = entitlements.mint_entitlement_token(
             subject="user-2",
             tenant_id="tenant-2",
@@ -553,9 +548,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_et_expiry_rejected(self):
         _ = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         now = int(time.time())
         token = entitlements.mint_et(
             {
@@ -577,9 +570,7 @@ class SpawnServiceTests(unittest.TestCase):
     def test_sat_derived_from_et(self):
         os.environ["SAT_REQUIRED"] = "false"
         module = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         captured = {}
         real_mint = module.mint_entitlement_token
 
@@ -640,9 +631,7 @@ class SpawnServiceTests(unittest.TestCase):
         os.environ.pop("ET_HMAC_SECRET", None)
         os.environ.pop("DEV_ALLOW_MISSING_ET_SECRET", None)
         module = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         entitlements._et_secret_cache = None
         app = module.app
         response = asyncio.run(
@@ -665,9 +654,7 @@ class SpawnServiceTests(unittest.TestCase):
         os.environ.pop("ET_HMAC_SECRET", None)
         os.environ["DEV_ALLOW_MISSING_ET_SECRET"] = "true"
         module = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         entitlements._et_secret_cache = None
         app = module.app
         response = asyncio.run(
@@ -813,9 +800,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_billing_audit_chain_integrity(self):
         _ = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         entitlements.append_billing_audit_event(
             tenant_id="tenant-1",
             subject="user-1",
@@ -833,9 +818,7 @@ class SpawnServiceTests(unittest.TestCase):
 
     def test_billing_audit_chain_tamper_detected(self):
         _ = load_module()
-        entitlements = importlib.import_module(
-            "services.spawn_service.app.entitlements"
-        )
+        entitlements = importlib.import_module("services.spawn_service.app.entitlements")
         entitlements.append_billing_audit_event(
             tenant_id="tenant-2",
             subject="user-1",

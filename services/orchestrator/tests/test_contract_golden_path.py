@@ -1,9 +1,9 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 import tempfile
 import unittest
-from pathlib import Path
 
 import httpx
 
@@ -73,7 +73,9 @@ class ContractGoldenPathTests(unittest.TestCase):
             scenario_id = "scn-contract-golden"
             subject = "user-e2e"
 
-            async def run_flow() -> tuple[httpx.Response, httpx.Response, httpx.Response, httpx.Response]:
+            async def run_flow() -> (
+                tuple[httpx.Response, httpx.Response, httpx.Response, httpx.Response]
+            ):
                 spawn_transport = httpx.ASGITransport(app=spawn_app)
                 orchestrator_transport = httpx.ASGITransport(app=orchestrator_app)
                 scoreboard_transport = httpx.ASGITransport(app=scoreboard_app)
@@ -116,12 +118,8 @@ class ContractGoldenPathTests(unittest.TestCase):
                     transport=scoreboard_transport,
                     base_url="http://scoreboard",
                 ) as scoreboard_client:
-                    score_response = await scoreboard_client.get(
-                        f"/v1/scores/{scenario_id}"
-                    )
-                    audit_response = await scoreboard_client.get(
-                        f"/v1/audit/{scenario_id}/verify"
-                    )
+                    score_response = await scoreboard_client.get(f"/v1/scores/{scenario_id}")
+                    audit_response = await scoreboard_client.get(f"/v1/audit/{scenario_id}/verify")
 
                 return spawn_response, completion_response, score_response, audit_response
 

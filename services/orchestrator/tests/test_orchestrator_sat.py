@@ -2,13 +2,10 @@ import asyncio
 import base64
 from datetime import UTC, datetime
 import hmac
-import importlib.util
 import json
 import os
 from pathlib import Path
-import sys
 import unittest
-import uuid
 
 
 def b64url_encode(data: bytes) -> str:
@@ -34,6 +31,8 @@ def load_module():
     os.environ["TEMPLATE_DIR"] = str(repo_root / "templates")
     if "SAT_HMAC_SECRET" not in os.environ and "SAT_SECRET" not in os.environ:
         os.environ["SAT_HMAC_SECRET"] = "test-sat-secret"
+    import importlib
+
     module = importlib.import_module("services.orchestrator.app.main")
     return importlib.reload(module)
 
@@ -51,25 +50,30 @@ class DummyMsg:
         self.nacked = True
 
 
+class MockState:
+    """Mock app state for testing."""
+
+    def __init__(self, module):
+        self.replay_protector = module.ReplayProtector()
+        self.scenarios = {}
+        self.policy_evaluator = None
+
+
+class MockApp:
+    """Mock FastAPI app for testing."""
+
+    def __init__(self, module):
+        self.state = MockState(module)
+
+
 class OrchestratorSatTests(unittest.TestCase):
-    def _build_app(self, module):
-        return module.create_app(
-            module.OrchestratorConfig(
-                template_dir=Path(os.environ["TEMPLATE_DIR"]),
-                opa_url="http://unused",
-                nats_url="nats://memory",
-                scoreboard_url="http://scoreboard",
-                scoreboard_app=None,
-                storage_root=Path("storage"),
-                policy_backend="allow_all",
-                container_backend="stub",
-                event_bus_backend="memory",
-                storage_backend="fs",
-            )
-        )
+    def _build_mock_app(self, module):
+        """Build a minimal mock app for testing."""
+        return MockApp(module)
 
     def test_sat_replay_rejected(self):
         module = load_module()
+        app = self._build_mock_app(module)
         module.replay_protector = module.ReplayProtector()
         now = int(datetime.now(UTC).timestamp())
         claims = {
@@ -83,15 +87,9 @@ class OrchestratorSatTests(unittest.TestCase):
             "tier": "free",
         }
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
-        asyncio.run(
-            module.enforce_sat(app, token, "scn-1", "netplus", "netplus", "free")
-        )
+        asyncio.run(module.enforce_sat(app, token, "scn-1", "netplus", "netplus", "free"))
         with self.assertRaises(module.HTTPException):
-            asyncio.run(
-                module.enforce_sat(
-                    app, token, "scn-1", "netplus", "netplus", "free"
-                )
-            )
+            asyncio.run(module.enforce_sat(app, token, "scn-1", "netplus", "netplus", "free"))
 
     def test_spawn_request_denied_without_sat(self):
         module = load_module()
@@ -99,7 +97,7 @@ class OrchestratorSatTests(unittest.TestCase):
         msg = DummyMsg({"scenario_id": "scn-123", "track": "netplus", "request_id": "req-1"})
         asyncio.run(module.process_spawn_request(msg))
         self.assertTrue(msg.acked)
-        self.assertEqual(app.state.scenarios, {})
+        self.assertEqual(module.scenarios, {})
 
     def test_opa_unavailable_denies_prelaunch(self):
         module = load_module()
@@ -118,12 +116,15 @@ class OrchestratorSatTests(unittest.TestCase):
         }
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
 
+        # Save original and mock the policy evaluator
+        original_policy = getattr(module, "policy_evaluator", None)
+
         class DenyPolicy(module.PolicyEvaluator):
             async def allow(self, input_payload: dict):
                 return False, "OPA unavailable"
 
-        app.state.policy_evaluator = DenyPolicy()
-        app.state.scenarios.clear()
+        module.policy_evaluator = DenyPolicy()
+        module.scenarios.clear()
         msg = DummyMsg(
             {
                 "scenario_id": "scn-opa",
@@ -133,12 +134,17 @@ class OrchestratorSatTests(unittest.TestCase):
                 "sat": token,
             }
         )
-        asyncio.run(module.process_spawn_request(app, msg))
-        self.assertTrue(msg.acked)
-        self.assertEqual(app.state.scenarios, {})
+        try:
+            asyncio.run(module.process_spawn_request(msg))
+            self.assertTrue(msg.acked)
+            self.assertEqual(module.scenarios, {})
+        finally:
+            if original_policy is not None:
+                module.policy_evaluator = original_policy
 
     def test_sat_missing_tenant_or_subject_rejected(self):
         module = load_module()
+        app = self._build_mock_app(module)
         module.replay_protector = module.ReplayProtector()
         now = int(datetime.now(UTC).timestamp())
         claims = {
@@ -152,11 +158,7 @@ class OrchestratorSatTests(unittest.TestCase):
         }
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
         with self.assertRaises(module.HTTPException):
-            asyncio.run(
-                module.enforce_sat(
-                    app, token, "scn-3", "netplus", "netplus", "free"
-                )
-            )
+            asyncio.run(module.enforce_sat(app, token, "scn-3", "netplus", "netplus", "free"))
 
     def test_sat_secret_alias_warning_emitted_once(self):
         os.environ.pop("SAT_HMAC_SECRET", None)
@@ -187,13 +189,16 @@ class OrchestratorSatTests(unittest.TestCase):
         token = mint_sat(os.environ["SAT_HMAC_SECRET"], claims)
         captured = {}
 
+        # Save original and mock the policy evaluator
+        original_policy = getattr(module, "policy_evaluator", None)
+
         class CapturePolicy(module.PolicyEvaluator):
             async def allow(self, input_payload: dict):
                 captured.update(input_payload)
                 return True, None
 
-        app.state.policy_evaluator = CapturePolicy()
-        app.state.scenarios.clear()
+        module.policy_evaluator = CapturePolicy()
+        module.scenarios.clear()
         msg = DummyMsg(
             {
                 "scenario_id": "scn-entitlements",
@@ -203,12 +208,16 @@ class OrchestratorSatTests(unittest.TestCase):
                 "sat": token,
             }
         )
-        asyncio.run(module.process_spawn_request(app, msg))
-        self.assertTrue(msg.acked)
-        self.assertEqual(captured.get("plan"), "TEAM")
-        self.assertEqual(captured.get("retention_days"), 45)
-        self.assertEqual(captured.get("subject"), "user-4")
-        self.assertEqual(captured.get("tenant_id"), "tenant-4")
+        try:
+            asyncio.run(module.process_spawn_request(msg))
+            self.assertTrue(msg.acked)
+            self.assertEqual(captured.get("plan"), "TEAM")
+            self.assertEqual(captured.get("retention_days"), 45)
+            self.assertEqual(captured.get("subject"), "user-4")
+            self.assertEqual(captured.get("tenant_id"), "tenant-4")
+        finally:
+            if original_policy is not None:
+                module.policy_evaluator = original_policy
 
 
 if __name__ == "__main__":
