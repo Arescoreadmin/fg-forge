@@ -718,7 +718,7 @@ def _load_entitlements_json() -> list[dict[str, Any]]:
         tracks = item.get("tracks", [])
         if not subj or not tier or not isinstance(tracks, list):
             continue
-        tr = {str(t).strip() for t in tracks if isinstance(t, (str, int))}
+        tr = {str(t).strip() for t in tracks if isinstance(t, str | int)}
         out.append({"subject": subj, "tier": tier, "tracks": sorted(tr)})
     _dev_entitlements_cache = out
     return _dev_entitlements_cache
