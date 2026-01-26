@@ -1,0 +1,234 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* FrostGate Forge - Dark Industrial Theme */
+@layer base {
+  :root {
+    /* Brand colors */
+    --frost-blue: #1e3a5f;
+    --frost-blue-light: #3d6ba5;
+    --frost-orange: #c45c26;
+    --frost-orange-light: #e87a4d;
+    --frost-dark: #0a0a0a;
+    --frost-dark-lighter: #141414;
+
+    /* Text colors */
+    --text-primary: #e0e0e0;
+    --text-secondary: #8a8a8a;
+    --text-muted: #5c5c5c;
+  }
+
+  html {
+    @apply antialiased;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-frost-dark-900 text-frost-dark-100;
+    background-image:
+      radial-gradient(ellipse at top left, rgba(30, 58, 95, 0.08) 0%, transparent 50%),
+      radial-gradient(ellipse at bottom right, rgba(196, 92, 38, 0.06) 0%, transparent 50%);
+    min-height: 100vh;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-frost-dark-900;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-frost-dark-600 rounded-full;
+    border: 2px solid transparent;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-frost-dark-500;
+  }
+}
+
+@layer components {
+  /* Card with metallic border effect */
+  .card {
+    @apply bg-frost-dark-800/80 backdrop-blur-sm rounded-lg border border-frost-dark-700;
+    box-shadow:
+      0 4px 20px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .card-hover {
+    @apply card transition-all duration-300;
+  }
+
+  .card-hover:hover {
+    @apply border-frost-blue-600/50;
+    box-shadow:
+      0 8px 30px rgba(0, 0, 0, 0.5),
+      0 0 20px rgba(30, 58, 95, 0.15),
+      inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* Primary button with ember glow */
+  .btn-primary {
+    @apply px-6 py-3 bg-frost-orange-500 text-white font-display font-semibold uppercase tracking-wider rounded;
+    @apply transition-all duration-300;
+    @apply hover:bg-frost-orange-400 hover:shadow-ember;
+    @apply active:scale-[0.98];
+    @apply disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none;
+  }
+
+  /* Secondary button with frost glow */
+  .btn-secondary {
+    @apply px-6 py-3 bg-frost-blue-600 text-white font-display font-semibold uppercase tracking-wider rounded;
+    @apply transition-all duration-300;
+    @apply hover:bg-frost-blue-500 hover:shadow-frost;
+    @apply active:scale-[0.98];
+    @apply disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Ghost button */
+  .btn-ghost {
+    @apply px-6 py-3 bg-transparent text-frost-dark-200 font-display font-semibold uppercase tracking-wider rounded;
+    @apply border border-frost-dark-600;
+    @apply transition-all duration-300;
+    @apply hover:bg-frost-dark-800 hover:border-frost-dark-500 hover:text-white;
+  }
+
+  /* Input fields */
+  .input {
+    @apply w-full px-4 py-3 bg-frost-dark-900 border border-frost-dark-700 rounded;
+    @apply text-frost-dark-100 placeholder-frost-dark-500;
+    @apply focus:outline-none focus:border-frost-blue-600 focus:ring-1 focus:ring-frost-blue-600/50;
+    @apply transition-all duration-200;
+  }
+
+  /* Select dropdown */
+  .select {
+    @apply input appearance-none cursor-pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%238a8a8a'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+    background-position: right 12px center;
+    background-repeat: no-repeat;
+    background-size: 20px;
+    padding-right: 44px;
+  }
+
+  /* Status badges */
+  .badge {
+    @apply inline-flex items-center px-3 py-1 rounded-full text-xs font-display font-semibold uppercase tracking-wider;
+  }
+
+  .badge-success {
+    @apply badge bg-emerald-500/20 text-emerald-400 border border-emerald-500/30;
+  }
+
+  .badge-warning {
+    @apply badge bg-amber-500/20 text-amber-400 border border-amber-500/30;
+  }
+
+  .badge-error {
+    @apply badge bg-red-500/20 text-red-400 border border-red-500/30;
+  }
+
+  .badge-info {
+    @apply badge bg-frost-blue-500/20 text-frost-blue-300 border border-frost-blue-500/30;
+  }
+
+  .badge-pending {
+    @apply badge bg-frost-dark-600 text-frost-dark-300 border border-frost-dark-500;
+  }
+
+  /* Track badges (certification types) */
+  .track-netplus {
+    @apply badge bg-emerald-500/20 text-emerald-400 border border-emerald-500/30;
+  }
+
+  .track-ccna {
+    @apply badge bg-frost-blue-500/20 text-frost-blue-300 border border-frost-blue-500/30;
+  }
+
+  .track-cissp {
+    @apply badge bg-purple-500/20 text-purple-400 border border-purple-500/30;
+  }
+
+  /* Metallic divider */
+  .divider {
+    @apply h-px bg-gradient-to-r from-transparent via-frost-dark-600 to-transparent;
+  }
+
+  /* Glowing text effect */
+  .text-glow-ember {
+    text-shadow: 0 0 20px rgba(196, 92, 38, 0.5);
+  }
+
+  .text-glow-frost {
+    text-shadow: 0 0 20px rgba(30, 58, 95, 0.5);
+  }
+
+  /* Progress bar */
+  .progress-bar {
+    @apply h-2 bg-frost-dark-800 rounded-full overflow-hidden;
+  }
+
+  .progress-bar-fill {
+    @apply h-full bg-gradient-to-r from-frost-blue-600 to-frost-orange-500 rounded-full;
+    @apply transition-all duration-500 ease-out;
+  }
+
+  /* Table styles */
+  .table-header {
+    @apply px-4 py-3 text-left text-xs font-display font-semibold uppercase tracking-wider text-frost-dark-400;
+  }
+
+  .table-cell {
+    @apply px-4 py-4 text-sm text-frost-dark-200;
+  }
+
+  .table-row {
+    @apply border-b border-frost-dark-800 transition-colors duration-150;
+    @apply hover:bg-frost-dark-800/50;
+  }
+}
+
+@layer utilities {
+  /* Gradient text */
+  .gradient-text {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-frost-blue-400 to-frost-orange-400;
+  }
+
+  /* Shield gradient background */
+  .shield-bg {
+    background: linear-gradient(135deg, var(--frost-blue) 0%, var(--frost-blue) 50%, var(--frost-orange) 50%, var(--frost-orange) 100%);
+  }
+
+  /* Ember underline effect */
+  .ember-underline {
+    @apply relative;
+  }
+
+  .ember-underline::after {
+    content: '';
+    @apply absolute bottom-0 left-0 w-full h-0.5 bg-gradient-to-r from-frost-orange-500 to-frost-orange-600;
+    @apply transform scale-x-0 origin-left transition-transform duration-300;
+  }
+
+  .ember-underline:hover::after {
+    @apply scale-x-100;
+  }
+
+  /* Loading shimmer */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.05) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 2s linear infinite;
+  }
+}
