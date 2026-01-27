@@ -1,0 +1,32 @@
+{
+  email {$FORGE_ACME_EMAIL}
+}
+
+{$FORGE_DOMAIN} {
+  encode zstd gzip
+
+  # Security headers (baseline)
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "no-referrer"
+  }
+
+  # ---- Spawn API (REST) ----
+  @spawn path /v1/spawn* /v1/access* /healthz /readyz
+  handle @spawn {
+    reverse_proxy forge_spawn_service:8080
+  }
+
+  # ---- Egress Gateway (capability proxy) ----
+  @cap path /v1/cap/*
+  handle @cap {
+    reverse_proxy forge_egress_gateway:8080
+  }
+
+  # Default: 404 (don’t expose internals)
+  handle {
+    respond "not found" 404
+  }
+}

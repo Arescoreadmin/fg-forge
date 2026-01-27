@@ -1,0 +1,183 @@
+# compose.prod.yml
+# Production overrides:
+# - Expose ONLY via ingress (TLS termination + routing)
+# - No direct host port publishing for internal services
+# - Require secrets via ${VAR:?required}
+# - Disable dev escape hatches
+#
+# Usage:
+#   docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d
+
+services:
+  # ----------------------------
+  # Public ingress (ONLY exposed service)
+  # ----------------------------
+  forge_ingress:
+    image: caddy:2.8.4-alpine
+    container_name: forge_ingress
+    restart: unless-stopped
+    depends_on:
+      forge_spawn_service:
+        condition: service_started
+      forge_egress_gateway:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Used by Caddyfile
+      FORGE_DOMAIN: ${FORGE_DOMAIN:?required}
+      FORGE_ACME_EMAIL: ${FORGE_ACME_EMAIL:?required}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - forge_caddy_data:/data
+      - forge_caddy_config:/config
+    networks:
+      - default
+
+  # ----------------------------
+  # App services (no published ports)
+  # ----------------------------
+  forge_spawn_service:
+    environment:
+      FORGE_ENV: prod
+      BILLING_MODE: ${BILLING_MODE:-stripe}
+
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
+      ET_HMAC_SECRET: ${ET_HMAC_SECRET:?required}
+      RECEIPT_HMAC_SECRET: ${RECEIPT_HMAC_SECRET:?required}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
+
+      # Hard-disable dev escape hatches
+      DEV_ALLOW_XPLAN: "false"
+      ALLOW_FREE_DEFAULT: "false"
+      ENTITLEMENT_ALLOW_ALL: "false"
+      DEV_ALLOW_MISSING_ET_SECRET: "false"
+
+      # Egress gateway public URL is what spawn returns to clients
+      EGRESS_GATEWAY_PUBLIC_URL: ${EGRESS_GATEWAY_PUBLIC_URL:?required}
+
+      # Capability signing
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
+      CAP_TOKEN_TTL_SECONDS: ${CAP_TOKEN_TTL_SECONDS:-300}
+    ports: []
+
+  forge_egress_gateway:
+    environment:
+      FORGE_ENV: prod
+
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
+      CAP_TOKEN_TTL_SECONDS: ${CAP_TOKEN_TTL_SECONDS:-300}
+
+      # In prod this should be real
+      DRY_RUN: "false"
+
+      # Enforce SAT + single-use CAPs
+      SAT_REQUIRED: "true"
+      CAP_SINGLE_USE: "true"
+
+      # Session controls
+      TTY_IDLE_SECONDS: ${TTY_IDLE_SECONDS:-900}
+      TTY_MAX_SECONDS: ${TTY_MAX_SECONDS:-1800}
+
+      # Required for single-use
+      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
+    ports: []
+    depends_on:
+      forge_opa_probe:
+        condition: service_healthy
+      forge_redis:
+        condition: service_healthy
+
+  forge_orchestrator:
+    environment:
+      FORGE_ENV: prod
+
+      ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
+      SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
+      ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:?required}
+      SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
+
+      # Production posture
+      READ_ONLY_REQUIRED: "true"
+
+      # Strong default: no docker backend in prod unless you explicitly accept it
+      ORCH_BACKEND: ${ORCH_BACKEND:-k8s}
+      ALLOW_DOCKER_IN_PROD: ${ALLOW_DOCKER_IN_PROD:-false}
+    ports: []
+
+  forge_scoreboard:
+    environment:
+      FORGE_ENV: prod
+      SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
+    ports: []
+
+  forge_worker_agent:
+    environment:
+      FORGE_ENV: prod
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+    ports: []
+
+  forge_overlay_sanitizer:
+    environment:
+      FORGE_ENV: prod
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
+      SANITIZED_BUCKET: ${SANITIZED_BUCKET:-forge-sanitized}
+    ports: []
+
+  forge_observer_hub:
+    environment:
+      FORGE_ENV: prod
+    ports: []
+
+  forge_playbook_runner:
+    environment:
+      FORGE_ENV: prod
+    ports: []
+
+  forge_metrics_tuner:
+    environment:
+      FORGE_ENV: prod
+    ports: []
+
+  forge_llm_analyzer:
+    environment:
+      FORGE_ENV: prod
+    ports: []
+
+  # ----------------------------
+  # Infra services (no published ports)
+  # ----------------------------
+  forge_opa:
+    ports: []
+
+  forge_redis:
+    ports: []
+
+  forge_nats:
+    ports: []
+
+  forge_minio:
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+    ports: []
+
+  forge_loki:
+    ports: []
+
+  forge_prometheus:
+    ports: []
+
+  forge_grafana:
+    ports: []
+
+volumes:
+  forge_caddy_data:
+  forge_caddy_config:
