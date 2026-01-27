@@ -67,6 +67,9 @@ services:
       DEV_XPLAN_RETENTION_DAYS: ${DEV_XPLAN_RETENTION_DAYS:-30}
 
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      EGRESS_GATEWAY_PUBLIC_URL: ${EGRESS_GATEWAY_PUBLIC_URL:-http://localhost:8089}
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:-dev-cap-secret-change-me}
+      CAP_TOKEN_TTL_SECONDS: ${CAP_TOKEN_TTL_SECONDS:-300}
     volumes:
       - *templates_mount
     depends_on:
@@ -133,8 +136,6 @@ services:
       ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:-dev-internal}
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:-dev-operator}
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:-dev-scoreboard}
-
-      DOCKER_HOST: unix:///var/run/docker.sock
       FORGE_STATE_DIR: /data/forge
     networks:
       default:
@@ -144,7 +145,6 @@ services:
     volumes:
       - *templates_mount
       - forge_orchestrator_storage:/app/storage
-      - /var/run/docker.sock:/var/run/docker.sock
       - forge_orch_state:/data
     depends_on:
       forge_orchestrator_storage_init:
@@ -158,9 +158,6 @@ services:
       forge_scoreboard:
         condition: service_healthy
     user: "1000:999"
-    group_add:
-      - "${DOCKER_GID}"
-
   forge_worker_agent:
     <<: *app_defaults
     build:
@@ -286,6 +283,13 @@ services:
       NATS_URL: ${NATS_URL:-nats://forge_nats:4222}
       DRY_RUN: ${EGRESS_DRY_RUN:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:-dev-cap-secret-change-me}
+      OPA_URL: ${OPA_URL:-http://forge_opa:8181}
+      TTY_IDLE_SECONDS: ${TTY_IDLE_SECONDS:-900}
+      TTY_MAX_SECONDS: ${TTY_MAX_SECONDS:-1800}
+      SAT_REQUIRED: ${SAT_REQUIRED:-false}
+      CAP_SINGLE_USE: ${CAP_SINGLE_USE:-false}
+      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
     depends_on:
       forge_nats_probe:
         condition: service_healthy
@@ -387,11 +391,7 @@ services:
     image: nats:2.10-alpine
     container_name: forge_nats
     command:
-      - -js
-      - -sd
-      - /data/jetstream
-      - -m
-      - "8222"
+      ["-js", "-sd", "/data", "-m", "8222"]
     volumes:
       - forge_nats_data:/data
     healthcheck:

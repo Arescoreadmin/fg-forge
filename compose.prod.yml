@@ -2,41 +2,37 @@
 # Production overrides:
 # - Expose ONLY via ingress (TLS termination + routing)
 # - No direct host port publishing for internal services
-# - Require secrets via ${VAR:?required}
+# - Enforce required secrets via ${VAR:?required}
 # - Disable dev escape hatches
-#
-# Usage:
-#   docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d
+# - Orchestrator runs ORCH_BACKEND=k8s (no docker.sock, no DOCKER_GID)
 
 services:
   # ----------------------------
-  # Public ingress (ONLY exposed service)
+  # Ingress (ONLY thing with host ports)
   # ----------------------------
   forge_ingress:
     image: caddy:2.8.4-alpine
     container_name: forge_ingress
     restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      FORGE_DOMAIN: ${FORGE_DOMAIN:?required}
+      FORGE_ACME_EMAIL: ${FORGE_ACME_EMAIL:?required}
+    volumes:
+      - ./telemetry/Caddyfile:/etc/caddy/Caddyfile:ro
+      - forge_caddy_data:/data
+      - forge_caddy_config:/config
     depends_on:
       forge_spawn_service:
         condition: service_started
       forge_egress_gateway:
         condition: service_started
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      # Used by Caddyfile
-      FORGE_DOMAIN: ${FORGE_DOMAIN:?required}
-      FORGE_ACME_EMAIL: ${FORGE_ACME_EMAIL:?required}
-    volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - forge_caddy_data:/data
-      - forge_caddy_config:/config
-    networks:
-      - default
 
   # ----------------------------
-  # App services (no published ports)
+  # App strictness
   # ----------------------------
   forge_spawn_service:
     environment:
@@ -49,50 +45,23 @@ services:
       RECEIPT_HMAC_SECRET: ${RECEIPT_HMAC_SECRET:?required}
       OPERATOR_TOKEN: ${OPERATOR_TOKEN:?required}
 
-      # Hard-disable dev escape hatches
+      # Disable dev escape hatches
       DEV_ALLOW_XPLAN: "false"
-      ALLOW_FREE_DEFAULT: "false"
-      ENTITLEMENT_ALLOW_ALL: "false"
       DEV_ALLOW_MISSING_ET_SECRET: "false"
+      ENTITLEMENT_ALLOW_ALL: "false"
+      ALLOW_FREE_DEFAULT: "false"
 
-      # Egress gateway public URL is what spawn returns to clients
+      # Must be your real public base URL behind ingress
+      SPAWN_BASE_URL: ${SPAWN_BASE_URL:?required}
       EGRESS_GATEWAY_PUBLIC_URL: ${EGRESS_GATEWAY_PUBLIC_URL:?required}
-
-      # Capability signing
       CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
       CAP_TOKEN_TTL_SECONDS: ${CAP_TOKEN_TTL_SECONDS:-300}
     ports: []
-
-  forge_egress_gateway:
-    environment:
-      FORGE_ENV: prod
-
-      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
-      CAP_TOKEN_TTL_SECONDS: ${CAP_TOKEN_TTL_SECONDS:-300}
-
-      # In prod this should be real
-      DRY_RUN: "false"
-
-      # Enforce SAT + single-use CAPs
-      SAT_REQUIRED: "true"
-      CAP_SINGLE_USE: "true"
-
-      # Session controls
-      TTY_IDLE_SECONDS: ${TTY_IDLE_SECONDS:-900}
-      TTY_MAX_SECONDS: ${TTY_MAX_SECONDS:-1800}
-
-      # Required for single-use
-      REDIS_URL: ${REDIS_URL:-redis://forge_redis:6379}
-    ports: []
-    depends_on:
-      forge_opa_probe:
-        condition: service_healthy
-      forge_redis:
-        condition: service_healthy
 
   forge_orchestrator:
     environment:
       FORGE_ENV: prod
+      ORCH_BACKEND: k8s
 
       ACCESS_TOKEN_SECRET: ${ACCESS_TOKEN_SECRET:?required}
       SAT_HMAC_SECRET: ${SAT_HMAC_SECRET:?required}
@@ -100,13 +69,16 @@ services:
       ORCHESTRATOR_INTERNAL_TOKEN: ${ORCHESTRATOR_INTERNAL_TOKEN:?required}
       SCOREBOARD_INTERNAL_TOKEN: ${SCOREBOARD_INTERNAL_TOKEN:?required}
 
-      # Production posture
-      READ_ONLY_REQUIRED: "true"
-
-      # Strong default: no docker backend in prod unless you explicitly accept it
-      ORCH_BACKEND: ${ORCH_BACKEND:-k8s}
-      ALLOW_DOCKER_IN_PROD: ${ALLOW_DOCKER_IN_PROD:-false}
+      # Safety: prod should not touch host docker
+      ALLOW_DOCKER_IN_PROD: "false"
     ports: []
+    # Remove docker.sock access from base compose.yml
+    volumes:
+      - ./templates:/templates:ro
+      - forge_orchestrator_storage:/app/storage
+      - forge_orch_state:/data
+    # Remove group_add that references ${DOCKER_GID} (kills the warning too)
+    group_add: []
 
   forge_scoreboard:
     environment:
@@ -117,18 +89,11 @@ services:
   forge_worker_agent:
     environment:
       FORGE_ENV: prod
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
-      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
     ports: []
 
   forge_overlay_sanitizer:
     environment:
       FORGE_ENV: prod
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
-      MINIO_BUCKET: ${MINIO_BUCKET:-forge-evidence}
-      SANITIZED_BUCKET: ${SANITIZED_BUCKET:-forge-sanitized}
     ports: []
 
   forge_observer_hub:
@@ -146,17 +111,24 @@ services:
       FORGE_ENV: prod
     ports: []
 
+  forge_egress_gateway:
+    environment:
+      FORGE_ENV: prod
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
+      SAT_REQUIRED: "true"
+      CAP_SINGLE_USE: "true"
+      TTY_IDLE_SECONDS: ${TTY_IDLE_SECONDS:-900}
+      TTY_MAX_SECONDS: ${TTY_MAX_SECONDS:-1800}
+    ports: []
+
   forge_llm_analyzer:
     environment:
       FORGE_ENV: prod
     ports: []
 
   # ----------------------------
-  # Infra services (no published ports)
+  # Infra strictness
   # ----------------------------
-  forge_opa:
-    ports: []
-
   forge_redis:
     ports: []
 
@@ -167,6 +139,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?required}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?required}
+    ports: []
+
+  forge_opa:
     ports: []
 
   forge_loki:

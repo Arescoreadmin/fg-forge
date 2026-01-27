@@ -23,6 +23,8 @@ services:
       # staging guardrails (explicit)
       DEV_ALLOW_XPLAN: "false"
       ALLOW_FREE_DEFAULT: "false"
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
+      EGRESS_GATEWAY_PUBLIC_URL: ${EGRESS_GATEWAY_PUBLIC_URL:?required}
     ports: []
 
   forge_orchestrator:
@@ -90,6 +92,7 @@ services:
   forge_egress_gateway:
     environment:
       FORGE_ENV: staging
+      CAP_TOKEN_SECRET: ${CAP_TOKEN_SECRET:?required}
     ports: []
 
   forge_llm_analyzer:

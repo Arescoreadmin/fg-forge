@@ -3,6 +3,10 @@ FrostGate Forge Orchestrator Service.
 
 Central coordinator for scenario lifecycle management. Validates templates,
 enforces OPA policies, creates isolated networks, and manages container lifecycles.
+
+Supports:
+- ORCH_BACKEND=docker (dev/labs): Docker network + containers + ttyd + egress gateway join
+- ORCH_BACKEND=k8s (prod): Kubernetes adapter path (no docker.sock needed)
 """
 
 from __future__ import annotations
@@ -36,54 +40,15 @@ from pydantic import BaseModel, Field
 import yaml
 
 
+# -----------------------------------------------------------------------------
+# Config helpers
+# -----------------------------------------------------------------------------
 def cfg_orch_backend() -> str:
     return os.getenv("ORCH_BACKEND", "docker").lower()
 
 
-# -----------------------------------------------------------------------------
-# Routers (declare first; mount inside create_app())
-# -----------------------------------------------------------------------------
-router = APIRouter()
-internal_router = APIRouter(prefix="/internal")
-
-# Request correlation id (used by logger + middleware)
-request_id_ctx = contextvars.ContextVar("request_id", default="-")
-
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-class JsonLogFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "correlation_id": request_id_ctx.get(),
-        }
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload)
-
-
-def configure_logging() -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonLogFormatter())
-    root_logger = logging.getLogger()
-    root_logger.handlers = [handler]
-    root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-
-
-configure_logging()
-logger = logging.getLogger("forge_orchestrator")
-
-
-# -----------------------------------------------------------------------------
-# Configuration (NO import-time freezing)
-# -----------------------------------------------------------------------------
-NETWORK_PREFIX = "forge_scn_"
-_sat_secret_warning_emitted = False
+def cfg_forge_env() -> str:
+    return os.getenv("FORGE_ENV", "dev").lower()
 
 
 def cfg_unit_tests() -> bool:
@@ -128,6 +93,81 @@ def cfg_http_retry_jitter() -> float:
 
 def cfg_circuit_breaker_cooldown() -> float:
     return float(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "10"))
+
+
+# -----------------------------------------------------------------------------
+# Gateway-only access config (ttyd + egress network join) for docker backend
+# -----------------------------------------------------------------------------
+def cfg_ttyd_enabled() -> bool:
+    # default on for docker backend, off for k8s unless you build it there too
+    return os.getenv("TTYD_ENABLED", "true").lower() == "true"
+
+
+def cfg_ttyd_image() -> str:
+    return os.getenv("TTYD_IMAGE", "tsl0922/ttyd:1.7.7")
+
+
+def cfg_ttyd_port() -> int:
+    return int(os.getenv("TTYD_PORT", "7681"))
+
+
+def cfg_ttyd_shell() -> str:
+    return os.getenv("TTYD_SHELL", "bash")
+
+
+def cfg_gateway_container_name() -> str:
+    return os.getenv("EGRESS_GATEWAY_CONTAINER_NAME", "forge_egress_gateway")
+
+
+def cfg_ttyd_base_prefix() -> str:
+    # Must match egress_gateway route prefix: /v1/cap/web_tty/{sid}
+    return os.getenv("TTYD_BASE_PREFIX", "/v1/cap/web_tty")
+
+
+# -----------------------------------------------------------------------------
+# Routers (declare first; mount inside create_app())
+# -----------------------------------------------------------------------------
+router = APIRouter()
+internal_router = APIRouter(prefix="/internal")
+
+# Request correlation id (used by logger + middleware)
+request_id_ctx = contextvars.ContextVar("request_id", default="-")
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "correlation_id": request_id_ctx.get(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.handlers = [handler]
+    root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+
+configure_logging()
+logger = logging.getLogger("forge_orchestrator")
+
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+NETWORK_PREFIX = "forge_scn_"
+_sat_secret_warning_emitted = False
 
 
 # -----------------------------------------------------------------------------
@@ -262,6 +302,9 @@ nc: nats.NATS | None = None
 js: Any = None
 
 
+# -----------------------------------------------------------------------------
+# Circuit breaker + http retry
+# -----------------------------------------------------------------------------
 class CircuitBreaker:
     def __init__(self, name: str, cooldown_seconds: float) -> None:
         self._name = name
@@ -333,8 +376,9 @@ _scoreboard_breaker = CircuitBreaker("scoreboard", cfg_circuit_breaker_cooldown(
 _egress_breaker = CircuitBreaker("egress_gateway", cfg_circuit_breaker_cooldown())
 
 
-
-
+# -----------------------------------------------------------------------------
+# Scoreboard client
+# -----------------------------------------------------------------------------
 def _import_from_path(import_path: str) -> Any:
     """Import "module.sub:attr" and return attr."""
     if ":" not in import_path:
@@ -511,9 +555,7 @@ async def enforce_sat(
     if tier and claims.tier != tier:
         raise HTTPException(status_code=403, detail="sat tier mismatch")
 
-    stored = await app.state.replay_protector.check_and_store(
-        claims.jti, claims.exp
-    )
+    stored = await app.state.replay_protector.check_and_store(claims.jti, claims.exp)
     if not stored:
         raise HTTPException(status_code=401, detail="sat replayed")
 
@@ -551,7 +593,9 @@ async def _call_enforce_sat(
     try:
         return await enforce_sat(**kwargs)  # type: ignore[misc]
     except TypeError:
-        arity = len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
+        arity = len(
+            [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        )
         if arity >= 6:
             return await enforce_sat(app_obj, token, scenario_id, track, template_id, tier)  # type: ignore[misc]
         return await enforce_sat(token, scenario_id, track, template_id, tier)  # type: ignore[misc]
@@ -581,7 +625,7 @@ def _require_operator_auth(request: Request) -> None:
 
 
 # -----------------------------------------------------------------------------
-# OPA + scoreboard
+# OPA + readiness
 # -----------------------------------------------------------------------------
 def _normalize_plan(tier: str | None) -> str | None:
     if not tier:
@@ -627,9 +671,7 @@ async def check_opa_policy(input_payload: dict) -> tuple[bool, str | None]:
         except httpx.RequestError as e:
             logger.warning("OPA request failed: %s", e)
             return False, f"OPA unavailable: {e}"
-
         except Exception:
-            # This is the “adult” pattern: log + re-raise.
             logger.exception("orchestrator: unhandled error in OPA policy check")
             raise
 
@@ -650,8 +692,7 @@ async def _check_opa_ready() -> None:
 def _read_only_required() -> bool:
     if os.getenv("READ_ONLY_REQUIRED", "").lower() == "true":
         return True
-    forge_env = os.getenv("FORGE_ENV", "dev").lower()
-    return forge_env in {"staging", "prod", "production"}
+    return cfg_forge_env() in {"staging", "prod", "production"}
 
 
 def _check_read_only_fs() -> None:
@@ -674,8 +715,7 @@ async def _check_egress_gateway() -> None:
         return
     expected = os.getenv("EGRESS_DRY_RUN_EXPECTED")
     if expected is None:
-        forge_env = os.getenv("FORGE_ENV", "dev").lower()
-        expected = "true" if forge_env == "dev" else "false"
+        expected = "true" if cfg_forge_env() == "dev" else "false"
 
     async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
         try:
@@ -701,6 +741,9 @@ async def _check_egress_gateway() -> None:
         raise HTTPException(status_code=503, detail="egress gateway config mismatch")
 
 
+# -----------------------------------------------------------------------------
+# Scoreboard trigger
+# -----------------------------------------------------------------------------
 async def _trigger_scoreboard(
     scenario_id: str,
     track: str,
@@ -770,7 +813,8 @@ def append_audit_event(
     correlation_id: str,
     details: dict[str, Any],
 ) -> None:
-    audit_path = _audit_path(app, scenario_id)
+    # app currently unused (kept for future: per-tenant storage routing, etc.)
+    audit_path = _audit_path(scenario_id)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
 
     prev_hash = "0" * 64
@@ -801,11 +845,34 @@ def append_audit_event(
 
 
 # -----------------------------------------------------------------------------
-# Docker orchestration
+# Backend: Docker orchestration
 # -----------------------------------------------------------------------------
-def create_scenario_network(scenario_id: str) -> str:
+def _production_guardrail_for_docker() -> None:
+    if cfg_orch_backend() != "docker":
+        return
+    if cfg_forge_env() in {"prod", "production"} and os.getenv("ALLOW_DOCKER_IN_PROD", "").lower() != "true":
+        raise RuntimeError(
+            "docker backend is not allowed in production by default. "
+            "Set ORCH_BACKEND=k8s, or explicitly set ALLOW_DOCKER_IN_PROD=true (not recommended)."
+        )
+
+
+def get_docker_client() -> docker.DockerClient:
+    global docker_client
+    if docker_client is None:
+        docker_client = docker.from_env()
+        if not cfg_unit_tests():
+            docker_client.ping()
+    return docker_client
+
+
+def _scenario_network_name(scenario_id: str) -> str:
+    return f"{NETWORK_PREFIX}{scenario_id}"
+
+
+def docker_create_scenario_network(scenario_id: str) -> str:
     client = get_docker_client()
-    network_name = f"{NETWORK_PREFIX}{scenario_id}"
+    network_name = _scenario_network_name(scenario_id)
     network = client.networks.create(
         name=network_name,
         driver="bridge",
@@ -820,7 +887,7 @@ def create_scenario_network(scenario_id: str) -> str:
     return network.id
 
 
-def launch_scenario_containers(scenario_id: str, network_id: str, template: dict) -> list[str]:
+def docker_launch_scenario_containers(scenario_id: str, network_id: str, template: dict) -> list[str]:
     client = get_docker_client()
     container_ids: list[str] = []
 
@@ -850,8 +917,8 @@ def launch_scenario_containers(scenario_id: str, network_id: str, template: dict
                 },
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
-                mem_limit="512m",
-                cpu_quota=50000,
+                mem_limit=os.getenv("SCENARIO_MEM_LIMIT", "512m"),
+                cpu_quota=int(os.getenv("SCENARIO_CPU_QUOTA", "50000")),
                 command="sleep infinity" if "alpine" in image else None,
             )
 
@@ -873,7 +940,7 @@ def launch_scenario_containers(scenario_id: str, network_id: str, template: dict
     return container_ids
 
 
-def cleanup_scenario(scenario_id: str) -> None:
+def docker_cleanup_scenario(scenario_id: str) -> None:
     client = get_docker_client()
 
     containers = client.containers.list(
@@ -896,6 +963,90 @@ def cleanup_scenario(scenario_id: str) -> None:
             logger.warning("Failed to remove network %s: %s", network.name, e)
 
 
+def _safe_get_container(client: docker.DockerClient, name: str):
+    try:
+        return client.containers.get(name)
+    except Exception:
+        return None
+
+
+def docker_connect_gateway_to_network(scenario_id: str, network_id: str) -> None:
+    client = get_docker_client()
+    gw_name = cfg_gateway_container_name()
+    gw = _safe_get_container(client, gw_name)
+    if not gw:
+        logger.warning("Gateway container not found: %s (skipping network join)", gw_name)
+        return
+
+    net = client.networks.get(network_id)
+    try:
+        net.connect(gw, aliases=[f"gw-{scenario_id}"])
+        logger.info("Connected gateway %s to network %s for scenario %s", gw_name, net.name, scenario_id)
+    except docker.errors.APIError as exc:
+        msg = str(exc).lower()
+        if "already exists" in msg or "already connected" in msg:
+            logger.info("Gateway already connected to network %s for scenario %s", net.name, scenario_id)
+            return
+        raise
+
+
+def docker_launch_ttyd_container(scenario_id: str, network_id: str) -> str:
+    """
+    Launch per-scenario ttyd inside the scenario network (no host ports).
+    ttyd base-path must match gateway route prefix:
+      /v1/cap/web_tty/<scenario_id>
+    """
+    client = get_docker_client()
+    ttyd_name = f"forge_ttyd_{scenario_id}"
+    base_path = f"{cfg_ttyd_base_prefix().rstrip('/')}/{scenario_id}"
+
+    existing = _safe_get_container(client, ttyd_name)
+    if existing:
+        with suppress(Exception):
+            existing.reload()
+        if getattr(existing, "status", "") != "running":
+            with suppress(Exception):
+                existing.start()
+        logger.info("ttyd already exists for scenario %s: %s", scenario_id, ttyd_name)
+        return existing.id
+
+    def _run():
+        return client.containers.run(
+            image=cfg_ttyd_image(),
+            name=ttyd_name,
+            detach=True,
+            read_only=True,
+            network=network_id,
+            hostname="ttyd",  # gateway resolves "ttyd" in scenario network
+            labels={
+                "forge.scenario_id": scenario_id,
+                "forge.container_name": "ttyd",
+                "forge.managed": "true",
+            },
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            tmpfs={"/tmp": "rw,nosuid,nodev,size=64m"},
+            ports={},  # explicit: no host port mappings
+            command=[
+                "ttyd",
+                "--port", str(cfg_ttyd_port()),
+                "--base-path", base_path,
+                cfg_ttyd_shell(),
+            ],
+        )
+
+    try:
+        c = _run()
+        logger.info("Launched ttyd %s for scenario %s (base_path=%s)", ttyd_name, scenario_id, base_path)
+        return c.id
+    except docker.errors.ImageNotFound:
+        logger.warning("ttyd image %s not found, pulling...", cfg_ttyd_image())
+        client.images.pull(cfg_ttyd_image())
+        c = _run()
+        logger.info("Launched ttyd %s for scenario %s (base_path=%s)", ttyd_name, scenario_id, base_path)
+        return c.id
+
+
 # -----------------------------------------------------------------------------
 # Scenario completion
 # -----------------------------------------------------------------------------
@@ -904,11 +1055,11 @@ async def complete_scenario(
     completion_reason: str,
     completion_timestamp: datetime | None = None,
 ) -> ScenarioState:
-    scenarios = app.state.scenarios
-    if scenario_id not in scenarios:
+    scenarios_map: dict[str, ScenarioState] = app.state.scenarios
+    if scenario_id not in scenarios_map:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
-    state = scenarios[scenario_id]
+    state = scenarios_map[scenario_id]
     completed_at = completion_timestamp or datetime.now(UTC)
     state.completed_at = completed_at
     state.completion_reason = completion_reason
@@ -944,7 +1095,6 @@ async def complete_scenario(
             state.tier,
             state.retention_days,
             request_id_ctx.get(),
-            app,
         )
         state.status = ScenarioStatus.COMPLETED
     except Exception as exc:
@@ -980,7 +1130,7 @@ async def process_spawn_request(msg: Any) -> None:
 
         try:
             template_id = data.get("template_id") or track
-            claims = await _call_enforce_sat(None, sat, scenario_id, track, template_id, tier)
+            claims = await _call_enforce_sat(app, sat, scenario_id, track, template_id, tier)
         except HTTPException as exc:
             logger.warning("Spawn request denied: %s", exc.detail)
             await msg.ack()
@@ -1015,8 +1165,8 @@ async def process_spawn_request(msg: Any) -> None:
             retention_days=claims.retention_days,
             status=ScenarioStatus.CREATING,
         )
-        scenarios = app.state.scenarios
-        scenarios[scenario_id] = state
+        store: dict[str, ScenarioState] = app.state.scenarios
+        store[scenario_id] = state
 
         append_audit_event(
             app,
@@ -1024,333 +1174,26 @@ async def process_spawn_request(msg: Any) -> None:
             event_type="scenario.create",
             actor=claims.subject,
             correlation_id=correlation_id,
-            details={"track": track, "tenant_id": claims.tenant_id},
+            details={"track": track, "tenant_id": claims.tenant_id, "backend": cfg_orch_backend()},
         )
 
-        network_id = create_scenario_network(scenario_id)
+        # NATS path: only implemented for docker backend today
+        if cfg_orch_backend() == "k8s":
+            logger.warning("spawn.request received but ORCH_BACKEND=k8s; ignoring (use API path)")
+            await msg.ack()
+            return
+
+        _production_guardrail_for_docker()
+
+        network_id = docker_create_scenario_network(scenario_id)
         state.network_id = network_id
 
-        container_ids = launch_scenario_containers(scenario_id, network_id, template)
-        state.containers = container_ids
-        state.status = ScenarioStatus.RUNNING
-        state.updated_at = datetime.now(UTC)
+        container_ids = docker_launch_scenario_containers(scenario_id, network_id, template)
 
-        logger.info(
-            "Scenario %s is now running with %d containers", scenario_id, len(container_ids)
-        )
+        # Gateway-only access: ttyd + gateway join
+        ttyd_id: str | None = None
+        if cfg_ttyd_enabled():
+            ttyd_id = docker_launch_ttyd_container(scenario_id, network_id)
+            docker_connect_gateway_to_network(scenario_id, network_id)
 
-        if js:
-            await js.publish(
-                "scenario.created",
-                json.dumps(
-                    {
-                        "scenario_id": scenario_id,
-                        "track": track,
-                        "network_id": network_id,
-                        "containers": container_ids,
-                    }
-                ).encode("utf-8"),
-            )
-
-        await msg.ack()
-
-    except Exception as e:
-        logger.exception("Error processing spawn request: %s", e)
-        with suppress(Exception):
-            await msg.nak()
-
-
-async def nats_subscriber() -> None:
-    """Subscribe to NATS spawn requests."""
-    global nc, js
-
-    try:
-        nc = await nats.connect(cfg_nats_url())
-        js = nc.jetstream()
-
-        with suppress(Exception):
-            await js.add_stream(name="FORGE", subjects=["spawn.*", "scenario.*"])
-
-        consumer_config = ConsumerConfig(
-            durable_name="orchestrator", deliver_policy=DeliverPolicy.ALL, ack_wait=30
-        )
-        await js.subscribe("spawn.request", cb=process_spawn_request, config=consumer_config)
-        logger.info("Subscribed to spawn.request")
-
-        while True:
-            await asyncio.sleep(1)
-
-    except Exception as e:
-        logger.error("NATS subscriber error: %s", e)
-
-
-# -----------------------------------------------------------------------------
-# FastAPI lifecycle + factory (ONE app, created after routes exist)
-# -----------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app_: FastAPI):
-    app_.state.scenarios = scenarios
-
-    if os.getenv("SAT_SECRET") and not os.getenv("SAT_HMAC_SECRET"):
-        _warn_sat_secret_alias()
-
-    task = asyncio.create_task(nats_subscriber())
-    logger.info("Orchestrator started")
-    try:
-        yield
-    finally:
-        task.cancel()
-        with suppress(Exception):
-            await task
-        if nc:
-            await nc.close()
-        logger.info("Orchestrator stopped")
-
-
-def create_app() -> FastAPI:
-    app_ = FastAPI(title="FrostGate Forge Orchestrator", lifespan=lifespan)
-
-    @app_.middleware("http")
-    async def add_request_id(request: Request, call_next):
-        rid = (
-            request.headers.get("x-request-id")
-            or request.headers.get("x-correlation-id")
-            or str(uuid.uuid4())
-        )
-        token = request_id_ctx.set(rid)
-        try:
-            response = await call_next(request)
-        finally:
-            request_id_ctx.reset(token)
-        response.headers["x-request-id"] = rid
-        return response
-
-    app_.include_router(router)
-    app_.include_router(internal_router)
-    return app_
-
-
-# -----------------------------------------------------------------------------
-# Public routes
-# -----------------------------------------------------------------------------
-@router.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": "forge_orchestrator"}
-
-
-@router.get("/healthz")
-def healthz() -> dict:
-    return {"status": "ok", "service": "forge_orchestrator"}
-
-
-@router.get("/readyz")
-async def readyz() -> dict:
-    _check_read_only_fs()
-    await _check_egress_gateway()
-    await _check_opa_ready()
-
-    try:
-        async with _scoreboard_client() as client:
-            response = await _request_with_retries(
-                client, "GET", "/readyz", breaker=_scoreboard_breaker
-            )
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=503, detail=f"scoreboard unavailable: {exc}") from exc
-
-    if response.status_code >= 400:
-        raise HTTPException(status_code=503, detail=f"scoreboard unhealthy: {response.status_code}")
-
-    return {"status": "ready", "service": "forge_orchestrator"}
-
-
-@router.post("/v1/scenarios", response_model=CreateScenarioResponse)
-async def create_scenario(
-    request: CreateScenarioRequest, http_request: Request
-) -> CreateScenarioResponse:
-    """Create a new scenario (direct API, bypasses NATS)."""
-    scenario_id = request.scenario_id
-    track = request.template
-
-    token = http_request.headers.get("x-sat") or _parse_bearer_token(
-        http_request.headers.get("authorization", "")
-    )
-    template_id = getattr(request, "template_id", None) or track
-
-    claims = await _call_enforce_sat(
-        http_request.app, token, scenario_id, track, template_id, request.tier
-    )
-
-    store: dict[str, ScenarioState] = http_request.app.state.scenarios
-
-    # Idempotency: if scenario already exists, return current state
-    if scenario_id in store:
-        state = store[scenario_id]
-        return CreateScenarioResponse(
-            scenario_id=scenario_id, status=state.status, network_id=state.network_id
-        )
-
-    # Create state once
-    state = ScenarioState(
-        scenario_id=scenario_id,
-        request_id=request.request_id,
-        track=track,
-        subject=claims.subject,
-        tenant_id=claims.tenant_id,
-        tier=_normalize_plan(claims.tier),
-        retention_days=claims.retention_days,
-        status=ScenarioStatus.CREATING,
-    )
-    store[scenario_id] = state
-    scenarios[scenario_id] = state
-
-    append_audit_event(
-        http_request.app,
-        scenario_id=scenario_id,
-        event_type="scenario.create",
-        actor=claims.subject,
-        correlation_id=request_id_ctx.get(),
-        details={"track": track, "tenant_id": claims.tenant_id, "backend": cfg_orch_backend()},
-    )
-
-    # Load template + OPA gate before launching anything
-    template = load_template(track)
-    allowed, reason = await check_opa_policy(_build_opa_input(template, claims))
-    if not allowed:
-        state.status = ScenarioStatus.FAILED
-        state.error = reason
-        raise HTTPException(status_code=403, detail=reason)
-
-    # --- K8s backend (no docker.sock) ---
-    if cfg_orch_backend() == "k8s":
-        try:
-            # Optional components; only imported when backend is k8s.
-            from .k8s_adapter import K8sAdapter  # type: ignore
-            from .scenario_manifests import learner_pod_yaml  # type: ignore
-        except Exception as exc:
-            state.status = ScenarioStatus.FAILED
-            state.error = f"k8s backend not available: {exc}"
-            raise HTTPException(status_code=500, detail=state.error) from exc
-
-        k8s = K8sAdapter()
-        ns = scenario_id if scenario_id.startswith("scn-") else f"scn-{scenario_id}"
-
-        try:
-            k8s.create_namespace(ns, labels={"forge.scenario": "true", "scenario_id": scenario_id})
-
-            deny_path = (
-                Path(__file__).resolve().parents[3]
-                / "infra"
-                / "k8s"
-                / "base"
-                / "deny-all-networkpolicy.yaml"
-            )
-            k8s.apply_yaml(ns, deny_path.read_text(encoding="utf-8"))
-
-            k8s.apply_yaml(ns, learner_pod_yaml(scenario_id))
-            k8s.wait_pods_ready(
-                ns, label_selector=f"scenario_id={scenario_id}", timeout_seconds=120
-            )
-
-            state.network_id = f"k8s:{ns}"
-            state.status = ScenarioStatus.RUNNING
-            state.updated_at = datetime.now(UTC)
-
-            append_audit_event(
-                scenario_id=scenario_id,
-                event_type="scenario.k8s.started",
-                actor=claims.subject,
-                correlation_id=request_id_ctx.get(),
-                details={"namespace": ns},
-            )
-
-            return CreateScenarioResponse(
-                scenario_id=scenario_id, status=state.status, network_id=state.network_id
-            )
-
-        except Exception as e:
-            state.status = ScenarioStatus.FAILED
-            state.error = str(e)
-
-            append_audit_event(
-                scenario_id=scenario_id,
-                event_type="scenario.k8s.failed",
-                actor=claims.subject,
-                correlation_id=request_id_ctx.get(),
-                details={"namespace": ns, "error": str(e)},
-            )
-
-            raise HTTPException(status_code=500, detail=f"K8s scenario launch failed: {e}") from e
-
-    # --- Docker backend ---
-    try:
-        network_id = create_scenario_network(http_request.app, scenario_id)
-        state.network_id = network_id
-    except Exception as e:
-        state.status = ScenarioStatus.FAILED
-        state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Network creation failed: {e}") from e
-
-    try:
-        container_ids = launch_scenario_containers(
-            http_request.app, scenario_id, network_id, template
-        )
-        state.containers = container_ids
-        state.status = ScenarioStatus.RUNNING
-        state.updated_at = datetime.now(UTC)
-    except Exception as e:
-        cleanup_scenario(http_request.app, scenario_id)
-        state.status = ScenarioStatus.FAILED
-        state.error = str(e)
-        raise HTTPException(status_code=500, detail=f"Container launch failed: {e}") from e
-
-    return CreateScenarioResponse(
-        scenario_id=scenario_id, status=state.status, network_id=network_id
-    )
-
-
-@router.get("/v1/scenarios/{scenario_id}")
-async def get_scenario(scenario_id: str, request: Request) -> ScenarioState:
-    store: dict[str, ScenarioState] = request.app.state.scenarios
-    if scenario_id not in store:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-    return store[scenario_id]
-
-
-@router.delete("/v1/scenarios/{scenario_id}")
-async def delete_scenario(scenario_id: str, request: Request) -> dict:
-    store: dict[str, ScenarioState] = request.app.state.scenarios
-    if scenario_id not in store:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-    cleanup_scenario(scenario_id)
-    del store[scenario_id]
-    scenarios.pop(scenario_id, None)
-    return {"status": "deleted", "scenario_id": scenario_id}
-
-
-@router.get("/v1/scenarios")
-async def list_scenarios(request: Request) -> list[ScenarioState]:
-    store: dict[str, ScenarioState] = request.app.state.scenarios
-    return list(store.values())
-
-
-# -----------------------------------------------------------------------------
-# Internal routes (keep both legacy and plural endpoints)
-# -----------------------------------------------------------------------------
-@internal_router.post("/scenario/{scenario_id}/complete")
-@internal_router.post("/scenarios/{scenario_id}/complete")
-async def complete_scenario_endpoint(
-    scenario_id: str,
-    payload: ScenarioCompletionRequest,
-    request: Request,
-) -> ScenarioState:
-    _require_internal_auth(request)
-    _require_operator_auth(request)
-    return await complete_scenario(
-        scenario_id, payload.completion_reason, payload.completion_timestamp
-    )
-
-
-# -----------------------------------------------------------------------------
-# Module-level ASGI app (used by uvicorn + tests)
-# -----------------------------------------------------------------------------
-app = create_app()
+        state.containers

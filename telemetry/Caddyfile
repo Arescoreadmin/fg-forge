@@ -1,0 +1,14 @@
+{
+  email {$FORGE_ACME_EMAIL}
+}
+
+{$FORGE_DOMAIN} {
+  encode zstd gzip
+
+  respond /healthz 200
+  respond /readyz 200
+
+  # Adjust these if your internal ports differ
+  reverse_proxy /v1/* forge_spawn_service:8080
+  reverse_proxy /egress/* forge_egress_gateway:8080
+}

@@ -1,0 +1,14 @@
+# compose.docker.yml
+# Dev override: allow orchestrator to control local Docker via /var/run/docker.sock.
+# Usage:
+#   docker compose --env-file .env -f compose.yml -f compose.docker.yml up -d
+
+services:
+  forge_orchestrator:
+    environment:
+      ORCH_BACKEND: docker
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-0}"
