@@ -29,3 +29,9 @@ secrets/
 
 # local secrets
 secrets/
+
+# Env files (never commit real secrets)
+.env.prod
+.env.staging
+.env.dev
+.env.*
